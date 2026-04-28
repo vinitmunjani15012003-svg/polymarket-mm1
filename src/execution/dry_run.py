@@ -133,10 +133,13 @@ class DryRunExecutor:
         """
         Check if any simulated orders should fill based on price crossing.
 
-        A BUY order fills when the market price reaches or exceeds
-        our limit price. For binary markets:
-          - BUY YES at $0.45: fills when P(Up) >= 0.45
-          - BUY NO  at $0.55: fills when P(Down) >= 0.55, i.e., P(Up) <= 0.45
+        Realistic fill model for Polymarket 15-min binary markets:
+          - A BUY YES at $P fills when P(Up) crosses through P
+          - A BUY NO  at $P fills when P(Down)=1-P(Up) crosses through P
+          - Always enforces minimum queue time (real markets have queue depth)
+          - Near-the-money orders have a small probabilistic fill chance
+            to simulate occasional taker flow, but it's rare
+          - Orders far from FV almost never fill unless price truly moves
 
         Returns:
             List of simulated fill events.
@@ -150,64 +153,50 @@ class DryRunExecutor:
             if order.filled:
                 continue
 
-            # Enforce minimum queue time (simulates queue position)
             elapsed = now - order.placed_at
-            if elapsed < self.min_queue_time:
-                continue
 
             # Expire stale orders (> 30s unfilled = would have been cancelled)
             if elapsed > 30:
                 to_remove.append(oid)
                 continue
 
-            # --- Core fill logic: price crossing + taker flow simulation ---
-            should_fill = False
-
-            # In a real market, takers cross the spread. 
-            # We simulate this by filling if our bid is within 2 cents of FV,
-            # with a probabilistic chance based on how close it is.
-            taker_tolerance = 0.025  # Takers will cross up to 2.5 cents of edge
-
+            # --- Compute edge: how far our bid is from fair value ---
+            # Positive edge = our bid is below FV (normal limit order)
+            # Zero/negative edge = FV has crossed through our price
             if order.side == "yes":
-                edge = fv - order.price
-                if edge <= 0:
-                    should_fill = True  # Price crossed
-                elif edge < 0.15 and random.random() < 0.4:
-                    should_fill = True  # Simulate market order hitting our shadowed quote
+                edge = fv - order.price        # fv=0.60, bid=0.55 → edge=+0.05
             elif order.side == "no":
                 no_value = 1.0 - fv
-                edge = no_value - order.price
-                if edge <= 0:
-                    should_fill = True  # Price crossed
-                elif edge < 0.15 and random.random() < 0.4:
-                    should_fill = True  # Simulate market order hitting our shadowed quote
-
-            if not should_fill:
+                edge = no_value - order.price   # no_val=0.40, bid=0.35 → edge=+0.05
+            else:
                 continue
 
-            # Queue position simulation: orders closer to mid fill faster
-            # In a taker fill (we bid higher than FV), edge is negative.
-            if order.side == "yes":
-                edge = order.price - fv
-            else:
-                edge = order.price - (1.0 - fv)
+            # --- Determine fill probability and required queue time ---
+            should_fill = False
 
-            # Tighter/crossing orders fill sooner.
-            # If edge >= 0, we crossed the market -> instant fill.
-            if edge >= 0:
-                required_queue = 0
-            else:
-                # Limit order waiting for market to drop. The simulator already
-                # required fv <= order.price to reach here, so this case mostly
-                # applies if we just simulate the time it takes for the market to drop.
-                required_queue = self.min_queue_time
+            if edge <= 0:
+                # Price has CROSSED our limit — definite fill, but still
+                # need minimum queue time (simulates order book processing)
+                if elapsed >= self.min_queue_time:
+                    should_fill = True
 
-            # Wait, if edge >= 0 it was an instant fill.
-            # If edge < 0, we bid lower than FV. But since should_fill is True,
-            # it means FV dropped. We just use min_queue_time.
-            required_queue = min(required_queue, self.max_queue_time)
+            elif edge <= 0.02:
+                # Very close to FV (within 2 cents) — occasional taker flow
+                # ~8% chance per check cycle, but only after queue time
+                queue_needed = self.min_queue_time + edge * 30  # 2s + 0-0.6s
+                if elapsed >= queue_needed and random.random() < 0.08:
+                    should_fill = True
 
-            if elapsed < required_queue:
+            elif edge <= 0.05:
+                # Moderate distance (2-5 cents) — rare taker fills
+                # ~2% chance, needs longer queue time
+                queue_needed = self.min_queue_time + edge * 60  # 2s + 1.2-3s
+                if elapsed >= queue_needed and random.random() < 0.02:
+                    should_fill = True
+
+            # Orders > 5 cents from FV: no fill unless price crosses
+
+            if not should_fill:
                 continue
 
             # Determine fill size (sometimes partial)

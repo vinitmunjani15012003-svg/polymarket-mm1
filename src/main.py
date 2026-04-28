@@ -135,7 +135,21 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
             )
             log.info("simulated_balance_monitor_ready")
     else:
-        # Live mode
+        # Live mode — validate required credentials before proceeding
+        required_creds = [
+            ("private_key", config.credentials.private_key),
+            ("api_key", config.credentials.api_key),
+            ("api_secret", config.credentials.api_secret),
+            ("api_passphrase", config.credentials.api_passphrase),
+        ]
+        missing = [name for name, val in required_creds if not val]
+        if missing:
+            log.error("missing_live_credentials", fields=missing)
+            print(f"\n[FATAL] Missing required live credentials: {', '.join(missing)}")
+            print("  Set them via environment variables or in config/live.yaml")
+            print("  Example: export POLYMARKET_PK='0x...'\n")
+            return
+
         from src.execution.clob_client import ClobClientWrapper
         executor = ClobClientWrapper(
             host=config.credentials.host,
@@ -147,6 +161,10 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
         )
         await executor.initialize()
         log.info("live_executor_initialized")
+
+        # Safety: cancel any stale orders from a previous run/crash
+        await executor.cancel_all()
+        log.info("startup_cleanup", msg="Cancelled all stale orders from previous session")
 
         # --- Initialize gasless merger (Builder Relayer) ---
         gasless_merger = GaslessMerger(
@@ -205,12 +223,6 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
                             msg="Balance monitoring disabled")
                 balance_monitor = None
 
-    # Order manager
-    order_manager = OrderManager(
-        executor=executor,
-        reprice_threshold=config.global_params.reprice_threshold,
-    )
-
     # --- Create per-asset market cyclers ---
     cyclers = []
     tasks = []
@@ -219,6 +231,22 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
         dashboard.update(state)
 
     for asset_name, ac in active_assets.items():
+        # Per-asset executor + order manager in dry-run mode
+        # Each asset needs its own DryRunExecutor so that fair values
+        # and open orders don't collide between assets.
+        if mode == "dry-run":
+            asset_executor = DryRunExecutor(
+                min_queue_time=config.dry_run.fill_delay_min,
+                max_queue_time=config.dry_run.fill_delay_max,
+            )
+        else:
+            asset_executor = executor  # Live mode: shared CLOB client
+
+        asset_order_manager = OrderManager(
+            executor=asset_executor,
+            reprice_threshold=config.global_params.reprice_threshold,
+        )
+
         # Per-asset inventory manager
         inventory = InventoryManager(
             soft_limit=ac.soft_limit,
@@ -240,7 +268,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
             asset_config=ac,
             global_config=config.global_params,
             price_feed=price_feed,
-            order_manager=order_manager,
+            order_manager=asset_order_manager,
             market_discovery=discovery,
             book_reader=book_reader,
             inventory_manager=inventory,
@@ -361,8 +389,9 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
     for cycler in cyclers:
         await cycler.stop()
 
-    # Cancel all orders
-    await order_manager.cancel_all()
+    # Cancel all orders (each cycler has its own order manager)
+    for cycler in cyclers:
+        await cycler.order_mgr.cancel_all()
 
     # Stop price feed
     await price_feed.stop()

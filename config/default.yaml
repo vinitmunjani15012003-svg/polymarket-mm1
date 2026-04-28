@@ -51,11 +51,11 @@ assets:
     enabled: true
     symbol: "ETHUSDT"
     default_sigma: 0.25
-    gamma: 0.15
-    gamma_near_expiry: 0.50
+    gamma: 0.40             # Match BTC: aggressive skew to prevent one-sided inventory
+    gamma_near_expiry: 0.80
     min_spread: 0.01
     max_spread: 0.05
-    max_order_size: 30
+    max_order_size: 10         # Match BTC: smaller orders, build inventory slower
     max_dollar_delta: 150
     soft_limit: 75
     hard_limit: 120
@@ -65,29 +65,29 @@ assets:
     enabled: true
     symbol: "SOLUSDT"
     default_sigma: 0.90
-    gamma: 0.20
-    gamma_near_expiry: 0.60
+    gamma: 0.40             # Match BTC: aggressive skew to prevent one-sided inventory
+    gamma_near_expiry: 0.80
     min_spread: 0.01
     max_spread: 0.05
-    max_order_size: 20
-    max_dollar_delta: 100
-    soft_limit: 50
-    hard_limit: 80
-    emergency: 95
+    max_order_size: 10         # Match BTC: smaller orders, build inventory slower
+    max_dollar_delta: 150
+    soft_limit: 75
+    hard_limit: 120
+    emergency: 140
 
   XRP:
     enabled: true
     symbol: "XRPUSDT"
     default_sigma: 0.80
-    gamma: 0.20
-    gamma_near_expiry: 0.60
+    gamma: 0.40             # Match BTC: aggressive skew to prevent one-sided inventory
+    gamma_near_expiry: 0.80
     min_spread: 0.01
     max_spread: 0.05
-    max_order_size: 25
-    max_dollar_delta: 100
-    soft_limit: 50
-    hard_limit: 80
-    emergency: 95
+    max_order_size: 10         # Match BTC: smaller orders, build inventory slower
+    max_dollar_delta: 150
+    soft_limit: 75
+    hard_limit: 120
+    emergency: 140
 
 # --- Global Trading Parameters ---
 global:
