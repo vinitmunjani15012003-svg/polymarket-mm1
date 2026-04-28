@@ -10,6 +10,9 @@ logs/
 .env
 .env.*
 
+# Secrets / Live credentials (NEVER commit these)
+config/live.yaml
+
 # IDE
 .vscode/
 .idea/

@@ -387,8 +387,15 @@ def main():
 
     args = parse_args()
 
+    # Auto-detect live.yaml when running in live mode
+    override = args.override
+    if args.mode == "live" and not override:
+        if os.path.exists("config/live.yaml"):
+            override = "config/live.yaml"
+            print("[INFO] Auto-loading config/live.yaml for live mode")
+
     # Load config
-    config = load_config(args.config, args.override)
+    config = load_config(args.config, override)
     config.mode = args.mode
 
     # Setup logging

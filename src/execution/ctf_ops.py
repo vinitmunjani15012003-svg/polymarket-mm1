@@ -801,6 +801,66 @@ class CTFOperations:
             log.error("split_error", error=str(e))
             return None
 
+    async def get_token_balance(self, token_id: int) -> int:
+        """Get balance of a specific outcome token."""
+        if not self._initialized:
+            return 0
+        try:
+            balance = self._ctf.functions.balanceOf(
+                self._account.address, token_id
+            ).call()
+            return balance
+        except Exception as e:
+            log.error("balance_error", error=str(e))
+            return 0
+
+    async def is_market_resolved(self, condition_id: str) -> bool:
+        """Check if a market has been resolved."""
+        if not self._initialized:
+            return False
+        try:
+            condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+            payout_denom = self._ctf.functions.payoutDenominator(
+                condition_bytes
+            ).call()
+            return payout_denom > 0
+        except Exception:
+            return False
+
+    async def _ensure_usdc_approval(self, amount: int):
+        """Ensure CTF contract has USDC approval."""
+        try:
+            allowance = self._usdc.functions.allowance(
+                self._account.address,
+                self._w3.to_checksum_address(CTF_CONTRACT),
+            ).call()
+
+            if allowance < amount:
+                # Approve max uint256
+                max_approval = 2**256 - 1
+                tx = self._usdc.functions.approve(
+                    self._w3.to_checksum_address(CTF_CONTRACT),
+                    max_approval,
+                ).build_transaction({
+                    "from": self._account.address,
+                    "nonce": self._w3.eth.get_transaction_count(
+                        self._account.address
+                    ),
+                    "gas": 60_000,
+                    "gasPrice": self._w3.eth.gas_price,
+                })
+                signed = self._account.sign_transaction(tx)
+                tx_hash = self._w3.eth.send_raw_transaction(
+                    signed.raw_transaction
+                )
+                self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+                log.info("usdc_approved", tx_hash=tx_hash.hex()[:16])
+
+        except Exception as e:
+            log.error("approval_error", error=str(e))
+            raise
+
+
 class SimulatedBalanceMonitor:
     """Simulated Balance Monitor for Dry-Run Mode. Uses current_capital from PnLTracker."""
     def __init__(self, warn_balance: float = 20.0, merge_balance: float = 10.0,
@@ -896,61 +956,4 @@ class SimulatedBalanceMonitor:
             "merge_message": getattr(self, '_merge_message', "")
         }
 
-    async def get_token_balance(self, token_id: int) -> int:
-        """Get balance of a specific outcome token."""
-        if not self._initialized:
-            return 0
-        try:
-            balance = self._ctf.functions.balanceOf(
-                self._account.address, token_id
-            ).call()
-            return balance
-        except Exception as e:
-            log.error("balance_error", error=str(e))
-            return 0
 
-    async def is_market_resolved(self, condition_id: str) -> bool:
-        """Check if a market has been resolved."""
-        if not self._initialized:
-            return False
-        try:
-            condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-            payout_denom = self._ctf.functions.payoutDenominator(
-                condition_bytes
-            ).call()
-            return payout_denom > 0
-        except Exception:
-            return False
-
-    async def _ensure_usdc_approval(self, amount: int):
-        """Ensure CTF contract has USDC approval."""
-        try:
-            allowance = self._usdc.functions.allowance(
-                self._account.address,
-                self._w3.to_checksum_address(CTF_CONTRACT),
-            ).call()
-
-            if allowance < amount:
-                # Approve max uint256
-                max_approval = 2**256 - 1
-                tx = self._usdc.functions.approve(
-                    self._w3.to_checksum_address(CTF_CONTRACT),
-                    max_approval,
-                ).build_transaction({
-                    "from": self._account.address,
-                    "nonce": self._w3.eth.get_transaction_count(
-                        self._account.address
-                    ),
-                    "gas": 60_000,
-                    "gasPrice": self._w3.eth.gas_price,
-                })
-                signed = self._account.sign_transaction(tx)
-                tx_hash = self._w3.eth.send_raw_transaction(
-                    signed.raw_transaction
-                )
-                self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
-                log.info("usdc_approved", tx_hash=tx_hash.hex()[:16])
-
-        except Exception as e:
-            log.error("approval_error", error=str(e))
-            raise

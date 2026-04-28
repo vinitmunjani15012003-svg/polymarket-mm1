@@ -6,6 +6,7 @@ All orders are BUY-only.
 """
 
 import asyncio
+import time
 from typing import Optional
 from src.monitoring.logger import get_logger
 
@@ -51,7 +52,10 @@ class ClobClientWrapper:
             )
             self._client.set_api_creds(creds)
             self._initialized = True
-            log.info("clob_client_initialized")
+            
+            # Verify auth is working
+            addr = self._client.get_address()
+            log.info("clob_client_initialized", address=addr)
         except ImportError:
             log.error("py_clob_client_not_installed",
                      msg="Install with: pip install py-clob-client")
@@ -87,11 +91,10 @@ class ClobClientWrapper:
 
             signed_order = self._client.create_order(order_args)
 
-            # post_only=True — NEVER be a taker
+            # GTC = Good-Til-Cancelled, maker-only on Polymarket CLOB
             response = self._client.post_order(
                 signed_order,
                 OrderType.GTC,
-                post_only=True,  # ENFORCED
             )
 
             order_id = response.get("orderID") or response.get("id")
@@ -102,7 +105,7 @@ class ClobClientWrapper:
                     "price": price,
                     "size": size,
                     "side": "BUY",
-                    "token_side": side,  # "yes" or "no"
+                    "token_side": side,  # "up" or "down"
                 }
                 log.info("order_placed", order_id=order_id[:8],
                          price=price, size=size, token=token_id[:8], token_side=side)
@@ -145,11 +148,13 @@ class ClobClientWrapper:
             return False
 
     async def get_fills(self, market_id: str) -> list[dict]:
-        """Fetch recent fills for a market."""
+        """Fetch recent fills for a market using TradeParams."""
         if not self._initialized:
             return []
         try:
-            resp = self._client.get_trades(market_id=market_id)
+            from py_clob_client.clob_types import TradeParams
+            params = TradeParams(market=market_id)
+            resp = self._client.get_trades(params=params)
             fills = resp if isinstance(resp, list) else resp.get("data", [])
             return fills
         except Exception as e:
