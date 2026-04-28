@@ -32,6 +32,7 @@ class ClobClientWrapper:
         # Track open orders: order_id -> {token_id, price, size, side}
         self.open_orders: dict[str, dict] = {}
         self._processed_fills: set = set()
+        self._last_fill_check_ts: float = 0.0
 
     async def initialize(self):
         """Initialize the CLOB client with credentials."""
@@ -148,9 +149,19 @@ class ClobClientWrapper:
             return False
 
     async def get_fills(self, market_id: str) -> list[dict]:
-        """Fetch recent fills for a market using TradeParams."""
+        """Fetch recent fills for a market using TradeParams.
+        
+        Throttled to max once per 2 seconds to avoid API spam.
+        """
         if not self._initialized:
             return []
+        
+        # Throttle: max 1 request per 2 seconds
+        now = time.time()
+        if now - self._last_fill_check_ts < 2.0:
+            return []
+        self._last_fill_check_ts = now
+        
         try:
             from py_clob_client.clob_types import TradeParams
             params = TradeParams(market=market_id)

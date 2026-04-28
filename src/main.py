@@ -189,6 +189,17 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
                 log.info("balance_monitor_ready",
                          balance=f"${initial_bal:.2f}",
                          merge_at=f"${config.balance_monitor.merge_balance:.2f}")
+                
+                # Preflight: abort if wallet has zero balance
+                if initial_bal <= 0:
+                    log.error("zero_balance_abort",
+                              msg="Wallet has $0 USDC. Fund your wallet before trading.",
+                              address=balance_monitor._address)
+                    print("\n[FATAL] Wallet has $0 USDC.e on Polygon!")
+                    print(f"  Address: {balance_monitor._address}")
+                    print("  Fund with at least $50 USDC.e before running live mode.")
+                    print("  Deposit at: https://polymarket.com/deposit\n")
+                    return
             else:
                 log.warning("balance_monitor_failed",
                             msg="Balance monitoring disabled")

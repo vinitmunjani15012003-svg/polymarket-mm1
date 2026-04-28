@@ -353,7 +353,9 @@ class BalanceMonitor:
             from web3 import Web3
 
             self._w3 = Web3(Web3.HTTPProvider(self._rpc_url))
-            if not self._w3.is_connected():
+            try:
+                self._w3.eth.block_number  # Reliable connectivity test
+            except Exception:
                 log.error("balance_monitor_rpc_down", rpc=self._rpc_url)
                 return False
 
@@ -591,7 +593,9 @@ class CTFOperations:
             from web3 import Web3
 
             self._w3 = Web3(Web3.HTTPProvider(self._rpc_url))
-            if not self._w3.is_connected():
+            try:
+                self._w3.eth.block_number  # Reliable connectivity test
+            except Exception:
                 log.error("web3_not_connected", rpc=self._rpc_url)
                 return False
 
