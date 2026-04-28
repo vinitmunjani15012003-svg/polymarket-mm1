@@ -49,6 +49,7 @@ class ClobClientWrapper:
                 key=self._private_key,
                 creds=creds,
             )
+            self._client.set_api_creds(creds)
             self._initialized = True
             log.info("clob_client_initialized")
         except ImportError:
@@ -60,7 +61,7 @@ class ClobClientWrapper:
             raise
 
     async def place_buy_order(self, token_id: str, price: float,
-                               size: float) -> Optional[str]:
+                               size: float, side: str = "up", book_snapshot=None) -> Optional[str]:
         """
         Place a BUY order with post_only=True.
 
@@ -101,9 +102,10 @@ class ClobClientWrapper:
                     "price": price,
                     "size": size,
                     "side": "BUY",
+                    "token_side": side,  # "yes" or "no"
                 }
                 log.info("order_placed", order_id=order_id[:8],
-                         price=price, size=size, token=token_id[:8])
+                         price=price, size=size, token=token_id[:8], token_side=side)
                 return order_id
             else:
                 # post_only rejected — order would have crossed spread
@@ -156,8 +158,9 @@ class ClobClientWrapper:
 
     def process_fills(self, fills: list[dict], inventory_mgr,
                       market_id: str, edge_tracker=None,
-                      current_mid: float = None):
-        """Process fills with deduplication."""
+                      current_mid: float = None) -> list[dict]:
+        """Process fills with deduplication and update trackers."""
+        processed = []
         for fill in fills:
             fill_id = fill.get("id", f"{fill.get('order_id', '')}_{fill.get('size', '')}")
             if fill_id in self._processed_fills:
@@ -170,12 +173,19 @@ class ClobClientWrapper:
 
             # Determine if this was YES or NO based on our order tracker
             order_ctx = self.open_orders.get(order_id, {})
-            token_id = order_ctx.get("token_id", "")
+            side = order_ctx.get("token_side", "up")
 
-            # Determine side from context (we only BUY)
-            side = "yes"  # Default — needs proper token matching in production
-
-            inventory_mgr.record_fill(market_id, side, size, price)
-
-            if edge_tracker and current_mid is not None:
-                edge_tracker.record_fill(side, price, current_mid)
+            # Update inventory and edge tracker (MarketCycler loops this)
+            # Actually MarketCycler is expected to handle inventory directly from fills.
+            # So we will just return the standardized fill dict.
+            std_fill = {
+                "order_id": order_id,
+                "token_id": order_ctx.get("token_id", ""),
+                "side": side,
+                "price": price,
+                "size": size,
+                "fill_time": time.time(),
+                "simulated": False
+            }
+            processed.append(std_fill)
+        return processed

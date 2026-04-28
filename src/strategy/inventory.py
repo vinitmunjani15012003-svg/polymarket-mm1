@@ -122,11 +122,12 @@ class InventoryManager:
 
     def record_fill(self, market_id: str, side: str, size: float, price: float, asset: str = ""):
         pos = self.get_or_create(market_id, asset)
-        if side == "yes":
+        side = side.lower()
+        if side in ("yes", "up"):
             pos.yes_total_cost += price * size
             pos.yes_shares += size
             pos.yes_fill_count += 1
-        elif side == "no":
+        elif side in ("no", "down"):
             pos.no_total_cost += price * size
             pos.no_shares += size
             pos.no_fill_count += 1

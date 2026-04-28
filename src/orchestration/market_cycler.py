@@ -684,26 +684,36 @@ class MarketCycler:
             quotes=quotes,
         )
 
-        # 15. Process fills (dry-run: check simulated fills)
+        # 15. Process fills (handle both dry-run and live CLOB modes)
+        fills = []
         if hasattr(self.order_mgr.executor, 'check_fills'):
+            # Dry-run
             fills = self.order_mgr.executor.check_fills()
-            for fill in fills:
-                # Record in inventory
-                self.inventory.record_fill(
-                    market.market_id, fill["side"],
-                    fill["size"], fill["price"], self.asset
-                )
-                # Record in P&L tracker (with rebate calculation)
-                self.pnl.record_fill(
-                    size=fill["size"],
-                    price=fill["price"],
-                    side=fill["side"],
-                    asset=self.asset,
-                    market_id=market.market_id,
-                )
-                self.edge_tracker.record_fill(
-                    fill["side"], fill["price"], fv
-                )
+        elif hasattr(self.order_mgr.executor, 'get_fills'):
+            # Live CLOB API
+            try:
+                raw_fills = await self.order_mgr.executor.get_fills(market.market_id)
+                fills = self.order_mgr.executor.process_fills(raw_fills, self.inventory, market.market_id)
+            except Exception as e:
+                log.error("live_fill_check_error", error=str(e))
+
+        for fill in fills:
+            # Record in inventory
+            self.inventory.record_fill(
+                market.market_id, fill["side"],
+                fill["size"], fill["price"], self.asset
+            )
+            # Record in P&L tracker (with rebate calculation)
+            self.pnl.record_fill(
+                size=fill["size"],
+                price=fill["price"],
+                side=fill["side"],
+                asset=self.asset,
+                market_id=market.market_id,
+            )
+            self.edge_tracker.record_fill(
+                fill["side"], fill["price"], fv
+            )
 
         # 15.5. Auto-merge check (live mode: reclaim USDC when balance is low)
         force_merge = False

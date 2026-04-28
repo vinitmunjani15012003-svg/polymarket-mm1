@@ -92,7 +92,7 @@ class OrderManager:
         if yes_needs and quotes.yes_buy_price and quotes.yes_buy_size > 0:
             order_id = await self._place_buy(
                 token_id_yes, quotes.yes_buy_price,
-                quotes.yes_buy_size, "yes", book_snapshot
+                quotes.yes_buy_size, "up", book_snapshot
             )
             active.yes_order_id = order_id
             active.yes_price = quotes.yes_buy_price
@@ -103,7 +103,7 @@ class OrderManager:
         if no_needs and quotes.no_buy_price and quotes.no_buy_size > 0:
             order_id = await self._place_buy(
                 token_id_no, quotes.no_buy_price,
-                quotes.no_buy_size, "no", book_snapshot
+                quotes.no_buy_size, "down", book_snapshot
             )
             active.no_order_id = order_id
             active.no_price = quotes.no_buy_price
