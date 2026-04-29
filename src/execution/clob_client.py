@@ -96,6 +96,7 @@ class ClobClientWrapper:
             response = self._client.post_order(
                 signed_order,
                 OrderType.GTC,
+                post_only=True,
             )
 
             order_id = response.get("orderID") or response.get("id")

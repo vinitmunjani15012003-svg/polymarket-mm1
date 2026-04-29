@@ -106,10 +106,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
     # Order book reader (REAL for both modes)
     book_reader = OrderBookReader(host=config.credentials.host)
 
-    # P&L tracker
-    pnl_tracker = PnLTracker()
-    pnl_tracker.starting_capital = config.global_params.starting_capital
-    pnl_tracker.current_capital = config.global_params.starting_capital
+    # (PnLTracker moved to per-asset loop)
 
     # Dashboard
     dashboard = Dashboard(mode=mode)
@@ -263,6 +260,11 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
             max_drawdown_pct=config.global_params.max_drawdown_pct,
         )
 
+        # Per-asset P&L tracker
+        asset_pnl_tracker = PnLTracker()
+        asset_pnl_tracker.starting_capital = config.global_params.starting_capital
+        asset_pnl_tracker.current_capital = config.global_params.starting_capital
+
         cycler = MarketCycler(
             asset=asset_name,
             asset_config=ac,
@@ -273,7 +275,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
             book_reader=book_reader,
             inventory_manager=inventory,
             risk_engine=risk,
-            pnl_tracker=pnl_tracker,
+            pnl_tracker=asset_pnl_tracker,
             dashboard_callback=dashboard_update,
             ctf_ops=ctf_ops,
             gasless_merger=gasless_merger,
