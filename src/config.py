@@ -81,8 +81,13 @@ class ToxicityConfig:
     """Adverse selection monitoring parameters."""
     window_seconds: int = 300
     threshold: float = 0.002
-    edge_adverse_rate: float = 0.60
+    edge_adverse_rate: float = 0.85
+    edge_mean_threshold: float = 0.015
     edge_window: int = 30
+    min_fills_for_halt: int = 8
+    one_sided_fill_limit: int = 8
+    immediate_drift_threshold: float = 0.02
+    halt_cooldown: int = 90
 
 
 @dataclass
@@ -258,8 +263,13 @@ def load_config(config_path: str = "config/default.yaml",
     config.toxicity = ToxicityConfig(
         window_seconds=t.get("window_seconds", 300),
         threshold=t.get("threshold", 0.002),
-        edge_adverse_rate=t.get("edge_adverse_rate", 0.60),
+        edge_adverse_rate=t.get("edge_adverse_rate", 0.85),
+        edge_mean_threshold=t.get("edge_mean_threshold", 0.015),
         edge_window=t.get("edge_window", 30),
+        min_fills_for_halt=t.get("min_fills_for_halt", 8),
+        one_sided_fill_limit=t.get("one_sided_fill_limit", 8),
+        immediate_drift_threshold=t.get("immediate_drift_threshold", 0.02),
+        halt_cooldown=t.get("halt_cooldown", 90),
     )
 
     # Balance monitor

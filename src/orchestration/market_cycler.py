@@ -176,6 +176,12 @@ class MarketCycler:
         tox_edge_window = getattr(toxicity_config, "edge_window", 30)
         tox_window = getattr(toxicity_config, "window_seconds", 300)
         tox_threshold = getattr(toxicity_config, "threshold", 0.002)
+        tox_edge_adverse_rate = getattr(toxicity_config, "edge_adverse_rate", 0.85)
+        tox_edge_mean_threshold = getattr(toxicity_config, "edge_mean_threshold", 0.015)
+        tox_min_fills_for_halt = getattr(toxicity_config, "min_fills_for_halt", 8)
+        tox_one_sided_fill_limit = getattr(toxicity_config, "one_sided_fill_limit", 8)
+        tox_immediate_drift_threshold = getattr(toxicity_config, "immediate_drift_threshold", 0.02)
+        tox_halt_cooldown = getattr(toxicity_config, "halt_cooldown", 90)
         self.regime_filter = RegimeFilter(
             lookback=regime_lookback,
             trend_threshold=regime_trend,
@@ -185,6 +191,12 @@ class MarketCycler:
         self.toxicity_monitor = ToxicityMonitor(
             window_seconds=tox_window,
             threshold=tox_threshold,
+            halt_cooldown=tox_halt_cooldown,
+            edge_adverse_rate=tox_edge_adverse_rate,
+            edge_mean_threshold=tox_edge_mean_threshold,
+            min_fills_for_halt=tox_min_fills_for_halt,
+            one_sided_fill_limit=tox_one_sided_fill_limit,
+            immediate_drift_threshold=tox_immediate_drift_threshold,
         )
         self.last_fair_value: Optional[float] = None
 
@@ -541,6 +553,12 @@ class MarketCycler:
         tox_edge_window = getattr(self.toxicity_config, "edge_window", 30)
         tox_window = getattr(self.toxicity_config, "window_seconds", 300)
         tox_threshold = getattr(self.toxicity_config, "threshold", 0.002)
+        tox_edge_adverse_rate = getattr(self.toxicity_config, "edge_adverse_rate", 0.85)
+        tox_edge_mean_threshold = getattr(self.toxicity_config, "edge_mean_threshold", 0.015)
+        tox_min_fills_for_halt = getattr(self.toxicity_config, "min_fills_for_halt", 8)
+        tox_one_sided_fill_limit = getattr(self.toxicity_config, "one_sided_fill_limit", 8)
+        tox_immediate_drift_threshold = getattr(self.toxicity_config, "immediate_drift_threshold", 0.02)
+        tox_halt_cooldown = getattr(self.toxicity_config, "halt_cooldown", 90)
         self.regime_filter = RegimeFilter(
             lookback=regime_lookback,
             trend_threshold=regime_trend,
@@ -550,6 +568,12 @@ class MarketCycler:
         self.toxicity_monitor = ToxicityMonitor(
             window_seconds=tox_window,
             threshold=tox_threshold,
+            halt_cooldown=tox_halt_cooldown,
+            edge_adverse_rate=tox_edge_adverse_rate,
+            edge_mean_threshold=tox_edge_mean_threshold,
+            min_fills_for_halt=tox_min_fills_for_halt,
+            one_sided_fill_limit=tox_one_sided_fill_limit,
+            immediate_drift_threshold=tox_immediate_drift_threshold,
         )
         self.quote_engine.reset_params()
 

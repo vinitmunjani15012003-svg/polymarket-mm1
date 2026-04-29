@@ -130,6 +130,35 @@ def test_clear_market_removes_position_without_settlement_math():
     assert "MARKET2" not in inv.positions
 
 
+def test_markets_settled_counts_unique_markets():
+    from src.monitoring.pnl_tracker import PnLTracker
+
+    pnl = PnLTracker()
+    pnl.record_settlement(1.0, "MARKET1")
+    pnl.record_settlement(0.5, "MARKET1")
+    pnl.record_settlement(2.0, "MARKET2")
+
+    assert pnl.markets_settled == 2
+
+
+def test_toxicity_monitor_respects_conservative_thresholds():
+    tox = ToxicityMonitor(
+        halt_cooldown=60,
+        edge_adverse_rate=0.95,
+        edge_mean_threshold=0.02,
+        min_fills_for_halt=8,
+        one_sided_fill_limit=8,
+        immediate_drift_threshold=0.02,
+    )
+    edge = FillEdgeTracker(window=10)
+
+    for _ in range(7):
+        edge.record_fill("yes", 0.50, 0.48)
+
+    assert tox.check_kill_switch(edge) is False
+
+
+
 def test_dry_run_partial_fill_keeps_order_live():
     executor = DryRunExecutor(min_queue_time=0, max_queue_time=0, partial_fill_chance=1.0)
     executor.update_fair_value(0.4, 100.0)

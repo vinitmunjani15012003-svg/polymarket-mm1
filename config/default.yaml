@@ -113,9 +113,14 @@ regime:
 # --- Toxicity ---
 toxicity:
   window_seconds: 300
-  threshold: 0.002
-  edge_adverse_rate: 0.60
+  threshold: 0.004
+  edge_adverse_rate: 0.85
+  edge_mean_threshold: 0.015
   edge_window: 30
+  min_fills_for_halt: 8
+  one_sided_fill_limit: 8
+  immediate_drift_threshold: 0.02
+  halt_cooldown: 90
 
 # --- Dry Run ---
 dry_run:

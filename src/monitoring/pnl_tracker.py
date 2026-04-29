@@ -128,6 +128,7 @@ class PnLTracker:
         self._asset_rebates: dict[str, float] = {}
         self._asset_fills: dict[str, int] = {}
         self._asset_volume: dict[str, float] = {}
+        self._settled_markets: set[str] = set()
 
         self._fills: list[FillRecord] = []
         self._session_start = time.time()
@@ -205,7 +206,12 @@ class PnLTracker:
 
     def record_settlement(self, pnl: float, market_id: str = ""):
         self.settlement_pnl += pnl
-        self.markets_settled += 1
+        if market_id:
+            if market_id not in self._settled_markets:
+                self._settled_markets.add(market_id)
+                self.markets_settled += 1
+        else:
+            self.markets_settled += 1
         log.info("pnl_settlement",
                  market=market_id[:8] if market_id else "",
                  pnl=round(pnl, 4),

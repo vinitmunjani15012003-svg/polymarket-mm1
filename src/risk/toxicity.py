@@ -19,6 +19,7 @@ class FillEdgeTracker:
     def __init__(self, window=30):
         self.edges = deque(maxlen=window)
         self.fills = deque(maxlen=window)
+        self._last_reaction_log_ts = 0.0
 
     def clear(self):
         """Clear history (e.g., after a toxicity halt)."""
@@ -57,11 +58,14 @@ class FillEdgeTracker:
         """Auto-widen spreads if adverse selection is high. Returns True if we should HALT."""
         rate = self.adverse_selection_rate()
         avg = self.mean_edge()
+        now = time.time()
 
         if rate > 0.7 and avg < -0.005:
             quote_engine.spread_multiplier = min(3.0, quote_engine.spread_multiplier * 1.5)
             quote_engine.max_order_size = max(5, int(quote_engine.max_order_size * 0.5))
-            log.warning("high_adverse_selection", rate=f"{rate:.0%}", avg_edge=f"{avg:.4f}")
+            if now - self._last_reaction_log_ts >= 5.0:
+                log.warning("high_adverse_selection", rate=f"{rate:.0%}", avg_edge=f"{avg:.4f}")
+                self._last_reaction_log_ts = now
             
         elif rate > 0.5:
             quote_engine.spread_multiplier = min(2.0, quote_engine.spread_multiplier * 1.1)
@@ -74,12 +78,20 @@ class FillEdgeTracker:
 
 class ToxicityMonitor:
     """Delayed toxicity measurement — checks price drift 30s after each fill."""
-    def __init__(self, window_seconds=300, threshold=0.002, halt_cooldown=60):
+    def __init__(self, window_seconds=300, threshold=0.002,
+                 halt_cooldown=90, edge_adverse_rate=0.85,
+                 edge_mean_threshold=0.015, min_fills_for_halt=8,
+                 one_sided_fill_limit=8, immediate_drift_threshold=0.02):
         self.window = window_seconds
         self.threshold = threshold
         self.fill_history = []
         self.halt_until = 0.0
         self.halt_cooldown = halt_cooldown
+        self.edge_adverse_rate = edge_adverse_rate
+        self.edge_mean_threshold = edge_mean_threshold
+        self.min_fills_for_halt = min_fills_for_halt
+        self.one_sided_fill_limit = one_sided_fill_limit
+        self.immediate_drift_threshold = immediate_drift_threshold
 
     def record_fill(self, side: str, price: float, size: float, mid_at_fill: float):
         self.fill_history.append({
@@ -126,16 +138,22 @@ class ToxicityMonitor:
         if now < self.halt_until:
             return True
             
-        # 1. Repeated adverse fills: rate > 80% and mean edge < -1c
-        if edge_tracker.adverse_selection_rate() > 0.8 and edge_tracker.mean_edge() < -0.01:
+        adverse_rate = edge_tracker.adverse_selection_rate()
+        mean_edge = edge_tracker.mean_edge()
+        recent_fills = len(edge_tracker.edges)
+
+        # 1. Repeated adverse fills: configurable rate + depth thresholds
+        if (recent_fills >= self.min_fills_for_halt and
+                adverse_rate > self.edge_adverse_rate and
+                mean_edge < -self.edge_mean_threshold):
             log.error("toxicity_halt", reason="repeated_adverse_fills")
             self.halt_until = now + self.halt_cooldown
             edge_tracker.clear()
             self.fill_history.clear()
             return True
             
-        # 2. One-sided fill regime: 6 or more consecutive fills on the same side
-        if edge_tracker.recent_one_sided_fills() >= 6:
+        # 2. One-sided fill regime: configurable consecutive-fill threshold
+        if edge_tracker.recent_one_sided_fills() >= self.one_sided_fill_limit:
             log.error("toxicity_halt", reason="one_sided_fill_regime")
             self.halt_until = now + self.halt_cooldown
             edge_tracker.clear()
@@ -144,7 +162,7 @@ class ToxicityMonitor:
             
         # 3. Immediate post-fill move against us: tox < extreme threshold
         tox = self.compute_toxicity()
-        if tox < -0.01:  # drifted 1c against us on average recently
+        if tox < -self.immediate_drift_threshold:
             log.error("toxicity_halt", reason="immediate_post_fill_drift", tox=tox)
             self.halt_until = now + self.halt_cooldown
             edge_tracker.clear()
