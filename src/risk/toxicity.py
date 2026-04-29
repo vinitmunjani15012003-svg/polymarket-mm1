@@ -20,6 +20,11 @@ class FillEdgeTracker:
         self.edges = deque(maxlen=window)
         self.fills = deque(maxlen=window)
 
+    def clear(self):
+        """Clear history (e.g., after a toxicity halt)."""
+        self.edges.clear()
+        self.fills.clear()
+
     def record_fill(self, side: str, fill_price: float, current_mid: float):
         direction = 1 if side == "yes" else -1  # bought YES: want price up
         edge = (current_mid - fill_price) * direction
@@ -125,12 +130,16 @@ class ToxicityMonitor:
         if edge_tracker.adverse_selection_rate() > 0.8 and edge_tracker.mean_edge() < -0.01:
             log.error("toxicity_halt", reason="repeated_adverse_fills")
             self.halt_until = now + self.halt_cooldown
+            edge_tracker.clear()
+            self.fill_history.clear()
             return True
             
         # 2. One-sided fill regime: 6 or more consecutive fills on the same side
         if edge_tracker.recent_one_sided_fills() >= 6:
             log.error("toxicity_halt", reason="one_sided_fill_regime")
             self.halt_until = now + self.halt_cooldown
+            edge_tracker.clear()
+            self.fill_history.clear()
             return True
             
         # 3. Immediate post-fill move against us: tox < extreme threshold
@@ -138,6 +147,8 @@ class ToxicityMonitor:
         if tox < -0.01:  # drifted 1c against us on average recently
             log.error("toxicity_halt", reason="immediate_post_fill_drift", tox=tox)
             self.halt_until = now + self.halt_cooldown
+            edge_tracker.clear()
+            self.fill_history.clear()
             return True
             
         return False
