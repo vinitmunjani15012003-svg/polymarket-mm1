@@ -296,7 +296,9 @@ class MarketCycler:
                     # Kick off background task to wait for actual resolution from Polymarket API
                     asyncio.create_task(self._wait_and_settle_unmatched(market, pos, pairs))
 
-            self.pnl.markets_settled += 1
+            # Clear position from inventory state
+            self.inventory.settle_market(market.market_id)
+            
             self.current_market = None
 
         # Reset per-market state for next cycle
@@ -644,11 +646,13 @@ class MarketCycler:
 
         # 11.5 Fetch live orderbook to prevent crossing the book
         book_up = await self.book_reader.get_book(market.token_id_up)
+        book_down = await self.book_reader.get_book(market.token_id_down)
         best_ask_yes = None
         best_ask_no = None
         if book_up:
             best_ask_yes = book_up.best_ask
-            best_ask_no = 1.0 - book_up.best_bid
+        if book_down:
+            best_ask_no = book_down.best_ask
 
         # 12. Generate quotes using share imbalance for price skewing
         #     yes_buy = Up buy price, no_buy = Down buy price

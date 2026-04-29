@@ -407,11 +407,22 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
     await book_reader.close()
 
     # Final P&L report
-    snap = pnl_tracker.snapshot()
+    session_pnl = PnLTracker()
+    if cyclers:
+        session_pnl._start_time = cyclers[0].pnl_tracker._start_time
+        for cycler in cyclers:
+            session_pnl._net_trading_pnl += cycler.pnl_tracker._net_trading_pnl
+            session_pnl._total_rebates += cycler.pnl_tracker._total_rebates
+            session_pnl.total_volume += cycler.pnl_tracker.total_volume
+            session_pnl.total_shares += cycler.pnl_tracker.total_shares
+            session_pnl.total_fills += cycler.pnl_tracker.total_fills
+            session_pnl.markets_settled += cycler.pnl_tracker.markets_settled
+
+    snap = session_pnl.snapshot()
 
     print("\n" + "=" * 60)
     print(f"  SESSION COMPLETE — {mode.upper()}")
-    print(f"  Duration: {pnl_tracker.session_duration_hours:.2f} hours")
+    print(f"  Duration: {session_pnl.session_duration_hours:.2f} hours")
     print(f"  Markets Settled: {snap.markets_settled}")
     print(f"  Total Fills: {snap.total_fills}")
     print(f"  Total Volume: ${snap.total_volume:.2f}")
@@ -419,7 +430,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
     print("-" * 60)
     print(f"  Trading P&L:     ${snap.net_trading_pnl:.4f}")
     print(f"  Est. Rebates:    ${snap.est_rebates:.4f}   ")
-    print(f"  Rebates/Hour:    ${pnl_tracker.rebates_per_hour():.4f}")
+    print(f"  Rebates/Hour:    ${session_pnl.rebates_per_hour():.4f}")
     print(f"  Net P&L (total): ${snap.net_pnl_with_rebates:.4f}")
     print("=" * 60)
 

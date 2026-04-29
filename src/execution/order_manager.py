@@ -94,10 +94,15 @@ class OrderManager:
                 token_id_yes, quotes.yes_buy_price,
                 quotes.yes_buy_size, "yes", book_snapshot
             )
-            active.yes_order_id = order_id
-            active.yes_price = quotes.yes_buy_price
-            active.yes_size = quotes.yes_buy_size
-            updated = True
+            if order_id:
+                active.yes_order_id = order_id
+                active.yes_price = quotes.yes_buy_price
+                active.yes_size = quotes.yes_buy_size
+                updated = True
+            else:
+                active.yes_order_id = None
+                active.yes_price = None
+                active.yes_size = 0
 
         # Place new NO buy if we have a price and size
         if no_needs and quotes.no_buy_price and quotes.no_buy_size > 0:
@@ -105,10 +110,15 @@ class OrderManager:
                 token_id_no, quotes.no_buy_price,
                 quotes.no_buy_size, "no", book_snapshot
             )
-            active.no_order_id = order_id
-            active.no_price = quotes.no_buy_price
-            active.no_size = quotes.no_buy_size
-            updated = True
+            if order_id:
+                active.no_order_id = order_id
+                active.no_price = quotes.no_buy_price
+                active.no_size = quotes.no_buy_size
+                updated = True
+            else:
+                active.no_order_id = None
+                active.no_price = None
+                active.no_size = 0
 
         if updated:
             active.last_update = time.time()

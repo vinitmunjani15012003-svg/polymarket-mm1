@@ -508,10 +508,12 @@ class BalanceMonitor:
                     total_usdc += usdc_recovery
 
                     # Record profit in P&L tracker
-                    if pnl_tracker and pair_profit > 0:
-                        pnl_tracker.record_settlement(
-                            pair_profit, market_id
-                        )
+                    if pnl_tracker:
+                        if pair_profit > 0:
+                            pnl_tracker.record_settlement(
+                                pair_profit, market_id
+                            )
+                        pnl_tracker.record_capital_recovery(usdc_recovery)
 
                     # Deduct merged pairs from inventory
                     avg_yes = pos.yes_avg_entry

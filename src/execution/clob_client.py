@@ -32,7 +32,7 @@ class ClobClientWrapper:
         # Track open orders: order_id -> {token_id, price, size, side}
         self.open_orders: dict[str, dict] = {}
         self._processed_fills: set = set()
-        self._last_fill_check_ts: float = 0.0
+        self._last_fill_check_ts_by_market: dict[str, float] = {}
 
     async def initialize(self):
         """Initialize the CLOB client with credentials."""
@@ -157,11 +157,12 @@ class ClobClientWrapper:
         if not self._initialized:
             return []
         
-        # Throttle: max 1 request per 2 seconds
+        # Throttle: max 1 request per 2 seconds per market
         now = time.time()
-        if now - self._last_fill_check_ts < 2.0:
+        last_check = self._last_fill_check_ts_by_market.get(market_id, 0.0)
+        if now - last_check < 2.0:
             return []
-        self._last_fill_check_ts = now
+        self._last_fill_check_ts_by_market[market_id] = now
         
         try:
             from py_clob_client.clob_types import TradeParams
@@ -191,6 +192,12 @@ class ClobClientWrapper:
             # Determine if this was YES or NO based on our order tracker
             order_ctx = self.open_orders.get(order_id, {})
             side = order_ctx.get("token_side", "up")
+
+            # Update remaining size and remove if filled
+            if order_id in self.open_orders:
+                self.open_orders[order_id]["size"] -= size
+                if self.open_orders[order_id]["size"] <= 0.0001:  # Floating point safety
+                    del self.open_orders[order_id]
 
             # Update inventory and edge tracker (MarketCycler loops this)
             # Actually MarketCycler is expected to handle inventory directly from fills.
