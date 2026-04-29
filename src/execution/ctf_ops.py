@@ -535,6 +535,9 @@ class BalanceMonitor:
             result["pairs_merged"] = total_pairs
             result["usdc_recovered"] = total_usdc
 
+            if total_pairs > 0 and hasattr(inventory_mgr, "save_state"):
+                inventory_mgr.save_state()
+
             if total_pairs > 0:
                 log.info("auto_merge_complete",
                          total_pairs=total_pairs,
@@ -961,5 +964,4 @@ class SimulatedBalanceMonitor:
             "initialized": True,
             "merge_message": getattr(self, '_merge_message', "")
         }
-
 

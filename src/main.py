@@ -233,9 +233,37 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
     # --- Create per-asset market cyclers ---
     cyclers = []
     tasks = []
+    shutdown_event = asyncio.Event()
+
+    def request_shutdown():
+        if not shutdown_event.is_set():
+            shutdown_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: request_shutdown())
 
     def dashboard_update(state):
         dashboard.update(state)
+
+    shared_risk = RiskEngine(
+        total_capital=config.global_params.total_capital,
+        max_daily_loss_pct=config.global_params.max_daily_loss_pct,
+        max_drawdown_pct=config.global_params.max_drawdown_pct,
+    )
+
+    def portfolio_pnl_getter() -> float:
+        total = 0.0
+        for c in cyclers:
+            total += c.pnl.net_pnl
+            if c.current_market and c.last_fair_value is not None:
+                pos = c.inventory.positions.get(c.current_market.market_id)
+                if pos:
+                    total += pos.mark_to_market(c.last_fair_value)
+        return total
 
     for asset_name, ac in active_assets.items():
         # Per-asset executor + order manager in dry-run mode
@@ -264,13 +292,6 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
         )
         inventory.set_state_manager(state_manager)
 
-        # Per-asset risk engine
-        risk = RiskEngine(
-            total_capital=config.global_params.total_capital,
-            max_daily_loss_pct=config.global_params.max_daily_loss_pct,
-            max_drawdown_pct=config.global_params.max_drawdown_pct,
-        )
-
         # Per-asset P&L tracker
         asset_pnl_tracker = PnLTracker()
         asset_pnl_tracker.starting_capital = config.global_params.starting_capital
@@ -285,8 +306,11 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
             market_discovery=discovery,
             book_reader=book_reader,
             inventory_manager=inventory,
-            risk_engine=risk,
+            risk_engine=shared_risk,
             pnl_tracker=asset_pnl_tracker,
+            regime_config=config.regime,
+            toxicity_config=config.toxicity,
+            portfolio_pnl_getter=portfolio_pnl_getter,
             dashboard_callback=dashboard_update,
             ctf_ops=ctf_ops,
             gasless_merger=gasless_merger,
@@ -365,6 +389,13 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
 
     price_feed.on_price_update(on_live_price)
 
+    async def state_heartbeat_loop():
+        while True:
+            state_manager.save_state()
+            await asyncio.sleep(30)
+
+    tasks.append(asyncio.create_task(state_heartbeat_loop()))
+
     log.info("bot_running", assets=list(active_assets.keys()), mode=mode)
 
     # Switch to dashboard-only output (suppress console, keep file logs)
@@ -389,8 +420,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
 
     # --- Wait for shutdown (Windows-compatible) ---
     try:
-        while True:
-            await asyncio.sleep(1)
+        await shutdown_event.wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 
@@ -421,15 +451,23 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
 
     # Final P&L report
     session_pnl = PnLTracker()
+    session_pnl.starting_capital = 0.0
+    session_pnl.current_capital = 0.0
     if cyclers:
-        session_pnl._start_time = cyclers[0].pnl_tracker._start_time
+        session_pnl._session_start = min(cycler.pnl._session_start for cycler in cyclers)
         for cycler in cyclers:
-            session_pnl._net_trading_pnl += cycler.pnl_tracker._net_trading_pnl
-            session_pnl._total_rebates += cycler.pnl_tracker._total_rebates
-            session_pnl.total_volume += cycler.pnl_tracker.total_volume
-            session_pnl.total_shares += cycler.pnl_tracker.total_shares
-            session_pnl.total_fills += cycler.pnl_tracker.total_fills
-            session_pnl.markets_settled += cycler.pnl_tracker.markets_settled
+            session_pnl.settlement_pnl += cycler.pnl.settlement_pnl
+            session_pnl.spread_income += cycler.pnl.spread_income
+            session_pnl.total_fees += cycler.pnl.total_fees
+            session_pnl.est_rebates += cycler.pnl.est_rebates
+            session_pnl.total_taker_fees += cycler.pnl.total_taker_fees
+            session_pnl.total_volume += cycler.pnl.total_volume
+            session_pnl.total_shares += cycler.pnl.total_shares
+            session_pnl.total_fills += cycler.pnl.total_fills
+            session_pnl.markets_settled += cycler.pnl.markets_settled
+            session_pnl.markets_traded += cycler.pnl.markets_traded
+            session_pnl.starting_capital += cycler.pnl.starting_capital
+            session_pnl.current_capital += cycler.pnl.current_capital
 
     snap = session_pnl.snapshot()
 

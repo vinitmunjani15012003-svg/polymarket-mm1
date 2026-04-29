@@ -128,6 +128,9 @@ class MarketCycler:
                  inventory_manager: InventoryManager,
                  risk_engine: RiskEngine,
                  pnl_tracker: PnLTracker,
+                 regime_config=None,
+                 toxicity_config=None,
+                 portfolio_pnl_getter=None,
                  dashboard_callback=None,
                  ctf_ops: Optional[CTFOperations] = None,
                  gasless_merger: Optional[GaslessMerger] = None,
@@ -143,6 +146,9 @@ class MarketCycler:
         self.inventory = inventory_manager
         self.risk_engine = risk_engine
         self.pnl = pnl_tracker
+        self.regime_config = regime_config
+        self.toxicity_config = toxicity_config
+        self.portfolio_pnl_getter = portfolio_pnl_getter
         self._dashboard_cb = dashboard_callback
         self.ctf: Optional[CTFOperations] = ctf_ops
         self.gasless_merger: Optional[GaslessMerger] = gasless_merger
@@ -164,9 +170,23 @@ class MarketCycler:
             max_spread=asset_config.max_spread,
             max_order_size=asset_config.max_order_size,
         )
-        self.regime_filter = RegimeFilter()
-        self.edge_tracker = FillEdgeTracker(window=30)
-        self.toxicity_monitor = ToxicityMonitor()
+        regime_lookback = getattr(regime_config, "lookback", 30)
+        regime_trend = getattr(regime_config, "trend_threshold", 0.08)
+        regime_spike = getattr(regime_config, "spike_threshold", 0.20)
+        tox_edge_window = getattr(toxicity_config, "edge_window", 30)
+        tox_window = getattr(toxicity_config, "window_seconds", 300)
+        tox_threshold = getattr(toxicity_config, "threshold", 0.002)
+        self.regime_filter = RegimeFilter(
+            lookback=regime_lookback,
+            trend_threshold=regime_trend,
+            spike_threshold=regime_spike,
+        )
+        self.edge_tracker = FillEdgeTracker(window=tox_edge_window)
+        self.toxicity_monitor = ToxicityMonitor(
+            window_seconds=tox_window,
+            threshold=tox_threshold,
+        )
+        self.last_fair_value: Optional[float] = None
 
         self._running = False
         self._last_market_slug = None  # Track to detect new market
@@ -297,13 +317,14 @@ class MarketCycler:
                     asyncio.create_task(self._wait_and_settle_unmatched(market, pos, pairs))
 
             # Clear position from inventory state
-            self.inventory.settle_market(market.market_id)
+            self.inventory.clear_market(market.market_id)
             
             self.current_market = None
 
         # Reset per-market state for next cycle
         self.quote_engine.reset_params()
-        self.risk_engine.reset_for_new_market(self.pnl.net_pnl)
+        if not self.portfolio_pnl_getter:
+            self.risk_engine.reset_for_new_market(self.pnl.net_pnl)
 
     async def _wait_and_settle_unmatched(self, market: MarketInfo, pos, pairs: int):
         """Background task to poll Gamma API and wait for actual market resolution."""
@@ -514,8 +535,22 @@ class MarketCycler:
         )
 
         # Reset per-market state
-        self.regime_filter = RegimeFilter()
-        self.edge_tracker = FillEdgeTracker()
+        regime_lookback = getattr(self.regime_config, "lookback", 30)
+        regime_trend = getattr(self.regime_config, "trend_threshold", 0.08)
+        regime_spike = getattr(self.regime_config, "spike_threshold", 0.20)
+        tox_edge_window = getattr(self.toxicity_config, "edge_window", 30)
+        tox_window = getattr(self.toxicity_config, "window_seconds", 300)
+        tox_threshold = getattr(self.toxicity_config, "threshold", 0.002)
+        self.regime_filter = RegimeFilter(
+            lookback=regime_lookback,
+            trend_threshold=regime_trend,
+            spike_threshold=regime_spike,
+        )
+        self.edge_tracker = FillEdgeTracker(window=tox_edge_window)
+        self.toxicity_monitor = ToxicityMonitor(
+            window_seconds=tox_window,
+            threshold=tox_threshold,
+        )
         self.quote_engine.reset_params()
 
         while self._running:
@@ -567,6 +602,7 @@ class MarketCycler:
 
         # 3. Compute fair value: P(Up)
         fv = self.fair_value_model.fair_value(spot, sigma, now)
+        self.last_fair_value = fv
         t_norm = self.fair_value_model.normalized_time(now)
 
         # Feed FV to dry-run executor for price-crossing fill simulation
@@ -601,7 +637,10 @@ class MarketCycler:
             )
 
         # 7. Risk check (only cancel THIS market's quotes, not all assets)
-        current_pnl = pos.mark_to_market(fv) + self.pnl.net_pnl
+        if self.portfolio_pnl_getter:
+            current_pnl = self.portfolio_pnl_getter()
+        else:
+            current_pnl = pos.mark_to_market(fv) + self.pnl.net_pnl
         if not self.risk_engine.check_stops(current_pnl):
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, "HALTED", remaining)

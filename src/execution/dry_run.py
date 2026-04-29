@@ -204,8 +204,6 @@ class DryRunExecutor:
             if random.random() < self.partial_fill_chance and order.size > 5:
                 fill_size = max(1, int(order.size * random.uniform(0.3, 0.9)))
 
-            order.filled = True
-            order.fill_time = now
             self._total_fills += 1
 
             fill = {
@@ -219,11 +217,20 @@ class DryRunExecutor:
             }
             fills.append(fill)
             self.filled_orders.append(fill)
-            to_remove.append(oid)
 
-            log.info("dry_fill", order_id=oid, side=order.side,
-                     price=order.price, size=fill_size,
-                     fv=round(fv, 4), spot=round(self._current_spot, 2), elapsed=f"{elapsed:.1f}s")
+            if fill_size >= order.size:
+                order.filled = True
+                order.fill_time = now
+                to_remove.append(oid)
+                log.info("dry_fill", order_id=oid, side=order.side,
+                         price=order.price, size=fill_size,
+                         fv=round(fv, 4), spot=round(self._current_spot, 2), elapsed=f"{elapsed:.1f}s")
+            else:
+                order.size -= fill_size
+                log.info("dry_partial_fill", order_id=oid, side=order.side,
+                         price=order.price, size=fill_size,
+                         remaining=order.size,
+                         fv=round(fv, 4), spot=round(self._current_spot, 2), elapsed=f"{elapsed:.1f}s")
 
         for oid in to_remove:
             self.open_orders.pop(oid, None)

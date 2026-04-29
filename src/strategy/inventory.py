@@ -153,6 +153,10 @@ class InventoryManager:
             data = {mid: pos.to_dict() for mid, pos in self.positions.items()}
             self.state_manager.update_inventory(data)
 
+    def save_state(self):
+        """Persist current inventory state."""
+        self._save_state()
+
     def get_or_create(self, market_id: str, asset: str = "") -> InventoryPosition:
         if market_id not in self.positions:
             self.positions[market_id] = InventoryPosition(market_id=market_id, asset=asset)
@@ -272,3 +276,11 @@ class InventoryManager:
                  pnl=round(pnl, 4), pairs=pos.matched_pairs(),
                  up_shares=pos.yes_shares, down_shares=pos.no_shares)
         return pnl
+
+    def clear_market(self, market_id: str):
+        """Remove a market position from memory/state without computing settlement PnL."""
+        pos = self.positions.pop(market_id, None)
+        if pos:
+            self._save_state()
+            log.info("market_cleared", market=market_id[:8],
+                     up_shares=pos.yes_shares, down_shares=pos.no_shares)
