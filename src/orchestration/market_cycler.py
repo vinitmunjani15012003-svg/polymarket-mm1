@@ -615,6 +615,10 @@ class MarketCycler:
         # 9. Toxicity monitor
         self.toxicity_monitor.update_delayed_mids(fv)
         self.toxicity_monitor.adjust_spread(self.quote_engine)
+        if self.toxicity_monitor.check_kill_switch(self.edge_tracker):
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, "TOXICITY_HALT", remaining)
+            return
 
         # 10. Compute inventory state and sizes
         #     Uses SHARE COUNT imbalance (Up - Down), not dollar delta
@@ -624,8 +628,8 @@ class MarketCycler:
             market.market_id, fv, self.quote_engine.max_order_size
         )
 
-        # 10.5 Enforce Close-Only quoting during DEAD_ZONE
-        if phase == "DEAD_ZONE":
+        # 10.5 Enforce Close-Only quoting during near-expiry phases
+        if phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]:
             # Only allow quoting the side that reduces the imbalance
             if imbalance > 0:
                 up_size = 0

@@ -116,6 +116,28 @@ class BotConfig:
     balance_monitor: BalanceMonitorConfig = field(default_factory=BalanceMonitorConfig)
     dry_run: DryRunConfig = field(default_factory=DryRunConfig)
 
+    def validate(self):
+        """Validate all configuration invariants."""
+        if self.mode not in ["live", "dry-run"]:
+            raise ValueError(f"Invalid mode: {self.mode}. Must be 'live' or 'dry-run'.")
+            
+        if self.mode == "live":
+            if not self.credentials.private_key:
+                raise ValueError("private_key is required in live mode")
+            if not self.credentials.api_key:
+                raise ValueError("api_key is required in live mode")
+                
+        for name, asset in self.assets.items():
+            if asset.min_spread >= asset.max_spread:
+                raise ValueError(f"Asset {name}: min_spread ({asset.min_spread}) must be < max_spread ({asset.max_spread})")
+            if asset.soft_limit >= asset.hard_limit or asset.hard_limit >= asset.emergency:
+                raise ValueError(f"Asset {name}: Limits must be strictly increasing (soft < hard < emergency)")
+            if asset.max_order_size <= 0:
+                raise ValueError(f"Asset {name}: max_order_size must be > 0")
+                
+        if self.global_params.stop_quoting_seconds <= 0:
+            raise ValueError("stop_quoting_seconds must be positive")
+
 
 def _substitute_env_vars(value: str) -> str:
     """Replace ${ENV_VAR} patterns with environment variable values."""
@@ -258,6 +280,9 @@ def load_config(config_path: str = "config/default.yaml",
         fill_delay_max=d.get("fill_delay_max", 10),
         toxicity_multiplier=d.get("toxicity_multiplier", 2.0),
     )
+
+    # Validate config invariants
+    config.validate()
 
     return config
 

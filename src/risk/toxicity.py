@@ -18,11 +18,13 @@ class FillEdgeTracker:
     """
     def __init__(self, window=30):
         self.edges = deque(maxlen=window)
+        self.fills = deque(maxlen=window)
 
     def record_fill(self, side: str, fill_price: float, current_mid: float):
         direction = 1 if side == "yes" else -1  # bought YES: want price up
         edge = (current_mid - fill_price) * direction
         self.edges.append(edge)
+        self.fills.append({"side": side, "edge": edge, "time": time.time()})
 
     def adverse_selection_rate(self) -> float:
         if len(self.edges) < 5:
@@ -33,9 +35,21 @@ class FillEdgeTracker:
         if not self.edges:
             return 0.0
         return sum(self.edges) / len(self.edges)
+        
+    def recent_one_sided_fills(self) -> int:
+        if not self.fills:
+            return 0
+        last_side = self.fills[-1]["side"]
+        count = 0
+        for f in reversed(self.fills):
+            if f["side"] == last_side:
+                count += 1
+            else:
+                break
+        return count
 
     def should_react(self, quote_engine) -> bool:
-        """Auto-widen spreads if adverse selection is high."""
+        """Auto-widen spreads if adverse selection is high. Returns True if we should HALT."""
         rate = self.adverse_selection_rate()
         avg = self.mean_edge()
 
@@ -43,7 +57,7 @@ class FillEdgeTracker:
             quote_engine.spread_multiplier = min(3.0, quote_engine.spread_multiplier * 1.5)
             quote_engine.max_order_size = max(5, int(quote_engine.max_order_size * 0.5))
             log.warning("high_adverse_selection", rate=f"{rate:.0%}", avg_edge=f"{avg:.4f}")
-            return True
+            
         elif rate > 0.5:
             quote_engine.spread_multiplier = min(2.0, quote_engine.spread_multiplier * 1.1)
         elif rate < 0.3 and avg > 0:
@@ -55,10 +69,12 @@ class FillEdgeTracker:
 
 class ToxicityMonitor:
     """Delayed toxicity measurement — checks price drift 30s after each fill."""
-    def __init__(self, window_seconds=300, threshold=0.002):
+    def __init__(self, window_seconds=300, threshold=0.002, halt_cooldown=60):
         self.window = window_seconds
         self.threshold = threshold
         self.fill_history = []
+        self.halt_until = 0.0
+        self.halt_cooldown = halt_cooldown
 
     def record_fill(self, side: str, price: float, size: float, mid_at_fill: float):
         self.fill_history.append({
@@ -95,3 +111,33 @@ class ToxicityMonitor:
             quote_engine.spread_multiplier = min(3.0, quote_engine.spread_multiplier * 1.3)
         elif tox > -self.threshold * 0.3:
             quote_engine.spread_multiplier = max(1.0, quote_engine.spread_multiplier * 0.97)
+
+    def check_kill_switch(self, edge_tracker: FillEdgeTracker) -> bool:
+        """
+        Check if we need to completely halt quoting.
+        Returns True if halted.
+        """
+        now = time.time()
+        if now < self.halt_until:
+            return True
+            
+        # 1. Repeated adverse fills: rate > 80% and mean edge < -1c
+        if edge_tracker.adverse_selection_rate() > 0.8 and edge_tracker.mean_edge() < -0.01:
+            log.error("toxicity_halt", reason="repeated_adverse_fills")
+            self.halt_until = now + self.halt_cooldown
+            return True
+            
+        # 2. One-sided fill regime: 6 or more consecutive fills on the same side
+        if edge_tracker.recent_one_sided_fills() >= 6:
+            log.error("toxicity_halt", reason="one_sided_fill_regime")
+            self.halt_until = now + self.halt_cooldown
+            return True
+            
+        # 3. Immediate post-fill move against us: tox < extreme threshold
+        tox = self.compute_toxicity()
+        if tox < -0.01:  # drifted 1c against us on average recently
+            log.error("toxicity_halt", reason="immediate_post_fill_drift", tox=tox)
+            self.halt_until = now + self.halt_cooldown
+            return True
+            
+        return False

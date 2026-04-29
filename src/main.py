@@ -25,6 +25,7 @@ from src.data.orderbook import OrderBookReader
 from src.strategy.inventory import InventoryManager
 from src.execution.order_manager import OrderManager
 from src.execution.dry_run import DryRunExecutor
+from src.execution.state_manager import StateManager
 from src.execution.ctf_ops import (
     CTFOperations, GaslessMerger, BalanceMonitor, SimulatedBalanceMonitor
 )
@@ -60,10 +61,14 @@ def parse_args():
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level"
     )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="Run in headless mode (no dashboard, no confirmation prompts)"
+    )
     return parser.parse_args()
 
 
-async def run_bot(config: BotConfig, assets_filter: list[str] = None):
+async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: bool = False):
     """Main bot runner."""
     global log
 
@@ -110,6 +115,9 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
 
     # Dashboard
     dashboard = Dashboard(mode=mode)
+    
+    # State Manager (Crash recovery)
+    state_manager = StateManager()
 
     # --- Initialize executor (mode-dependent) ---
     gasless_merger = None
@@ -156,10 +164,12 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
             api_secret=config.credentials.api_secret,
             api_passphrase=config.credentials.api_passphrase,
         )
+        executor.set_state_manager(state_manager)
         await executor.initialize()
         log.info("live_executor_initialized")
 
-        # Safety: cancel any stale orders from a previous run/crash
+        # Reconcile state: cancel all orders on startup, which will also clear state.
+        # This prevents fake state or duplicate exposure.
         await executor.cancel_all()
         log.info("startup_cleanup", msg="Cancelled all stale orders from previous session")
 
@@ -252,6 +262,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
             max_imbalance=ac.max_dollar_delta,  # Now share-based threshold
             max_capital_per_market=config.global_params.max_capital_per_market,
         )
+        inventory.set_state_manager(state_manager)
 
         # Per-asset risk engine
         risk = RiskEngine(
@@ -358,22 +369,23 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
 
     # Switch to dashboard-only output (suppress console, keep file logs)
     from src.monitoring.logger import suppress_console, restore_console
-    suppress_console()
+    if not headless:
+        suppress_console()
 
-    # --- Legacy Windows Console Loop ---
-    # For older Windows terminals that don't support rich.Live ANSI replacements,
-    # we explicitly clear the console every second to prevent infinite scrolling.
-    async def dashboard_loop():
-        while True:
-            try:
-                os.system('cls' if os.name == 'nt' else 'clear')
-                dashboard.console.print(dashboard.render())
-            except Exception as e:
-                log.error("dashboard_error", error=str(e))
-            await asyncio.sleep(1)
+        # --- Legacy Windows Console Loop ---
+        # For older Windows terminals that don't support rich.Live ANSI replacements,
+        # we explicitly clear the console every second to prevent infinite scrolling.
+        async def dashboard_loop():
+            while True:
+                try:
+                    os.system('cls' if os.name == 'nt' else 'clear')
+                    dashboard.console.print(dashboard.render())
+                except Exception as e:
+                    log.error("dashboard_error", error=str(e))
+                await asyncio.sleep(1)
 
-    dash_task = asyncio.create_task(dashboard_loop())
-    tasks.append(dash_task)
+        dash_task = asyncio.create_task(dashboard_loop())
+        tasks.append(dash_task)
 
     # --- Wait for shutdown (Windows-compatible) ---
     try:
@@ -384,7 +396,8 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None):
 
     # --- Graceful shutdown ---
     # Re-enable console logging for shutdown messages
-    restore_console()
+    if not headless:
+        restore_console()
     log.info("shutting_down")
 
     # Stop all cyclers
@@ -464,7 +477,7 @@ def main():
     print("  Markets: Up/Down 15-minute crypto binaries")
     print("=" * 60 + "\n")
 
-    if args.mode == "live":
+    if args.mode == "live" and not args.headless:
         # Safety confirmation for live mode
         print("[WARNING] LIVE MODE — Real money will be used!")
         confirm = input("Type 'CONFIRM' to proceed: ")
@@ -474,7 +487,7 @@ def main():
 
     # Run
     try:
-        asyncio.run(run_bot(config, args.assets))
+        asyncio.run(run_bot(config, args.assets, args.headless))
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
 

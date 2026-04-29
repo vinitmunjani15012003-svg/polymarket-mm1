@@ -33,6 +33,30 @@ class ClobClientWrapper:
         self.open_orders: dict[str, dict] = {}
         self._processed_fills: set = set()
         self._last_fill_check_ts_by_market: dict[str, float] = {}
+        self.state_manager = None
+
+    def set_state_manager(self, state_manager):
+        self.state_manager = state_manager
+        
+        # Load open orders
+        loaded_orders = self.state_manager.state.get("open_orders", {})
+        if loaded_orders:
+            self.open_orders = loaded_orders
+            log.info("loaded_open_orders", count=len(self.open_orders))
+            
+        # Load processed fills
+        loaded_fills = self.state_manager.state.get("processed_fills", [])
+        if loaded_fills:
+            self._processed_fills = set(loaded_fills)
+            log.info("loaded_processed_fills", count=len(self._processed_fills))
+
+    def _save_orders_state(self):
+        if self.state_manager:
+            self.state_manager.update_open_orders(self.open_orders)
+            
+    def _save_fills_state(self):
+        if self.state_manager:
+            self.state_manager.update_processed_fills(list(self._processed_fills))
 
     async def initialize(self):
         """Initialize the CLOB client with credentials."""
@@ -109,6 +133,7 @@ class ClobClientWrapper:
                     "side": "BUY",
                     "token_side": side,  # "up" or "down"
                 }
+                self._save_orders_state()
                 log.info("order_placed", order_id=order_id[:8],
                          price=price, size=size, token=token_id[:8], token_side=side)
                 return order_id
@@ -131,6 +156,7 @@ class ClobClientWrapper:
         try:
             self._client.cancel(order_id)
             self.open_orders.pop(order_id, None)
+            self._save_orders_state()
             return True
         except Exception as e:
             log.error("cancel_error", order_id=order_id[:8], error=str(e))
@@ -143,6 +169,7 @@ class ClobClientWrapper:
         try:
             self._client.cancel_all()
             self.open_orders.clear()
+            self._save_orders_state()
             log.info("all_orders_cancelled")
             return True
         except Exception as e:
@@ -184,6 +211,7 @@ class ClobClientWrapper:
             if fill_id in self._processed_fills:
                 continue
             self._processed_fills.add(fill_id)
+            self._save_fills_state()
 
             size = float(fill.get("size", 0))
             price = float(fill.get("price", 0))
@@ -198,6 +226,7 @@ class ClobClientWrapper:
                 self.open_orders[order_id]["size"] -= size
                 if self.open_orders[order_id]["size"] <= 0.0001:  # Floating point safety
                     del self.open_orders[order_id]
+                self._save_orders_state()
 
             # Update inventory and edge tracker (MarketCycler loops this)
             # Actually MarketCycler is expected to handle inventory directly from fills.

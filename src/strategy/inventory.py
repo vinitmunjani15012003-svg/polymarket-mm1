@@ -39,6 +39,31 @@ class InventoryPosition:
     yes_fill_count: int = 0
     no_fill_count: int = 0
 
+    def to_dict(self):
+        return {
+            "market_id": self.market_id,
+            "asset": self.asset,
+            "yes_shares": self.yes_shares,
+            "no_shares": self.no_shares,
+            "yes_total_cost": self.yes_total_cost,
+            "no_total_cost": self.no_total_cost,
+            "yes_fill_count": self.yes_fill_count,
+            "no_fill_count": self.no_fill_count
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            market_id=data["market_id"],
+            asset=data.get("asset", ""),
+            yes_shares=data.get("yes_shares", 0.0),
+            no_shares=data.get("no_shares", 0.0),
+            yes_total_cost=data.get("yes_total_cost", 0.0),
+            no_total_cost=data.get("no_total_cost", 0.0),
+            yes_fill_count=data.get("yes_fill_count", 0),
+            no_fill_count=data.get("no_fill_count", 0)
+        )
+
     @property
     def yes_avg_entry(self) -> float:
         return self.yes_total_cost / self.yes_shares if self.yes_shares > 0 else 0.0
@@ -114,6 +139,19 @@ class InventoryManager:
         self.max_imbalance = max_imbalance
         self.max_capital_per_market = max_capital_per_market
         self.positions: dict[str, InventoryPosition] = {}
+        self.state_manager = None
+
+    def set_state_manager(self, state_manager):
+        self.state_manager = state_manager
+        # Load state if exists
+        inv_state = self.state_manager.state.get("inventory", {})
+        for mid, data in inv_state.items():
+            self.positions[mid] = InventoryPosition.from_dict(data)
+
+    def _save_state(self):
+        if self.state_manager:
+            data = {mid: pos.to_dict() for mid, pos in self.positions.items()}
+            self.state_manager.update_inventory(data)
 
     def get_or_create(self, market_id: str, asset: str = "") -> InventoryPosition:
         if market_id not in self.positions:
@@ -131,6 +169,7 @@ class InventoryManager:
             pos.no_total_cost += price * size
             pos.no_shares += size
             pos.no_fill_count += 1
+        self._save_state()
         log.info("fill_recorded", market=market_id[:8], side=side, size=size, price=price,
                  up_shares=pos.yes_shares, down_shares=pos.no_shares,
                  imbalance=pos.share_imbalance())
@@ -227,6 +266,7 @@ class InventoryManager:
         if not pos:
             return 0.0
         pnl = pos.settlement_pnl(outcome_yes)
+        self._save_state()
         log.info("market_settled", market=market_id[:8],
                  outcome="YES" if outcome_yes else "NO",
                  pnl=round(pnl, 4), pairs=pos.matched_pairs(),
