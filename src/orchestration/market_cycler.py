@@ -753,13 +753,18 @@ class MarketCycler:
             token_id_yes=market.token_id_up,
             token_id_no=market.token_id_down,
             quotes=quotes,
+            yes_book_snapshot=book_up,
+            no_book_snapshot=book_down,
         )
 
         # 15. Process fills (handle both dry-run and live CLOB modes)
         fills = []
         if hasattr(self.order_mgr.executor, 'check_fills'):
-            # Dry-run
-            fills = self.order_mgr.executor.check_fills()
+            # Dry-run (book-based)
+            fills = self.order_mgr.executor.check_fills(
+                yes_book_snapshot=book_up,
+                no_book_snapshot=book_down,
+            )
         elif hasattr(self.order_mgr.executor, 'get_fills'):
             # Live CLOB API
             try:

@@ -54,7 +54,9 @@ class OrderManager:
     async def update_quotes(self, market_id: str,
                              token_id_yes: str, token_id_no: str,
                              quotes: QuoteResult,
-                             book_snapshot=None) -> bool:
+                             book_snapshot=None,
+                             yes_book_snapshot=None,
+                             no_book_snapshot=None) -> bool:
         """
         Update quotes for a market. Only cancel+replace if materially different.
 
@@ -88,11 +90,18 @@ class OrderManager:
             await self.executor.cancel_order(active.no_order_id)
             active.no_order_id = None
 
+        # Allow per-side book snapshots (preferred). Fall back to shared
+        # book_snapshot for legacy callers.
+        if yes_book_snapshot is None:
+            yes_book_snapshot = book_snapshot
+        if no_book_snapshot is None:
+            no_book_snapshot = book_snapshot
+
         # Place new YES buy if we have a price and size
         if yes_needs and quotes.yes_buy_price and quotes.yes_buy_size > 0:
             order_id = await self._place_buy(
                 token_id_yes, quotes.yes_buy_price,
-                quotes.yes_buy_size, "yes", book_snapshot
+                quotes.yes_buy_size, "yes", yes_book_snapshot
             )
             if order_id:
                 active.yes_order_id = order_id
@@ -108,7 +117,7 @@ class OrderManager:
         if no_needs and quotes.no_buy_price and quotes.no_buy_size > 0:
             order_id = await self._place_buy(
                 token_id_no, quotes.no_buy_price,
-                quotes.no_buy_size, "no", book_snapshot
+                quotes.no_buy_size, "no", no_book_snapshot
             )
             if order_id:
                 active.no_order_id = order_id
