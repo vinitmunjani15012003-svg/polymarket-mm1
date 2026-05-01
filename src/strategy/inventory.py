@@ -351,6 +351,15 @@ class InventoryManager:
         # Use dynamic thresholds
         _, _, emerg = self._dynamic_thresholds(t_normalized)
 
+        # Hard emergency behavior: stop heavy side entirely, keep light side at
+        # base_size (no boosts). This is relied on by invariants/tests.
+        if abs_imbalance >= emerg:
+            if imbalance > 0:
+                return 0, base_size
+            elif imbalance < 0:
+                return base_size, 0
+            return 0, 0
+
         # --- Continuous exponential decay ---
         # k controls how aggressively we cut the heavy side
         # At emergency threshold → ~5% of base size

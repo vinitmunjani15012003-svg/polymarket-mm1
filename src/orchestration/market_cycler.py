@@ -379,19 +379,22 @@ class MarketCycler:
                 m = await self.discovery._fetch_market(market.asset, int(market.window_start_ts))
                 if not m:
                     continue
-                    
-                # Market is considered resolved if it's inactive or one token has hit $1.00
-                if not m.active or m.up_price == 1.0 or m.down_price == 1.0:
+
+                # Market is considered resolved if it's inactive OR prices have effectively
+                # settled to an extreme. Gamma often does not return *exactly* 1.0, so we
+                # use a tolerance.
+                prices = m.current_prices or []
+                up = m.up_price
+                down = m.down_price
+                max_price = max(prices) if prices else max(up, down)
+                resolved = (not m.active) or (max_price >= 0.95)
+
+                if resolved:
                     won_up = False
-                    if m.up_price == 1.0:
-                        won_up = True
-                    elif m.down_price == 1.0:
-                        won_up = False
-                    else:
-                        if not m.active:
-                            won_up = m.up_price > m.down_price
-                        else:
-                            continue
+
+                    # Prefer the higher-priced outcome when resolved.
+                    # (When inactive, prices sometimes aren't exactly {1,0}.)
+                    won_up = up >= down
                             
                     winning_shares = unmatched_up if won_up else unmatched_down
                     losing_shares = unmatched_down if won_up else unmatched_up
@@ -758,6 +761,34 @@ class MarketCycler:
             best_ask_no=best_ask_no,
         )
         quotes.phase = phase
+
+        # 12.5 Capital guardrail (prevents negative capital in dry-run and
+        # keeps live sizing within available funds).
+        # Conservative: assume both sides could fill immediately.
+        try:
+            avail = float(getattr(self.pnl, "current_capital", 0) or 0)
+            yes_notional = float(quotes.yes_buy_price or 0) * float(quotes.yes_buy_size or 0)
+            no_notional = float(quotes.no_buy_price or 0) * float(quotes.no_buy_size or 0)
+            planned = yes_notional + no_notional
+
+            if avail > 0 and planned > avail and planned > 0:
+                scale = max(0.0, min(1.0, avail / planned))
+                quotes.yes_buy_size = int(quotes.yes_buy_size * scale)
+                quotes.no_buy_size = int(quotes.no_buy_size * scale)
+
+            # Cross-asset arbiter: ensure we don't exceed dynamic allocation.
+            if self.inventory.capital_arbiter:
+                planned2 = (float(quotes.yes_buy_price or 0) * float(quotes.yes_buy_size or 0)
+                            + float(quotes.no_buy_price or 0) * float(quotes.no_buy_size or 0))
+                # If blocked, shrink sizes until allowed (binary-ish backoff).
+                while planned2 > 0 and not self.inventory.capital_arbiter.can_deploy(self.asset, planned2):
+                    quotes.yes_buy_size = int(quotes.yes_buy_size * 0.5)
+                    quotes.no_buy_size = int(quotes.no_buy_size * 0.5)
+                    planned2 = (float(quotes.yes_buy_price or 0) * float(quotes.yes_buy_size or 0)
+                                + float(quotes.no_buy_price or 0) * float(quotes.no_buy_size or 0))
+        except Exception:
+            # Never fail a cycle due to sizing guardrails.
+            pass
 
         # 13. Pre-trade checks
         fv_fresh = not self.fair_value_model.is_stale
