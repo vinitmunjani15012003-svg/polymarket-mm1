@@ -27,6 +27,7 @@ class AssetConfig:
     soft_limit: float = 25.0
     hard_limit: float = 40.0
     emergency: float = 48.0
+    auto_merge_dollar_threshold: float = 15.0  # Merge when locked capital exceeds this ($)
 
 
 @dataclass
@@ -231,6 +232,7 @@ def load_config(config_path: str = "config/default.yaml",
             soft_limit=params.get("soft_limit", 25.0),
             hard_limit=params.get("hard_limit", 40.0),
             emergency=params.get("emergency", 48.0),
+            auto_merge_dollar_threshold=params.get("auto_merge_dollar_threshold", 15.0),
         )
 
     # Global

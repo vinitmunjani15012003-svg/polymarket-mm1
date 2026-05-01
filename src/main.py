@@ -23,6 +23,7 @@ from src.data.price_feed import PriceFeed
 from src.data.market_discovery import MarketDiscovery
 from src.data.orderbook import OrderBookReader
 from src.strategy.inventory import InventoryManager
+from src.strategy.capital_arbiter import CapitalArbiter
 from src.execution.order_manager import OrderManager
 from src.execution.dry_run import DryRunExecutor
 from src.execution.state_manager import StateManager
@@ -265,6 +266,19 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
                     total += pos.mark_to_market(c.last_fair_value)
         return total
 
+    # --- Create shared capital arbiter ---
+    capital_arbiter = CapitalArbiter(
+        total_capital=config.global_params.total_capital,
+        asset_names=list(active_assets.keys()),
+        max_per_asset_pct=0.50,
+        reserve_pct=0.10,
+    )
+    for a_name in active_assets:
+        capital_arbiter.register_asset(a_name)
+    log.info("capital_arbiter_initialized",
+             total=config.global_params.total_capital,
+             assets=list(active_assets.keys()))
+
     for asset_name, ac in active_assets.items():
         # Per-asset executor + order manager in dry-run mode
         # Each asset needs its own DryRunExecutor so that fair values
@@ -289,8 +303,10 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
             emergency=ac.emergency,
             max_imbalance=ac.max_dollar_delta,  # Now share-based threshold
             max_capital_per_market=config.global_params.max_capital_per_market,
+            auto_merge_dollar_threshold=ac.auto_merge_dollar_threshold,
         )
         inventory.set_state_manager(state_manager)
+        inventory.set_capital_arbiter(capital_arbiter)
 
         # Per-asset P&L tracker
         asset_pnl_tracker = PnLTracker()

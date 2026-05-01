@@ -46,6 +46,7 @@ assets:
     soft_limit: 75
     hard_limit: 120
     emergency: 140
+    auto_merge_dollar_threshold: 15.0   # Merge when locked capital exceeds $15
 
   ETH:
     enabled: true
@@ -60,6 +61,7 @@ assets:
     soft_limit: 75
     hard_limit: 120
     emergency: 140
+    auto_merge_dollar_threshold: 15.0
 
   SOL:
     enabled: true
@@ -74,6 +76,7 @@ assets:
     soft_limit: 75
     hard_limit: 120
     emergency: 140
+    auto_merge_dollar_threshold: 15.0
 
   XRP:
     enabled: true
@@ -88,6 +91,7 @@ assets:
     soft_limit: 75
     hard_limit: 120
     emergency: 140
+    auto_merge_dollar_threshold: 15.0
 
 # --- Global Trading Parameters ---
 global:

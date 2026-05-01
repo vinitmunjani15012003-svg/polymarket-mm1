@@ -154,8 +154,8 @@ class MarketCycler:
         self.gasless_merger: Optional[GaslessMerger] = gasless_merger
         self.balance_monitor: Optional[BalanceMonitor] = balance_monitor
         
-        # Merge threshold: auto-merge when matched pairs exceed this
-        self._merge_threshold = 50  # shares
+        # Merge threshold: auto-merge when locked capital exceeds this
+        self._merge_dollar_threshold = 15.0  # dollars
 
         # Per-market components (recreated each cycle)
         self.current_market: Optional[MarketInfo] = None
@@ -213,12 +213,14 @@ class MarketCycler:
                 # 1. Discover next market
                 market = await self._find_next_market()
                 if not market:
+                    self._update_dashboard_waiting()
                     await asyncio.sleep(5)
                     continue
 
                 # Skip if same market as before (already being traded)
                 if market.slug == self._last_market_slug:
-                    await asyncio.sleep(5)
+                    log.warning("resuming_market_after_error", asset=self.asset, slug=market.slug)
+                    await self._run_market(market)
                     continue
 
                 # 2. New market found — settle old, prepare new
@@ -246,6 +248,7 @@ class MarketCycler:
                 if wait_time > 0:
                     log.info("waiting_for_next_window",
                              asset=self.asset, wait_s=round(wait_time, 1))
+                    self._update_dashboard_waiting()
                     await asyncio.sleep(wait_time)
 
             except asyncio.CancelledError:
@@ -298,6 +301,7 @@ class MarketCycler:
                     if tx:
                         pair_profit = pos.matched_pair_profit()
                         self.pnl.record_settlement(pair_profit, market.market_id)
+                        self.pnl.record_capital_recovery(pairs * 1.0)
                         log.info("pairs_merged",
                                  pairs=pairs,
                                  profit=f"${pair_profit:.4f}",
@@ -321,6 +325,14 @@ class MarketCycler:
 
             # Simulate redemption of unmatched tokens in Dry-Run
             elif not self.ctf and not self.gasless_merger:
+                if pairs > 0:
+                    pair_profit = pos.matched_pair_profit()
+                    self.pnl.record_settlement(pair_profit, market.market_id)
+                    self.pnl.record_capital_recovery(pairs * 1.0)
+                    log.info("dry_run_pairs_merged",
+                             pairs=pairs,
+                             profit=f"${pair_profit:.4f}")
+
                 unmatched_up = pos.yes_shares - pairs
                 unmatched_down = pos.no_shares - pairs
                 
@@ -457,18 +469,13 @@ class MarketCycler:
 
     async def _run_market(self, market: MarketInfo):
         """Run the quote loop for a single 15-minute market."""
-        # Fetch the "price to beat" — the exact strike price at window open.
-        #
-        # Polymarket 15-min windows use the Vatic Trading API to set the strike.
-        #
-        # Priority:
-        #   1. Vatic Trading API (EXACT price to beat)
-        #   2. Binance 15m candle open (fast, reliable fallback, ~$10-20 off)
-        #   3. Current spot (only if window just opened < 30s ago)
-        
         self._has_done_30s_merge = False
         start_price = None
         binance_start_price = None
+
+        log.info("initializing_new_market", asset=self.asset, slug=market.slug)
+        spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0)
+        self._update_dashboard(market, spot, 0, 0, "INITIALIZING", market.time_remaining)
 
         # 1. PRIMARY: Exact price-to-beat from Vatic API (Chainlink)
         start_price = await self.price_feed.fetch_vatic_strike(
@@ -583,16 +590,9 @@ class MarketCycler:
                 log.info("market_expired", asset=self.asset, slug=market.slug)
                 break  # Market resolved
 
-            # Skip quoting if risk-halted (but keep looping to check expiry)
+            # Check if cooldown expired for risk halts
             if self.risk_engine.halted:
-                # Check if cooldown expired
                 self.risk_engine.check_stops(self.pnl.net_pnl)
-                if self.risk_engine.halted:
-                    spot = self.price_feed.get_price(self.ac.symbol) or 0
-                    spot += self.chainlink_spread  # Apply spread to display
-                    self._update_dashboard(market, spot, 0.5, 0, "HALTED", remaining)
-                    await asyncio.sleep(self.gc.refresh_interval)
-                    continue
 
             try:
                 await self._quote_cycle(market)
@@ -665,10 +665,12 @@ class MarketCycler:
             current_pnl = self.portfolio_pnl_getter()
         else:
             current_pnl = pos.mark_to_market(fv) + self.pnl.net_pnl
-        if not self.risk_engine.check_stops(current_pnl):
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-            self._update_dashboard(market, spot, fv, sigma, "HALTED", remaining)
-            return
+        is_halted = False
+        halt_reason = ""
+
+        if self.risk_engine.halted or not self.risk_engine.check_stops(current_pnl):
+            is_halted = True
+            halt_reason = "HALTED"
 
         # 8. Edge tracker reaction
         # This will auto-adjust the quote_engine.spread_multiplier if toxicity is high.
@@ -678,21 +680,21 @@ class MarketCycler:
         # 9. Toxicity monitor
         self.toxicity_monitor.update_delayed_mids(fv)
         self.toxicity_monitor.adjust_spread(self.quote_engine)
-        if self.toxicity_monitor.check_kill_switch(self.edge_tracker):
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-            self._update_dashboard(market, spot, fv, sigma, "TOXICITY_HALT", remaining)
-            return
+        if not is_halted and self.toxicity_monitor.check_kill_switch(self.edge_tracker):
+            is_halted = True
+            halt_reason = "TOXICITY_HALT"
 
         # 10. Compute inventory state and sizes
         #     Uses SHARE COUNT imbalance (Up - Down), not dollar delta
+        #     Pass t_normalized for time-aware dynamic thresholds
         imbalance = pos.share_imbalance()
-        inv_state = self.inventory.get_state(market.market_id, fv)
+        inv_state = self.inventory.get_state(market.market_id, fv, t_norm)
         up_size, down_size = self.inventory.compute_size_adjustment(
-            market.market_id, fv, self.quote_engine.max_order_size
+            market.market_id, fv, self.quote_engine.max_order_size, t_norm
         )
 
-        # 10.5 Enforce Close-Only quoting during near-expiry phases
-        if phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]:
+        # 10.5 Enforce Close-Only quoting during near-expiry phases OR HALTS
+        if is_halted or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]:
             # Only allow quoting the side that reduces the imbalance
             if imbalance > 0:
                 up_size = 0
@@ -704,8 +706,14 @@ class MarketCycler:
                 up_size = 0
                 down_size = 0
 
-        # 11. Capital limit check
-        blocks = self.inventory.check_capital_limit(market.market_id, fv)
+            # If halted and flat, stop quoting entirely
+            if is_halted and up_size == 0 and down_size == 0:
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self._update_dashboard(market, spot, fv, sigma, halt_reason, remaining)
+                return
+
+        # 11. Capital limit check (includes cross-asset arbiter)
+        blocks = self.inventory.check_capital_limit(market.market_id, fv, self.asset)
         if blocks.get("block_yes"):
             up_size = 0
         if blocks.get("block_no"):
@@ -743,7 +751,7 @@ class MarketCycler:
         if not passed:
             log.warning("pre_trade_failed", market=market.market_id, reasons=failed_reasons)
             await self.order_mgr.cancel_market_quotes(market.market_id)
-            self._update_dashboard(market, spot, fv, sigma, phase, remaining)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
             return
 
         # 14. Update orders
@@ -791,11 +799,19 @@ class MarketCycler:
                 fill["side"], fill["price"], fv
             )
 
-        # 15.5. Auto-merge check (live mode: reclaim USDC when balance is low)
+        # 15.5. Auto-merge check: dollar-based threshold OR low balance OR near expiry
         force_merge = False
         if remaining <= 30 and not getattr(self, '_has_done_30s_merge', False):
             force_merge = True
             self._has_done_30s_merge = True
+
+        # Dollar-based mid-market merge trigger
+        if not force_merge and self.inventory.should_merge(market.market_id):
+            force_merge = True
+            log.info("dollar_threshold_merge_triggered",
+                     asset=self.asset,
+                     locked=f"${pos.locked_capital():.2f}",
+                     threshold=f"${self.inventory.auto_merge_dollar_threshold:.2f}")
 
         if self.balance_monitor:
             merge_result = await self.balance_monitor.check_and_merge(
@@ -811,10 +827,71 @@ class MarketCycler:
                          asset=self.asset,
                          pairs=merge_result["pairs_merged"],
                          usdc=f"${merge_result['usdc_recovered']:.2f}")
+                # Update capital arbiter on recovery
+                if self.inventory.capital_arbiter:
+                    self.inventory.capital_arbiter.record_recovery(
+                        self.asset, merge_result['usdc_recovered'])
 
         # 16. Update dashboard
-        self._update_dashboard(market, spot, fv, sigma, phase, remaining,
+        self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining,
                                 quotes, pos, imbalance, inv_state.value)
+
+    def _update_dashboard_waiting(self):
+        if not self._dashboard_cb:
+            return
+            
+        spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0)
+        
+        state = {
+            "asset": self.asset,
+            "market_id": "waiting...",
+            "slug": "Waiting for next Polymarket window...",
+            "question": "",
+            "start_price": 0,
+            "spot_price": spot,
+            "raw_spot": spot,
+            "chainlink_spread": 0,
+            "fair_value": 0,
+            "sigma": 0,
+            "ws_ticks": getattr(self.price_feed, "ticks", 0),
+            "phase": "WAITING",
+            "time_remaining": 0,
+            "regime": "WAITING",
+            "up_buy": 0,
+            "down_buy": 0,
+            "up_size": 0,
+            "down_size": 0,
+            "combined_cost": 0,
+            "edge": 0,
+            "up_shares": 0,
+            "down_shares": 0,
+            "up_avg": 0,
+            "down_avg": 0,
+            "share_imbalance": 0,
+            "dollar_delta": 0,
+            "inv_state": "WAITING",
+            "net_trading_pnl": self.pnl.net_trading_pnl,
+            "est_rebates": self.pnl.est_rebates,
+            "net_pnl": self.pnl.net_pnl,
+            "rebates_per_hour": self.pnl.rebates_per_hour(),
+            "total_volume": self.pnl.total_volume,
+            "total_shares": self.pnl.total_shares,
+            "markets_settled": self.pnl.markets_settled,
+            "total_fills": self.pnl.total_fills,
+            "starting_capital": getattr(self.pnl, "starting_capital", 0),
+            "current_capital": getattr(self.pnl, "current_capital", 0),
+        }
+        
+        if self.balance_monitor:
+            bm_stats = self.balance_monitor.stats
+            state["wallet_balance"] = bm_stats["last_balance"]
+            state["auto_merges"] = bm_stats["total_merges"]
+            state["auto_merged_usdc"] = bm_stats["total_merged_usdc"]
+            state["balance_warn_threshold"] = self.balance_monitor.warn_balance
+            state["balance_merge_threshold"] = self.balance_monitor.merge_balance
+            state["merge_message"] = bm_stats.get("merge_message", "")
+            
+        self._dashboard_cb(state)
 
     def _update_dashboard(self, market, spot, fv, sigma, phase,
                            remaining, quotes=None, pos=None,

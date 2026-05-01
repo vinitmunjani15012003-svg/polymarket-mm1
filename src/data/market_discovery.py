@@ -168,9 +168,13 @@ class MarketDiscovery:
         slug = self.compute_slug(asset, window_start)
 
         try:
+            params = {
+                "slug": slug,
+                "_t": int(time.time())  # Cache-buster
+            }
             resp = await self._client.get(
                 f"{GAMMA_API_URL}/markets",
-                params={"slug": slug}
+                params=params
             )
             resp.raise_for_status()
             data = resp.json()

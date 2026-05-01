@@ -509,10 +509,9 @@ class BalanceMonitor:
 
                     # Record profit in P&L tracker
                     if pnl_tracker:
-                        if pair_profit > 0:
-                            pnl_tracker.record_settlement(
-                                pair_profit, market_id
-                            )
+                        pnl_tracker.record_settlement(
+                            pair_profit, market_id
+                        )
                         pnl_tracker.record_capital_recovery(usdc_recovery)
 
                     # Deduct merged pairs from inventory
@@ -530,6 +529,9 @@ class BalanceMonitor:
 
                     self._total_merged_usdc += usdc_recovery
                     self._total_merges += 1
+
+            if total_pairs > 0:
+                inventory_mgr._save_state()
 
             result["merged"] = total_pairs > 0
             result["pairs_merged"] = total_pairs
