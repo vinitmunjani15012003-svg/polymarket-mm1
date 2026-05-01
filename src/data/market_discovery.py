@@ -63,13 +63,63 @@ class MarketInfo:
 
     @property
     def up_price(self) -> float:
-        """Current Up outcome price."""
-        return self.current_prices[0] if self.current_prices else 0.5
+        """Current Up outcome price.
+
+        Gamma's `outcomes` ordering is not guaranteed; do not assume
+        current_prices[0] is always Up.
+        """
+        return self._price_for("up")
 
     @property
     def down_price(self) -> float:
-        """Current Down outcome price."""
-        return self.current_prices[1] if self.current_prices else 0.5
+        """Current Down outcome price.
+
+        Gamma's `outcomes` ordering is not guaranteed; do not assume
+        current_prices[1] is always Down.
+        """
+        return self._price_for("down")
+
+    def _price_for(self, outcome: str) -> float:
+        """Return price for the requested outcome label (case-insensitive).
+
+        Falls back to the positional assumption when outcomes/prices are
+        missing or inconsistent.
+        """
+        try:
+            if not self.current_prices:
+                return 0.5
+            if not self.outcomes or len(self.outcomes) != len(self.current_prices):
+                # Legacy/fallback assumption: [Up, Down]
+                if outcome.lower() == "up":
+                    return self.current_prices[0]
+                if outcome.lower() == "down":
+                    return self.current_prices[1] if len(self.current_prices) > 1 else 0.5
+                return 0.5
+
+            want = outcome.lower()
+            for i, name in enumerate(self.outcomes):
+                if str(name).strip().lower() == want:
+                    return float(self.current_prices[i])
+
+            # If Gamma uses YES/NO, try mapping: YES=Up, NO=Down (our bot convention)
+            if want == "up":
+                for i, name in enumerate(self.outcomes):
+                    if str(name).strip().lower() == "yes":
+                        return float(self.current_prices[i])
+            if want == "down":
+                for i, name in enumerate(self.outcomes):
+                    if str(name).strip().lower() == "no":
+                        return float(self.current_prices[i])
+
+        except Exception:
+            pass
+
+        # Last-resort fallback
+        if outcome.lower() == "up":
+            return self.current_prices[0] if self.current_prices else 0.5
+        if outcome.lower() == "down":
+            return self.current_prices[1] if self.current_prices and len(self.current_prices) > 1 else 0.5
+        return 0.5
 
     @property
     def market_mid_up(self) -> float:
