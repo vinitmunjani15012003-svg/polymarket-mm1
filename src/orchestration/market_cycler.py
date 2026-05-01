@@ -337,8 +337,15 @@ class MarketCycler:
                 unmatched_down = pos.no_shares - pairs
                 
                 if (unmatched_up > 0 or unmatched_down > 0):
+                    # Snapshot position data BEFORE clear_market to avoid data race
+                    pos_snapshot = {
+                        "yes_avg_entry": pos.yes_avg_entry,
+                        "no_avg_entry": pos.no_avg_entry,
+                        "unmatched_up": unmatched_up,
+                        "unmatched_down": unmatched_down,
+                    }
                     # Kick off background task to wait for actual resolution from Polymarket API
-                    asyncio.create_task(self._wait_and_settle_unmatched(market, pos, pairs))
+                    asyncio.create_task(self._wait_and_settle_unmatched(market, pos_snapshot))
 
             # Clear position from inventory state
             self.inventory.clear_market(market.market_id)
@@ -350,10 +357,18 @@ class MarketCycler:
         if not self.portfolio_pnl_getter:
             self.risk_engine.reset_for_new_market(self.pnl.net_pnl)
 
-    async def _wait_and_settle_unmatched(self, market: MarketInfo, pos, pairs: int):
-        """Background task to poll Gamma API and wait for actual market resolution."""
-        unmatched_up = pos.yes_shares - pairs
-        unmatched_down = pos.no_shares - pairs
+    async def _wait_and_settle_unmatched(self, market: MarketInfo, pos_snapshot: dict):
+        """Background task to poll Gamma API and wait for actual market resolution.
+        
+        Args:
+            market: MarketInfo for the expired market.
+            pos_snapshot: Frozen dict with keys: yes_avg_entry, no_avg_entry,
+                          unmatched_up, unmatched_down.
+        """
+        unmatched_up = pos_snapshot["unmatched_up"]
+        unmatched_down = pos_snapshot["unmatched_down"]
+        yes_avg = pos_snapshot["yes_avg_entry"]
+        no_avg = pos_snapshot["no_avg_entry"]
         
         log.info("waiting_for_actual_resolution", slug=market.slug)
         
@@ -382,8 +397,8 @@ class MarketCycler:
                     losing_shares = unmatched_down if won_up else unmatched_up
                     winner_str = "UP" if won_up else "DOWN"
                     
-                    cost_of_winning = winning_shares * (pos.yes_avg_entry if won_up else pos.no_avg_entry)
-                    cost_of_losing = losing_shares * (pos.no_avg_entry if won_up else pos.yes_avg_entry)
+                    cost_of_winning = winning_shares * (yes_avg if won_up else no_avg)
+                    cost_of_losing = losing_shares * (no_avg if won_up else yes_avg)
                     
                     revenue = winning_shares * 1.0
                     net_profit = revenue - cost_of_winning - cost_of_losing

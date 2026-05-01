@@ -308,10 +308,11 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
         inventory.set_state_manager(state_manager)
         inventory.set_capital_arbiter(capital_arbiter)
 
-        # Per-asset P&L tracker
+        # Per-asset P&L tracker — split total capital across assets
+        per_asset_capital = config.global_params.starting_capital / max(1, len(active_assets))
         asset_pnl_tracker = PnLTracker()
-        asset_pnl_tracker.starting_capital = config.global_params.starting_capital
-        asset_pnl_tracker.current_capital = config.global_params.starting_capital
+        asset_pnl_tracker.starting_capital = per_asset_capital
+        asset_pnl_tracker.current_capital = per_asset_capital
 
         cycler = MarketCycler(
             asset=asset_name,

@@ -132,6 +132,7 @@ class ClobClientWrapper:
                     "size": size,
                     "side": "BUY",
                     "token_side": side,  # "up" or "down"
+                    "placed_at": time.time(),
                 }
                 self._save_orders_state()
                 log.info("order_placed", order_id=order_id[:8],
