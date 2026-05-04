@@ -884,11 +884,24 @@ class MarketCycler:
                 planned2 = (float(quotes.yes_buy_price or 0) * float(quotes.yes_buy_size or 0)
                             + float(quotes.no_buy_price or 0) * float(quotes.no_buy_size or 0))
                 # If blocked, shrink sizes until allowed (binary-ish backoff).
-                while planned2 > 0 and not self.inventory.capital_arbiter.can_deploy(self.asset, planned2):
+                # Cap iterations defensively in case can_deploy() misbehaves.
+                for i in range(20):
+                    if planned2 <= 0:
+                        break
+                    if self.inventory.capital_arbiter.can_deploy(self.asset, planned2):
+                        break
                     quotes.yes_buy_size = int(quotes.yes_buy_size * 0.5)
                     quotes.no_buy_size = int(quotes.no_buy_size * 0.5)
                     planned2 = (float(quotes.yes_buy_price or 0) * float(quotes.yes_buy_size or 0)
                                 + float(quotes.no_buy_price or 0) * float(quotes.no_buy_size or 0))
+                else:
+                    log.debug(
+                        "capital_arbiter_backoff_cap_hit",
+                        asset=self.asset,
+                        planned=planned2,
+                        yes_size=quotes.yes_buy_size,
+                        no_size=quotes.no_buy_size,
+                    )
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
