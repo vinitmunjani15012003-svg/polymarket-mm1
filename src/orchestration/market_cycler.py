@@ -655,6 +655,10 @@ class MarketCycler:
         phase = determine_phase(remaining, self.gc.stop_quoting_seconds,
                                 self.gc.reduce_size_seconds)
 
+        # Balance-only mode: last 5 minutes of the window.
+        # Goal: stop building the heavy side and quote ONLY to repair inventory.
+        balance_only = remaining <= 300
+
         # Get inventory position early for the DEAD_ZONE check
         pos = self.inventory.get_or_create(market.market_id, self.asset)
 
@@ -711,6 +715,24 @@ class MarketCycler:
             market.market_id, fv, self.quote_engine.max_order_size, t_norm
         )
 
+        # 10.25 Balance-only quoting in the last 5 minutes
+        if balance_only:
+            if imbalance > 0:
+                # Too many Up shares → quote Down only
+                up_size = 0
+                down_size = min(self.quote_engine.max_order_size, int(imbalance))
+            elif imbalance < 0:
+                # Too many Down shares → quote Up only
+                down_size = 0
+                up_size = min(self.quote_engine.max_order_size, int(abs(imbalance)))
+            else:
+                # Flat → stop quoting cleanly
+                up_size = 0
+                down_size = 0
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self._update_dashboard(market, spot, fv, sigma, phase, remaining)
+                return
+
         # 10.5 Enforce Close-Only quoting during near-expiry phases OR HALTS
         if is_halted or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]:
             # Only allow quoting the side that reduces the imbalance
@@ -721,8 +743,19 @@ class MarketCycler:
                 down_size = 0
                 up_size = min(self.quote_engine.max_order_size, int(abs(imbalance)))
             else:
+                # If we're flat near expiry, we intentionally do not quote.
+                # IMPORTANT: Don't treat this as a "pre_trade_failed" condition;
+                # it would spam warnings and look like terrible quote uptime.
                 up_size = 0
                 down_size = 0
+
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self._update_dashboard(
+                    market, spot, fv, sigma,
+                    halt_reason if is_halted else phase,
+                    remaining,
+                )
+                return
 
             # If halted and flat, stop quoting entirely
             if is_halted and up_size == 0 and down_size == 0:
