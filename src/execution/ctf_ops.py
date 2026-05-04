@@ -593,7 +593,7 @@ class CTFOperations:
     """
 
     def __init__(self, private_key: str,
-                 rpc_url: str = "https://polygon-rpc.com",
+                 rpc_url: str = "https://polygon-bor.publicnode.com",
                  dry_run: bool = True):
         """
         Args:
@@ -615,11 +615,25 @@ class CTFOperations:
         try:
             from web3 import Web3
 
-            self._w3 = Web3(Web3.HTTPProvider(self._rpc_url))
-            try:
-                self._w3.eth.block_number  # Reliable connectivity test
-            except Exception:
-                log.error("web3_not_connected", rpc=self._rpc_url)
+            rpc_candidates = [
+                self._rpc_url,
+                "https://polygon-bor.publicnode.com",
+                "https://polygon.rpc.blxrbdn.com",
+            ]
+            last_err = None
+            for rpc in rpc_candidates:
+                try:
+                    w3 = Web3(Web3.HTTPProvider(rpc))
+                    _ = w3.eth.block_number
+                    self._w3 = w3
+                    self._rpc_url = rpc
+                    break
+                except Exception as e:
+                    last_err = e
+                    continue
+
+            if not self._w3:
+                log.error("web3_not_connected", rpc=self._rpc_url, error=str(last_err) if last_err else "unknown")
                 return False
 
             self._account = self._w3.eth.account.from_key(self._private_key)

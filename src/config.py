@@ -213,7 +213,7 @@ def load_config(config_path: str = "config/default.yaml",
         builder_secret=builder.get("secret", ""),
         builder_passphrase=builder.get("passphrase", ""),
         builder_relayer_url=builder.get("relayer_url", "https://relayer-v2.polymarket.com"),
-        polygon_rpc_url=pm.get("polygon_rpc_url", "https://polygon-rpc.com"),
+        polygon_rpc_url=pm.get("polygon_rpc_url", "https://polygon-bor.publicnode.com"),
         binance_ws_url=bn.get("ws_url", "wss://stream.binance.com:9443/ws"),
         binance_rest_url=bn.get("rest_url", "https://api.binance.com/api/v3"),
     )
