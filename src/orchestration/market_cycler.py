@@ -208,6 +208,22 @@ class MarketCycler:
         self._running = True
         log.info("cycler_started", asset=self.asset)
 
+        # Dry-run: if the previous process stopped before Gamma recorded resolution,
+        # we may have unresolved windows persisted in state. Resume those checks.
+        try:
+            sm = getattr(self.inventory, "state_manager", None)
+            pending = (sm.state.get("pending_resolutions", []) if sm and hasattr(sm, "state") else [])
+            for e in pending:
+                if e.get("asset") != self.asset:
+                    continue
+                slug = e.get("slug")
+                window_start_ts = e.get("window_start_ts")
+                if slug and window_start_ts:
+                    asyncio.create_task(self._wait_and_settle_unmatched_from_state(e))
+        except Exception:
+            # Never block the cycler on pending-resolution bookkeeping.
+            pass
+
         while self._running:
             try:
                 # 1. Discover next market
@@ -335,17 +351,37 @@ class MarketCycler:
 
                 unmatched_up = pos.yes_shares - pairs
                 unmatched_down = pos.no_shares - pairs
-                
-                if (unmatched_up > 0 or unmatched_down > 0):
-                    # Snapshot position data BEFORE clear_market to avoid data race
-                    pos_snapshot = {
-                        "yes_avg_entry": pos.yes_avg_entry,
-                        "no_avg_entry": pos.no_avg_entry,
-                        "unmatched_up": unmatched_up,
-                        "unmatched_down": unmatched_down,
-                    }
-                    # Kick off background task to wait for actual resolution from Polymarket API
-                    asyncio.create_task(self._wait_and_settle_unmatched(market, pos_snapshot))
+
+                # Always track/record the real outcome (even if flat).
+                # This is useful for analyzing market behavior and verifying the model.
+                pos_snapshot = {
+                    "yes_avg_entry": pos.yes_avg_entry,
+                    "no_avg_entry": pos.no_avg_entry,
+                    "unmatched_up": unmatched_up,
+                    "unmatched_down": unmatched_down,
+                }
+
+                # Persist a pending resolution record so the next run can finish it even if
+                # this process exits (timeout/restart).
+                sm = getattr(self.inventory, "state_manager", None)
+                if sm:
+                    try:
+                        sm.add_pending_resolution({
+                            "slug": market.slug,
+                            "asset": market.asset,
+                            "window_start_ts": int(market.window_start_ts),
+                            "market_id": market.market_id,
+                            "yes_avg_entry": pos_snapshot["yes_avg_entry"],
+                            "no_avg_entry": pos_snapshot["no_avg_entry"],
+                            "unmatched_up": pos_snapshot["unmatched_up"],
+                            "unmatched_down": pos_snapshot["unmatched_down"],
+                            "created_ts": time.time(),
+                        })
+                    except Exception:
+                        pass
+
+                # Kick off background task to wait for actual resolution from Gamma API
+                asyncio.create_task(self._wait_and_settle_unmatched(market, pos_snapshot))
 
             # Clear position from inventory state
             self.inventory.clear_market(market.market_id)
@@ -410,13 +446,45 @@ class MarketCycler:
                     self.pnl.record_capital_recovery(revenue)
                     
                     log.info("dry_run_actual_resolution",
+                             slug=market.slug,
                              winner=winner_str,
                              winning_shares=winning_shares,
                              losing_shares=losing_shares,
                              pnl=f"${net_profit:.4f}")
+
+                    # Remove pending resolution record (if any)
+                    sm = getattr(self.inventory, "state_manager", None)
+                    if sm:
+                        try:
+                            sm.remove_pending_resolution(market.slug)
+                        except Exception:
+                            pass
                     break
             except Exception as e:
                 log.error("wait_and_settle_error", error=str(e))
+
+    async def _wait_and_settle_unmatched_from_state(self, entry: dict):
+        """Resume a pending dry-run resolution from persisted state."""
+        try:
+            class _M:
+                pass
+            m = _M()
+            m.slug = entry.get("slug")
+            m.asset = entry.get("asset")
+            m.window_start_ts = entry.get("window_start_ts")
+            m.market_id = entry.get("market_id")
+            # The rest of MarketInfo fields are not needed by the resolver.
+
+            pos_snapshot = {
+                "yes_avg_entry": float(entry.get("yes_avg_entry", 0.0) or 0.0),
+                "no_avg_entry": float(entry.get("no_avg_entry", 0.0) or 0.0),
+                "unmatched_up": float(entry.get("unmatched_up", 0.0) or 0.0),
+                "unmatched_down": float(entry.get("unmatched_down", 0.0) or 0.0),
+            }
+            await self._wait_and_settle_unmatched(m, pos_snapshot)
+        except Exception:
+            # If anything goes wrong, leave the pending entry for a later run.
+            return
 
     async def _find_next_market(self) -> Optional[MarketInfo]:
         """Find the next eligible market for this asset."""

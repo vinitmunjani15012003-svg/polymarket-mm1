@@ -17,6 +17,10 @@ class StateManager:
             "inventory": {},
             "open_orders": {},
             "processed_fills": [],
+            # Pending dry-run resolution records to be settled asynchronously.
+            # Each entry: {slug, asset, window_start_ts, market_id, yes_avg_entry,
+            #              no_avg_entry, unmatched_up, unmatched_down, created_ts}
+            "pending_resolutions": [],
             "last_updated": 0.0
         }
         os.makedirs(os.path.dirname(state_file), exist_ok=True)
@@ -62,6 +66,28 @@ class StateManager:
             "inventory": {},
             "open_orders": {},
             "processed_fills": [],
+            "pending_resolutions": [],
             "last_updated": time.time()
         }
+        self.save_state()
+
+    def add_pending_resolution(self, entry: Dict[str, Any]):
+        """Add/replace a pending resolution entry by slug."""
+        slug = entry.get("slug")
+        if not slug:
+            return
+        pending = self.state.get("pending_resolutions")
+        if not isinstance(pending, list):
+            pending = []
+        # de-dupe by slug
+        pending = [e for e in pending if e.get("slug") != slug]
+        pending.append(entry)
+        self.state["pending_resolutions"] = pending
+        self.save_state()
+
+    def remove_pending_resolution(self, slug: str):
+        pending = self.state.get("pending_resolutions")
+        if not isinstance(pending, list) or not slug:
+            return
+        self.state["pending_resolutions"] = [e for e in pending if e.get("slug") != slug]
         self.save_state()
