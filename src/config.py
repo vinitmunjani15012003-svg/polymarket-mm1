@@ -63,7 +63,8 @@ class CredentialsConfig:
     builder_passphrase: str = ""
     builder_relayer_url: str = "https://relayer-v2.polymarket.com"
     # Polygon RPC (for balance monitoring and on-chain ops)
-    polygon_rpc_url: str = "https://polygon-rpc.com"
+    # NOTE: polygon-rpc.com has become unreliable/paid for many tenants.
+    polygon_rpc_url: str = "https://polygon-bor.publicnode.com"
     # Binance
     binance_ws_url: str = "wss://stream.binance.com:9443/ws"
     binance_rest_url: str = "https://api.binance.com/api/v3"

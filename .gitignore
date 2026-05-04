@@ -12,6 +12,7 @@ logs/
 
 # Secrets / Live credentials (NEVER commit these)
 config/live.yaml
+secrets.txt
 
 # IDE
 .vscode/

@@ -180,9 +180,8 @@ class GaslessMerger:
             self._w3 = Web3()  # Only for ABI encoding, no RPC needed
 
             from py_builder_relayer_client.client import RelayClient
-            from py_builder_signing_sdk import (
-                BuilderConfig, BuilderApiKeyCreds,
-            )
+            # py-builder-signing-sdk does not export these from __init__ in newer versions
+            from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
 
             builder_config = BuilderConfig(
                 local_builder_creds=BuilderApiKeyCreds(
@@ -316,7 +315,7 @@ class BalanceMonitor:
 
     def __init__(self,
                  private_key: str,
-                 rpc_url: str = "https://polygon-rpc.com",
+                 rpc_url: str = "https://polygon-bor.publicnode.com",
                  warn_balance: float = 20.0,
                  merge_balance: float = 10.0,
                  min_merge_pairs: int = 5,
@@ -352,11 +351,28 @@ class BalanceMonitor:
         try:
             from web3 import Web3
 
-            self._w3 = Web3(Web3.HTTPProvider(self._rpc_url))
-            try:
-                self._w3.eth.block_number  # Reliable connectivity test
-            except Exception:
-                log.error("balance_monitor_rpc_down", rpc=self._rpc_url)
+            # Try primary RPC first, then fall back to a small allowlist.
+            # Public endpoints change reliability frequently.
+            rpc_candidates = [
+                self._rpc_url,
+                "https://polygon-bor.publicnode.com",
+                "https://polygon.rpc.blxrbdn.com",
+            ]
+            last_err = None
+            for rpc in rpc_candidates:
+                try:
+                    w3 = Web3(Web3.HTTPProvider(rpc))
+                    # Reliable connectivity test
+                    _ = w3.eth.block_number
+                    self._w3 = w3
+                    self._rpc_url = rpc
+                    break
+                except Exception as e:
+                    last_err = e
+                    continue
+
+            if not self._w3:
+                log.error("balance_monitor_rpc_down", rpc=self._rpc_url, error=str(last_err) if last_err else "unknown")
                 return False
 
             self._address = self._w3.eth.account.from_key(
@@ -966,4 +982,3 @@ class SimulatedBalanceMonitor:
             "initialized": True,
             "merge_message": getattr(self, '_merge_message', "")
         }
-

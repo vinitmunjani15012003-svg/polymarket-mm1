@@ -105,6 +105,7 @@ class ClobClientWrapper:
 
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.clob_types import PartialCreateOrderOptions
             from py_clob_client.order_builder.constants import BUY
 
             order_args = OrderArgs(
@@ -114,7 +115,10 @@ class ClobClientWrapper:
                 side=BUY,  # ALWAYS BUY
             )
 
-            signed_order = self._client.create_order(order_args)
+            # Crypto up/down markets are 1-cent tick. If we don't pass tick_size,
+            # the API may reject with order_version_mismatch.
+            opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+            signed_order = self._client.create_order(order_args, opts)
 
             # GTC = Good-Til-Cancelled, maker-only on Polymarket CLOB
             response = self._client.post_order(
