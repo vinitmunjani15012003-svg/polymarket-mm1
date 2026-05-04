@@ -218,11 +218,23 @@ class MarketCycler:
                     continue
                 slug = e.get("slug")
                 window_start_ts = e.get("window_start_ts")
-                if slug and window_start_ts:
-                    asyncio.create_task(self._wait_and_settle_unmatched_from_state(e))
-        except Exception:
+                market_id = e.get("market_id")
+                if slug and window_start_ts and market_id:
+                    asyncio.create_task(self._wait_and_settle_unmatched_by_fields(
+                        asset=e.get("asset"),
+                        slug=slug,
+                        window_start_ts=int(window_start_ts),
+                        market_id=market_id,
+                        pos_snapshot={
+                            "yes_avg_entry": float(e.get("yes_avg_entry", 0.0) or 0.0),
+                            "no_avg_entry": float(e.get("no_avg_entry", 0.0) or 0.0),
+                            "unmatched_up": float(e.get("unmatched_up", 0.0) or 0.0),
+                            "unmatched_down": float(e.get("unmatched_down", 0.0) or 0.0),
+                        },
+                    ))
+        except Exception as ex:
             # Never block the cycler on pending-resolution bookkeeping.
-            pass
+            log.debug("pending_resolution_bootstrap_failed", error=str(ex))
 
         while self._running:
             try:
@@ -377,8 +389,8 @@ class MarketCycler:
                             "unmatched_down": pos_snapshot["unmatched_down"],
                             "created_ts": time.time(),
                         })
-                    except Exception:
-                        pass
+                    except Exception as ex:
+                        log.debug("pending_resolution_persist_failed", slug=market.slug, error=str(ex))
 
                 # Kick off background task to wait for actual resolution from Gamma API
                 asyncio.create_task(self._wait_and_settle_unmatched(market, pos_snapshot))
@@ -406,85 +418,75 @@ class MarketCycler:
         yes_avg = pos_snapshot["yes_avg_entry"]
         no_avg = pos_snapshot["no_avg_entry"]
         
-        log.info("waiting_for_actual_resolution", slug=market.slug)
-        
+        await self._wait_and_settle_unmatched_by_fields(
+            asset=market.asset,
+            slug=market.slug,
+            window_start_ts=int(market.window_start_ts),
+            market_id=market.market_id,
+            pos_snapshot=pos_snapshot,
+        )
+
+    async def _wait_and_settle_unmatched_by_fields(self, asset: str, slug: str,
+                                                   window_start_ts: int,
+                                                   market_id: str,
+                                                   pos_snapshot: dict):
+        """Poll Gamma until the market is inactive, then record outcome.
+
+        NOTE: We require m.active == False to avoid false positives.
+        """
+        unmatched_up = pos_snapshot["unmatched_up"]
+        unmatched_down = pos_snapshot["unmatched_down"]
+        yes_avg = pos_snapshot["yes_avg_entry"]
+        no_avg = pos_snapshot["no_avg_entry"]
+
+        log.info("waiting_for_actual_resolution", slug=slug)
+
         while self._running:
             await asyncio.sleep(30)
             try:
-                # Re-fetch market metadata from Gamma API
-                m = await self.discovery._fetch_market(market.asset, int(market.window_start_ts))
+                m = await self.discovery._fetch_market(asset, int(window_start_ts))
                 if not m:
                     continue
 
-                # Market is considered resolved if it's inactive OR prices have effectively
-                # settled to an extreme. Gamma often does not return *exactly* 1.0, so we
-                # use a tolerance.
-                prices = m.current_prices or []
+                # Require inactive to prevent volatility false positives.
+                if m.active:
+                    continue
+
                 up = m.up_price
                 down = m.down_price
-                max_price = max(prices) if prices else max(up, down)
-                resolved = (not m.active) or (max_price >= 0.95)
+                won_up = up >= down
 
-                if resolved:
-                    won_up = False
+                winning_shares = unmatched_up if won_up else unmatched_down
+                losing_shares = unmatched_down if won_up else unmatched_up
+                winner_str = "UP" if won_up else "DOWN"
 
-                    # Prefer the higher-priced outcome when resolved.
-                    # (When inactive, prices sometimes aren't exactly {1,0}.)
-                    won_up = up >= down
-                            
-                    winning_shares = unmatched_up if won_up else unmatched_down
-                    losing_shares = unmatched_down if won_up else unmatched_up
-                    winner_str = "UP" if won_up else "DOWN"
-                    
-                    cost_of_winning = winning_shares * (yes_avg if won_up else no_avg)
-                    cost_of_losing = losing_shares * (no_avg if won_up else yes_avg)
-                    
-                    revenue = winning_shares * 1.0
-                    net_profit = revenue - cost_of_winning - cost_of_losing
-                    
-                    self.pnl.record_settlement(net_profit, market.market_id)
-                    self.pnl.record_capital_recovery(revenue)
-                    
-                    log.info("dry_run_actual_resolution",
-                             slug=market.slug,
-                             winner=winner_str,
-                             winning_shares=winning_shares,
-                             losing_shares=losing_shares,
-                             pnl=f"${net_profit:.4f}")
+                cost_of_winning = winning_shares * (yes_avg if won_up else no_avg)
+                cost_of_losing = losing_shares * (no_avg if won_up else yes_avg)
 
-                    # Remove pending resolution record (if any)
-                    sm = getattr(self.inventory, "state_manager", None)
-                    if sm:
-                        try:
-                            sm.remove_pending_resolution(market.slug)
-                        except Exception:
-                            pass
-                    break
+                revenue = winning_shares * 1.0
+                net_profit = revenue - cost_of_winning - cost_of_losing
+
+                self.pnl.record_settlement(net_profit, market_id)
+                self.pnl.record_capital_recovery(revenue)
+
+                log.info(
+                    "dry_run_actual_resolution",
+                    slug=slug,
+                    winner=winner_str,
+                    winning_shares=winning_shares,
+                    losing_shares=losing_shares,
+                    pnl=f"${net_profit:.4f}",
+                )
+
+                sm = getattr(self.inventory, "state_manager", None)
+                if sm:
+                    try:
+                        sm.remove_pending_resolution(slug)
+                    except Exception as ex:
+                        log.debug("pending_resolution_remove_failed", slug=slug, error=str(ex))
+                break
             except Exception as e:
-                log.error("wait_and_settle_error", error=str(e))
-
-    async def _wait_and_settle_unmatched_from_state(self, entry: dict):
-        """Resume a pending dry-run resolution from persisted state."""
-        try:
-            class _M:
-                pass
-            m = _M()
-            m.slug = entry.get("slug")
-            m.asset = entry.get("asset")
-            m.window_start_ts = entry.get("window_start_ts")
-            m.market_id = entry.get("market_id")
-            # The rest of MarketInfo fields are not needed by the resolver.
-
-            pos_snapshot = {
-                "yes_avg_entry": float(entry.get("yes_avg_entry", 0.0) or 0.0),
-                "no_avg_entry": float(entry.get("no_avg_entry", 0.0) or 0.0),
-                "unmatched_up": float(entry.get("unmatched_up", 0.0) or 0.0),
-                "unmatched_down": float(entry.get("unmatched_down", 0.0) or 0.0),
-            }
-            await self._wait_and_settle_unmatched(m, pos_snapshot)
-        except Exception:
-            # If anything goes wrong, leave the pending entry for a later run.
-            return
+                log.error("wait_and_settle_error", slug=slug, error=str(e))
 
     async def _find_next_market(self) -> Optional[MarketInfo]:
         """Find the next eligible market for this asset."""

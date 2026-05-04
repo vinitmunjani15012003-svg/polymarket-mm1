@@ -16,6 +16,7 @@ Collateral: USDC.e 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
 import asyncio
 from typing import Optional
 from src.monitoring.logger import get_logger
+from src.execution.rpc_utils import pick_working_polygon_rpc
 
 log = get_logger("ctf_ops")
 
@@ -351,29 +352,16 @@ class BalanceMonitor:
         try:
             from web3 import Web3
 
-            # Try primary RPC first, then fall back to a small allowlist.
-            # Public endpoints change reliability frequently.
             rpc_candidates = [
                 self._rpc_url,
                 "https://polygon-bor.publicnode.com",
                 "https://polygon.rpc.blxrbdn.com",
             ]
-            last_err = None
-            for rpc in rpc_candidates:
-                try:
-                    w3 = Web3(Web3.HTTPProvider(rpc))
-                    # Reliable connectivity test
-                    _ = w3.eth.block_number
-                    self._w3 = w3
-                    self._rpc_url = rpc
-                    break
-                except Exception as e:
-                    last_err = e
-                    continue
-
+            self._w3, rpc, err = pick_working_polygon_rpc(Web3, rpc_candidates)
             if not self._w3:
-                log.error("balance_monitor_rpc_down", rpc=self._rpc_url, error=str(last_err) if last_err else "unknown")
+                log.error("balance_monitor_rpc_down", rpc=self._rpc_url, error=str(err) if err else "unknown")
                 return False
+            self._rpc_url = rpc or self._rpc_url
 
             self._address = self._w3.eth.account.from_key(
                 self._private_key
@@ -620,21 +608,11 @@ class CTFOperations:
                 "https://polygon-bor.publicnode.com",
                 "https://polygon.rpc.blxrbdn.com",
             ]
-            last_err = None
-            for rpc in rpc_candidates:
-                try:
-                    w3 = Web3(Web3.HTTPProvider(rpc))
-                    _ = w3.eth.block_number
-                    self._w3 = w3
-                    self._rpc_url = rpc
-                    break
-                except Exception as e:
-                    last_err = e
-                    continue
-
+            self._w3, rpc, err = pick_working_polygon_rpc(Web3, rpc_candidates)
             if not self._w3:
-                log.error("web3_not_connected", rpc=self._rpc_url, error=str(last_err) if last_err else "unknown")
+                log.error("web3_not_connected", rpc=self._rpc_url, error=str(err) if err else "unknown")
                 return False
+            self._rpc_url = rpc or self._rpc_url
 
             self._account = self._w3.eth.account.from_key(self._private_key)
             self._ctf = self._w3.eth.contract(
