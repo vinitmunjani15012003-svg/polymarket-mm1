@@ -728,6 +728,26 @@ class MarketCycler:
         # Balance-only mode: last 5 minutes of the window.
         # Goal: stop building the heavy side and quote ONLY to repair inventory.
         balance_only = remaining <= 300
+        min_order_size = max(1, int(getattr(self.ac, "min_order_size", 5)))
+
+        def _repair_size(raw_size: int) -> int:
+            """Return a valid close-only repair size or 0 if below live minimum."""
+            raw_size = int(raw_size or 0)
+            if raw_size < min_order_size:
+                return 0
+            return raw_size
+
+        def _normalize_quote_sizes(yes_size: int, no_size: int, allow_round_up: bool = True) -> tuple[int, int]:
+            """Enforce Polymarket minimum order size on active quote sides."""
+            yes_size = int(yes_size or 0)
+            no_size = int(no_size or 0)
+            if allow_round_up:
+                yes_size = min_order_size if 0 < yes_size < min_order_size else yes_size
+                no_size = min_order_size if 0 < no_size < min_order_size else no_size
+            else:
+                yes_size = 0 if 0 < yes_size < min_order_size else yes_size
+                no_size = 0 if 0 < no_size < min_order_size else no_size
+            return yes_size, no_size
 
         # Get inventory position early for the DEAD_ZONE check
         pos = self.inventory.get_or_create(market.market_id, self.asset)
@@ -790,11 +810,11 @@ class MarketCycler:
             if imbalance > 0:
                 # Too many Up shares → quote Down only
                 up_size = 0
-                down_size = min(self.quote_engine.max_order_size, int(imbalance))
+                down_size = _repair_size(min(self.quote_engine.max_order_size, int(imbalance)))
             elif imbalance < 0:
                 # Too many Down shares → quote Up only
                 down_size = 0
-                up_size = min(self.quote_engine.max_order_size, int(abs(imbalance)))
+                up_size = _repair_size(min(self.quote_engine.max_order_size, int(abs(imbalance))))
             else:
                 # Flat → stop quoting cleanly
                 up_size = 0
@@ -808,10 +828,10 @@ class MarketCycler:
             # Only allow quoting the side that reduces the imbalance
             if imbalance > 0:
                 up_size = 0
-                down_size = min(self.quote_engine.max_order_size, int(imbalance))
+                down_size = _repair_size(min(self.quote_engine.max_order_size, int(imbalance)))
             elif imbalance < 0:
                 down_size = 0
-                up_size = min(self.quote_engine.max_order_size, int(abs(imbalance)))
+                up_size = _repair_size(min(self.quote_engine.max_order_size, int(abs(imbalance))))
             else:
                 # If we're flat near expiry, we intentionally do not quote.
                 # IMPORTANT: Don't treat this as a "pre_trade_failed" condition;
@@ -839,6 +859,20 @@ class MarketCycler:
             up_size = 0
         if blocks.get("block_no"):
             down_size = 0
+
+        # Enforce live minimum order size before quote generation. In normal quoting
+        # modes, round active-but-small sides up to the minimum. In close-only modes,
+        # avoid over-repairing small residual inventory (< min_order_size).
+        up_size, down_size = _normalize_quote_sizes(
+            up_size,
+            down_size,
+            allow_round_up=not (balance_only or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"] or is_halted),
+        )
+
+        if up_size == 0 and down_size == 0:
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
 
         # 11.5 Fetch live orderbook to prevent crossing the book
         book_up = await self.book_reader.get_book(market.token_id_up)
@@ -902,9 +936,22 @@ class MarketCycler:
                         yes_size=quotes.yes_buy_size,
                         no_size=quotes.no_buy_size,
                     )
+
+            # After capital scaling/backoff, drop any active side that fell below
+            # Polymarket's minimum order size. If nothing remains, stop cleanly.
+            quotes.yes_buy_size, quotes.no_buy_size = _normalize_quote_sizes(
+                quotes.yes_buy_size,
+                quotes.no_buy_size,
+                allow_round_up=False,
+            )
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
+
+        if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
 
         # 13. Pre-trade checks
         fv_fresh = not self.fair_value_model.is_stale

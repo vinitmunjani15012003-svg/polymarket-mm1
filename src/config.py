@@ -22,6 +22,7 @@ class AssetConfig:
     gamma_near_expiry: float = 1.0
     min_spread: float = 0.04
     max_spread: float = 0.25
+    min_order_size: int = 5
     max_order_size: int = 30
     max_dollar_delta: float = 50.0
     soft_limit: float = 25.0
@@ -141,6 +142,10 @@ class BotConfig:
                 raise ValueError(f"Asset {name}: Limits must be strictly increasing (soft < hard < emergency)")
             if asset.max_order_size <= 0:
                 raise ValueError(f"Asset {name}: max_order_size must be > 0")
+            if asset.min_order_size <= 0:
+                raise ValueError(f"Asset {name}: min_order_size must be > 0")
+            if asset.max_order_size < asset.min_order_size:
+                raise ValueError(f"Asset {name}: max_order_size ({asset.max_order_size}) must be >= min_order_size ({asset.min_order_size})")
                 
         if self.global_params.stop_quoting_seconds <= 0:
             raise ValueError("stop_quoting_seconds must be positive")
@@ -228,6 +233,7 @@ def load_config(config_path: str = "config/default.yaml",
             gamma_near_expiry=params.get("gamma_near_expiry", 1.0),
             min_spread=params.get("min_spread", 0.04),
             max_spread=params.get("max_spread", 0.25),
+            min_order_size=params.get("min_order_size", 5),
             max_order_size=params.get("max_order_size", 30),
             max_dollar_delta=params.get("max_dollar_delta", 50.0),
             soft_limit=params.get("soft_limit", 25.0),
