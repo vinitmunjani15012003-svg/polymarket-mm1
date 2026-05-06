@@ -48,6 +48,8 @@ class MarketInfo:
     current_prices: list     # [up_price, down_price]
     order_min_size: int      # Minimum order size (typically 5)
     active: bool
+    closed: bool = False
+    archived: bool = False
     best_bid: float = 0.0    # Best bid for Up token (from CLOB)
     best_ask: float = 0.0    # Best ask for Up token (from CLOB)
 
@@ -218,14 +220,29 @@ class MarketDiscovery:
         slug = self.compute_slug(asset, window_start)
 
         try:
-            params = {
-                "slug": slug,
-                "_t": int(time.time())  # Cache-buster
-            }
+            # Direct slug endpoint is reliable for closed/archived markets.
             resp = await self._client.get(
-                f"{GAMMA_API_URL}/markets",
-                params=params
+                f"{GAMMA_API_URL}/markets/slug/{slug}",
+                params={"_t": int(time.time())},
             )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if not data:
+                raise ValueError("empty direct slug response")
+
+            raw = data[0] if isinstance(data, list) else data
+            return self._parse_market(raw, asset, slug, window_start)
+
+        except httpx.HTTPError as e:
+            log.debug("gamma_direct_slug_fetch_error", slug=slug, error=str(e))
+        except Exception as e:
+            log.debug("gamma_direct_slug_parse_error", slug=slug, error=str(e))
+
+        # Fallback for compatibility with older Gamma behavior.
+        try:
+            params = {"slug": slug, "_t": int(time.time())}
+            resp = await self._client.get(f"{GAMMA_API_URL}/markets", params=params)
             resp.raise_for_status()
             data = resp.json()
 
@@ -303,6 +320,8 @@ class MarketDiscovery:
                 current_prices=prices,
                 order_min_size=raw.get("orderMinSize", 5),
                 active=raw.get("active", True),
+                closed=raw.get("closed", False),
+                archived=raw.get("archived", False),
                 best_bid=float(raw.get("bestBid", 0) or 0),
                 best_ask=float(raw.get("bestAsk", 0) or 0),
             )

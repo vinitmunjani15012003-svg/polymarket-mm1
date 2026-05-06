@@ -7,6 +7,10 @@ import time
 
 from src.execution.dry_run import DryRunExecutor, SimulatedOrder
 from src.execution.order_manager import OrderManager
+from src.orchestration.market_cycler import (
+    apply_dust_price_guardrails,
+    compute_inventory_repair_sizes,
+)
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
 from src.strategy.inventory import InventoryManager, InventoryState
 from src.strategy.quote_engine import QuoteEngine
@@ -24,6 +28,21 @@ class DummyExecutor:
         return True
 
     async def cancel_all(self):
+        return True
+
+
+class DummyBatchExecutor(DummyExecutor):
+    def __init__(self):
+        super().__init__()
+        self.cancel_batches = []
+        self.place_batches = []
+
+    async def place_buy_orders(self, orders):
+        self.place_batches.append(orders)
+        return {order["side"]: f"OID-{order['side']}" for order in orders}
+
+    async def cancel_orders(self, order_ids):
+        self.cancel_batches.append(order_ids)
         return True
 
 
@@ -72,6 +91,238 @@ def test_order_manager_places_buy_orders_through_executor():
         ("YES1", 0.45, 10, "yes"),
         ("NO1", 0.44, 8, "no"),
     ]
+
+
+def test_order_manager_batches_cancel_and_replace_when_available():
+    executor = DummyBatchExecutor()
+    om = OrderManager(executor, reprice_threshold=0.01)
+    active = om.get_active("MARKET1")
+    active.yes_order_id = "OLD-YES"
+    active.no_order_id = "OLD-NO"
+    active.yes_price = 0.40
+    active.no_price = 0.40
+    active.yes_size = 5
+    active.no_size = 5
+
+    quotes = SimpleNamespace(
+        yes_buy_price=0.45,
+        no_buy_price=0.44,
+        yes_buy_size=10,
+        no_buy_size=8,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+        )
+    )
+
+    assert updated is True
+    assert executor.cancel_batches == [["OLD-YES", "OLD-NO"]]
+    assert len(executor.place_batches) == 1
+    assert [o["side"] for o in executor.place_batches[0]] == ["yes", "no"]
+    active = om.get_active("MARKET1")
+    assert active.yes_order_id == "OID-yes"
+    assert active.no_order_id == "OID-no"
+
+
+def test_order_manager_throttles_non_urgent_bid_improvements():
+    executor = DummyBatchExecutor()
+    om = OrderManager(executor, reprice_threshold=0.01, min_update_interval=2.0)
+    active = om.get_active("MARKET1")
+    active.yes_order_id = "OLD-YES"
+    active.yes_price = 0.40
+    active.yes_size = 5
+    active.last_update = time.time()
+
+    quotes = SimpleNamespace(
+        yes_buy_price=0.45,  # improving/chasing bid: non-urgent
+        no_buy_price=None,
+        yes_buy_size=5,
+        no_buy_size=0,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+        )
+    )
+
+    assert updated is False
+    assert executor.cancel_batches == []
+    assert executor.place_batches == []
+    active = om.get_active("MARKET1")
+    assert active.yes_order_id == "OLD-YES"
+    assert active.yes_price == 0.40
+
+
+def test_order_manager_allows_urgent_risk_reductions_during_throttle():
+    executor = DummyBatchExecutor()
+    om = OrderManager(executor, reprice_threshold=0.01, min_update_interval=2.0)
+    active = om.get_active("MARKET1")
+    active.yes_order_id = "OLD-YES"
+    active.yes_price = 0.50
+    active.yes_size = 5
+    active.last_update = time.time()
+
+    quotes = SimpleNamespace(
+        yes_buy_price=0.45,  # lowering bid: urgent adverse-selection reduction
+        no_buy_price=None,
+        yes_buy_size=5,
+        no_buy_size=0,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+        )
+    )
+
+    assert updated is True
+    assert executor.cancel_batches == [["OLD-YES"]]
+    assert len(executor.place_batches) == 1
+    assert executor.place_batches[0][0]["price"] == 0.45
+    active = om.get_active("MARKET1")
+    assert active.yes_order_id == "OID-yes"
+    assert active.yes_price == 0.45
+
+
+def test_repair_quote_stays_resting_on_small_fv_wiggles():
+    executor = DummyBatchExecutor()
+    om = OrderManager(executor, reprice_threshold=0.01, min_update_interval=2.0)
+    active = om.get_active("MARKET1")
+    active.no_order_id = "OLD-NO"
+    active.no_price = 0.50
+    active.no_size = 6
+    active.last_update = time.time() - 30
+
+    quotes = SimpleNamespace(
+        yes_buy_price=None,
+        no_buy_price=0.47,  # normal mode would lower/cancel; repair should rest
+        yes_buy_size=0,
+        no_buy_size=6,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+            repair_mode="repair_down",
+        )
+    )
+
+    assert updated is False
+    assert executor.cancel_batches == []
+    assert executor.place_batches == []
+    assert active.no_order_id == "OLD-NO"
+    assert active.no_price == 0.50
+
+
+def test_repair_quote_reprices_when_dangerously_stale():
+    executor = DummyBatchExecutor()
+    om = OrderManager(executor, reprice_threshold=0.01, min_update_interval=2.0)
+    active = om.get_active("MARKET1")
+    active.no_order_id = "OLD-NO"
+    active.no_price = 0.58
+    active.no_size = 6
+    active.last_update = time.time() - 30
+
+    quotes = SimpleNamespace(
+        yes_buy_price=None,
+        no_buy_price=0.50,  # >5c lower, protect against stale overpaying
+        yes_buy_size=0,
+        no_buy_size=6,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+            repair_mode="repair_down",
+        )
+    )
+
+    assert updated is True
+    assert executor.cancel_batches == [["OLD-NO"]]
+    assert executor.place_batches[0][0]["price"] == 0.50
+
+
+def test_dust_normalization_quotes_down_tail_to_ten_each():
+    # Current inventory: DOWN=3, UP=0 -> imbalance=-3.
+    # Quote DOWN 7 and UP 10 so, if both fill, totals become 10/10.
+    up_size, down_size, mode = compute_inventory_repair_sizes(
+        imbalance=-3,
+        min_order_size=5,
+        max_order_size=5,
+    )
+
+    assert mode == "dust_down"
+    assert up_size == 10
+    assert down_size == 7
+
+
+def test_dust_normalization_quotes_up_tail_to_ten_each():
+    # Current inventory: UP=3, DOWN=0 -> imbalance=+3.
+    up_size, down_size, mode = compute_inventory_repair_sizes(
+        imbalance=3,
+        min_order_size=5,
+        max_order_size=5,
+    )
+
+    assert mode == "dust_up"
+    assert up_size == 7
+    assert down_size == 10
+
+
+def test_normal_repair_remains_close_only_for_live_sized_tail():
+    up_size, down_size, mode = compute_inventory_repair_sizes(
+        imbalance=-9,
+        min_order_size=5,
+        max_order_size=5,
+    )
+
+    assert mode == "repair_up"
+    assert up_size == 5
+    assert down_size == 0
+
+
+def test_dust_price_guardrails_favor_repair_side_and_keep_edge():
+    quotes = SimpleNamespace(
+        yes_buy_price=0.49,
+        no_buy_price=0.49,
+        combined_cost=0.98,
+        edge_per_pair=0.02,
+    )
+
+    guarded = apply_dust_price_guardrails(quotes, "dust_down")
+
+    # Too many DOWN means UP is repair side: improve UP bid, shade DOWN bid.
+    assert guarded.yes_buy_price == 0.50
+    assert guarded.no_buy_price == 0.48
+    assert guarded.combined_cost < 1.0
 
 
 def test_quote_invariant_combined_cost_below_one():

@@ -34,6 +34,15 @@ class ClobClientWrapper:
         self._processed_fills: set = set()
         self._last_fill_check_ts_by_market: dict[str, float] = {}
         self.state_manager = None
+        # py-clob-client is synchronous. Keep those calls off the event loop,
+        # but serialize access because the underlying client/signing state is
+        # not guaranteed to be thread-safe.
+        self._client_lock = asyncio.Lock()
+
+    async def _run_client_call(self, fn, *args, **kwargs):
+        """Run a blocking py-clob-client call in a worker thread."""
+        async with self._client_lock:
+            return await asyncio.to_thread(fn, *args, **kwargs)
 
     def set_state_manager(self, state_manager):
         self.state_manager = state_manager
@@ -104,28 +113,31 @@ class ClobClientWrapper:
             return None
 
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.clob_types import PartialCreateOrderOptions
-            from py_clob_client.order_builder.constants import BUY
+            def _create_and_post():
+                from py_clob_client.clob_types import OrderArgs, OrderType
+                from py_clob_client.clob_types import PartialCreateOrderOptions
+                from py_clob_client.order_builder.constants import BUY
 
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=price,
-                size=size,
-                side=BUY,  # ALWAYS BUY
-            )
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=size,
+                    side=BUY,  # ALWAYS BUY
+                )
 
-            # Crypto up/down markets are 1-cent tick. If we don't pass tick_size,
-            # the API may reject with order_version_mismatch.
-            opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
-            signed_order = self._client.create_order(order_args, opts)
+                # Crypto up/down markets are 1-cent tick. If we don't pass tick_size,
+                # the API may reject with order_version_mismatch.
+                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+                signed_order = self._client.create_order(order_args, opts)
 
-            # GTC = Good-Til-Cancelled, maker-only on Polymarket CLOB
-            response = self._client.post_order(
-                signed_order,
-                OrderType.GTC,
-                post_only=True,
-            )
+                # GTC = Good-Til-Cancelled, maker-only on Polymarket CLOB
+                return self._client.post_order(
+                    signed_order,
+                    OrderType.GTC,
+                    post_only=True,
+                )
+
+            response = await self._run_client_call(_create_and_post)
 
             order_id = response.get("orderID") or response.get("id")
 
@@ -154,12 +166,81 @@ class ClobClientWrapper:
                      price=price, size=size)
             return None
 
+    async def place_buy_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
+        """Place multiple BUY orders in one CLOB post_orders request."""
+        if not self._initialized:
+            log.error("client_not_initialized")
+            return {str(o.get("side", i)): None for i, o in enumerate(orders)}
+
+        try:
+            sides = [spec.get("side", "up") for spec in orders]
+
+            def _create_and_post_batch():
+                from py_clob_client.clob_types import OrderArgs, OrderType
+                from py_clob_client.clob_types import PartialCreateOrderOptions, PostOrdersArgs
+                from py_clob_client.order_builder.constants import BUY
+
+                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+                post_args = []
+
+                for spec in orders:
+                    order_args = OrderArgs(
+                        token_id=spec["token_id"],
+                        price=spec["price"],
+                        size=spec["size"],
+                        side=BUY,
+                    )
+                    signed_order = self._client.create_order(order_args, opts)
+                    post_args.append(PostOrdersArgs(
+                        signed_order,
+                        OrderType.GTC,
+                        postOnly=True,
+                    ))
+
+                return self._client.post_orders(post_args)
+
+            response = await self._run_client_call(_create_and_post_batch)
+            results = response if isinstance(response, list) else response.get("orders", []) if isinstance(response, dict) else []
+
+            placed: dict[str, Optional[str]] = {side: None for side in sides}
+            for idx, side in enumerate(sides):
+                item = results[idx] if idx < len(results) and isinstance(results[idx], dict) else {}
+                order_id = item.get("orderID") or item.get("id")
+                if order_id:
+                    spec = orders[idx]
+                    self.open_orders[order_id] = {
+                        "token_id": spec["token_id"],
+                        "price": spec["price"],
+                        "size": spec["size"],
+                        "side": "BUY",
+                        "token_side": side,
+                        "placed_at": time.time(),
+                    }
+                    placed[side] = order_id
+                    log.info("order_placed", order_id=order_id[:8],
+                             price=spec["price"], size=spec["size"],
+                             token=spec["token_id"][:8], token_side=side,
+                             batch=True)
+                else:
+                    status = item.get("status", "unknown")
+                    spec = orders[idx]
+                    log.info("post_only_rejected", status=status,
+                             price=spec["price"], token=spec["token_id"][:8],
+                             token_side=side, batch=True)
+
+            self._save_orders_state()
+            return placed
+
+        except Exception as e:
+            log.error("batch_order_place_error", error=str(e), count=len(orders))
+            return {str(o.get("side", i)): None for i, o in enumerate(orders)}
+
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a specific order."""
         if not self._initialized:
             return False
         try:
-            self._client.cancel(order_id)
+            await self._run_client_call(self._client.cancel, order_id)
             self.open_orders.pop(order_id, None)
             self._save_orders_state()
             return True
@@ -167,12 +248,29 @@ class ClobClientWrapper:
             log.error("cancel_error", order_id=order_id[:8], error=str(e))
             return False
 
+    async def cancel_orders(self, order_ids: list[str]) -> bool:
+        """Cancel multiple orders in one CLOB cancel_orders request."""
+        if not self._initialized:
+            return False
+        if not order_ids:
+            return True
+        try:
+            await self._run_client_call(self._client.cancel_orders, order_ids)
+            for order_id in order_ids:
+                self.open_orders.pop(order_id, None)
+            self._save_orders_state()
+            log.info("orders_cancelled", count=len(order_ids))
+            return True
+        except Exception as e:
+            log.error("cancel_orders_error", count=len(order_ids), error=str(e))
+            return False
+
     async def cancel_all(self) -> bool:
         """Cancel all open orders."""
         if not self._initialized:
             return False
         try:
-            self._client.cancel_all()
+            await self._run_client_call(self._client.cancel_all)
             self.open_orders.clear()
             self._save_orders_state()
             log.info("all_orders_cancelled")
@@ -199,7 +297,7 @@ class ClobClientWrapper:
         try:
             from py_clob_client.clob_types import TradeParams
             params = TradeParams(market=market_id)
-            resp = self._client.get_trades(params=params)
+            resp = await self._run_client_call(self._client.get_trades, params=params)
             fills = resp if isinstance(resp, list) else resp.get("data", [])
             return fills
         except Exception as e:
@@ -211,12 +309,14 @@ class ClobClientWrapper:
                       current_mid: float = None) -> list[dict]:
         """Process fills with deduplication and update trackers."""
         processed = []
+        fills_changed = False
+        orders_changed = False
         for fill in fills:
             fill_id = fill.get("id", f"{fill.get('order_id', '')}_{fill.get('size', '')}")
             if fill_id in self._processed_fills:
                 continue
             self._processed_fills.add(fill_id)
-            self._save_fills_state()
+            fills_changed = True
 
             size = float(fill.get("size", 0))
             price = float(fill.get("price", 0))
@@ -231,7 +331,7 @@ class ClobClientWrapper:
                 self.open_orders[order_id]["size"] -= size
                 if self.open_orders[order_id]["size"] <= 0.0001:  # Floating point safety
                     del self.open_orders[order_id]
-                self._save_orders_state()
+                orders_changed = True
 
             # Update inventory and edge tracker (MarketCycler loops this)
             # Actually MarketCycler is expected to handle inventory directly from fills.
@@ -246,4 +346,9 @@ class ClobClientWrapper:
                 "simulated": False
             }
             processed.append(std_fill)
+
+        if fills_changed:
+            self._save_fills_state()
+        if orders_changed:
+            self._save_orders_state()
         return processed

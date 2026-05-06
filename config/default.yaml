@@ -95,10 +95,12 @@ assets:
 
 # --- Global Trading Parameters ---
 global:
-  refresh_interval: 0.25
+  refresh_interval: 1.0        # fallback quote wake-up if no price ticks arrive
+  min_quote_interval: 0.25     # max 4 quote cycles/sec on price-tick wakeups
+  min_order_update_interval: 2.0 # throttle non-urgent bid improvements; adverse cancels still immediate
   stop_quoting_seconds: 90     # Quote closer to expiry (more volume)
   reduce_size_seconds: 240
-  reprice_threshold: 0.01      # Increased to 1 cent to protect queue position
+  reprice_threshold: 0.03      # 3 cents: preserve queue priority; avoid churn
   starting_capital: 50
   max_daily_loss_pct: 0.50     # 50% — generous, rebates offset losses
   max_drawdown_pct: 0.30       # 30% drawdown pause (auto-resumes 60s)
