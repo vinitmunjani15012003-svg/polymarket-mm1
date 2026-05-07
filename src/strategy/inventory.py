@@ -24,6 +24,15 @@ from src.monitoring.logger import get_logger
 log = get_logger("inventory")
 
 
+@dataclass
+class FillEntry:
+    """A single fill with remaining unmatched shares for FIFO pair matching."""
+    price: float
+    size: float
+    remaining: float
+    timestamp: float = 0.0
+
+
 class InventoryState(Enum):
     NORMAL = "NORMAL"
     SKEWED = "SKEWED"
@@ -41,6 +50,15 @@ class InventoryPosition:
     no_total_cost: float = 0.0
     yes_fill_count: int = 0
     no_fill_count: int = 0
+    # FIFO pair matching: track individual fills for accurate per-pair P&L.
+    # Without this, averaged entry prices inflate P&L when FV swings between
+    # the YES fill and the NO fill (e.g., YES@$0.09 + NO@$0.51 = $0.40 "edge"
+    # when in reality combined cost at quote time was ~$0.98).
+    _yes_fills: list = field(default_factory=list)   # list[FillEntry]
+    _no_fills: list = field(default_factory=list)     # list[FillEntry]
+    _realized_pair_pnl: float = 0.0   # accumulated P&L from FIFO-matched pairs
+    _realized_pairs: float = 0.0      # total FIFO-matched pair count
+    _settled_pair_pnl: float = 0.0    # already reported to PnL tracker
 
     def to_dict(self):
         return {
@@ -116,12 +134,70 @@ class InventoryPosition:
     def matched_pairs(self) -> float:
         return min(self.yes_shares, self.no_shares)
 
+    def add_fill(self, side: str, price: float, size: float, ts: float = 0.0):
+        """Record a fill and FIFO-match against the opposite side.
+
+        This is the core of accurate per-pair P&L: each YES fill is matched
+        against the oldest unmatched NO fill (and vice versa) instead of
+        computing profit from time-averaged entry prices.
+        """
+        ts = ts or time.time()
+        if side in ("yes", "up"):
+            self.yes_total_cost += price * size
+            self.yes_shares += size
+            self.yes_fill_count += 1
+            self._yes_fills.append(FillEntry(
+                price=price, size=size, remaining=size, timestamp=ts))
+        elif side in ("no", "down"):
+            self.no_total_cost += price * size
+            self.no_shares += size
+            self.no_fill_count += 1
+            self._no_fills.append(FillEntry(
+                price=price, size=size, remaining=size, timestamp=ts))
+        self._match_pairs()
+
+    def _match_pairs(self):
+        """FIFO drain: match oldest YES fill vs oldest NO fill."""
+        while self._yes_fills and self._no_fills:
+            yes_fill = self._yes_fills[0]
+            no_fill = self._no_fills[0]
+
+            if yes_fill.remaining <= 0:
+                self._yes_fills.pop(0)
+                continue
+            if no_fill.remaining <= 0:
+                self._no_fills.pop(0)
+                continue
+
+            match_size = min(yes_fill.remaining, no_fill.remaining)
+            pair_pnl = match_size * (1.0 - (yes_fill.price + no_fill.price))
+            self._realized_pair_pnl += pair_pnl
+            self._realized_pairs += match_size
+
+            yes_fill.remaining -= match_size
+            no_fill.remaining -= match_size
+
+            if yes_fill.remaining <= 0:
+                self._yes_fills.pop(0)
+            if no_fill.remaining <= 0:
+                self._no_fills.pop(0)
+
     def matched_pair_profit(self) -> float:
-        pairs = self.matched_pairs()
-        if pairs <= 0:
-            return 0.0
-        pair_cost = self.yes_avg_entry + self.no_avg_entry
-        return pairs * (1.0 - pair_cost)
+        """Profit from FIFO-matched pairs, excluding already-settled amounts.
+
+        This replaces the old averaged calculation:
+            OLD: pairs * (1.0 - (yes_avg_entry + no_avg_entry))
+            NEW: sum of per-pair (1.0 - (yes_fill_price + no_fill_price))
+        """
+        return self._realized_pair_pnl - self._settled_pair_pnl
+
+    def acknowledge_settlement(self):
+        """Mark current realized pair P&L as settled.
+
+        Call after recording settlement to prevent double-counting
+        on subsequent mid-market merges.
+        """
+        self._settled_pair_pnl = self._realized_pair_pnl
 
     def unmatched_exposure(self) -> float:
         """Capital at risk from unmatched tokens (could expire worthless)."""
@@ -260,14 +336,9 @@ class InventoryManager:
     def record_fill(self, market_id: str, side: str, size: float, price: float, asset: str = ""):
         pos = self.get_or_create(market_id, asset)
         side = side.lower()
-        if side in ("yes", "up"):
-            pos.yes_total_cost += price * size
-            pos.yes_shares += size
-            pos.yes_fill_count += 1
-        elif side in ("no", "down"):
-            pos.no_total_cost += price * size
-            pos.no_shares += size
-            pos.no_fill_count += 1
+
+        # Delegate to position's FIFO-matching fill recorder
+        pos.add_fill(side, price, size)
 
         # Track fill rate for asymmetry detection
         self.fill_tracker.record(side, size)
@@ -279,6 +350,7 @@ class InventoryManager:
         self._save_state()
         log.info("fill_recorded", market=market_id[:8], side=side, size=size, price=price,
                  up_shares=pos.yes_shares, down_shares=pos.no_shares,
+                 pair_pnl=round(pos._realized_pair_pnl, 4),
                  imbalance=pos.share_imbalance())
 
     def get_state(self, market_id: str, current_mid: float = 0.5,
