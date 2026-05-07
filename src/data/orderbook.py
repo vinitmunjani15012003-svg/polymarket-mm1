@@ -76,8 +76,28 @@ class OrderBookReader:
             raw_books = resp.json()
 
             books: dict[str, Optional[BookSnapshot]] = {token_id: None for token_id in token_ids}
-            for token_id, raw in zip(token_ids, raw_books):
-                books[token_id] = self._parse_book(token_id, raw)
+            for raw in raw_books:
+                # Use asset_id from response to map correctly instead of
+                # assuming positional order (the API may not preserve order)
+                asset_id = raw.get("asset_id", "")
+                if asset_id in books:
+                    books[asset_id] = self._parse_book(asset_id, raw)
+                else:
+                    # Fallback: try matching by market field or log warning
+                    log.warning("books_unknown_asset",
+                                asset_id=asset_id,
+                                expected=token_ids)
+            
+            # If any books weren't matched, fall back to positional zip
+            unmatched = [tid for tid in token_ids if books[tid] is None]
+            if unmatched and len(raw_books) == len(token_ids):
+                # Check if none were matched by asset_id (API doesn't include it)
+                all_none = all(books[tid] is None for tid in token_ids)
+                if all_none:
+                    # Positional fallback
+                    for token_id, raw in zip(token_ids, raw_books):
+                        books[token_id] = self._parse_book(token_id, raw)
+
             return books
         except Exception as e:
             log.error("books_fetch_error", count=len(token_ids), error=str(e))

@@ -13,6 +13,10 @@ spreads 10-25x wider than actual market spreads.
 
 import math
 import time
+
+from src.monitoring.logger import get_logger
+
+_qlog = get_logger("quote_engine")
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -149,6 +153,7 @@ class QuoteEngine:
         reservation = max(0.005, min(0.995, reservation))
         result.reservation_price = round(reservation, 4)
 
+
         # 2. Compute base spread (per side)
         base_half_spread = self.edge_ticks * TICK_SIZE * self.spread_multiplier
 
@@ -192,6 +197,7 @@ class QuoteEngine:
 
         yes_buy = max(0.01, min(0.99, yes_buy))
         no_buy = max(0.01, min(0.99, no_buy))
+
 
         # 6. Orderbook clamping: prevent crossing the book
         orig_yes = yes_buy
@@ -278,6 +284,23 @@ class QuoteEngine:
         result.no_buy_size = no_size
         result.combined_cost = combined
         result.edge_per_pair = round(1.0 - combined, 4)
+
+        # Sanity check: YES bid should never exceed NO bid when FV < 0.50
+        # (and vice versa). If this fires, something upstream is swapping prices.
+        if fair_value < 0.50 and result.yes_buy_price > result.no_buy_price and yes_size > 0:
+            _qlog.warning("price_inversion_detected",
+                          fv=round(fair_value, 4),
+                          yes=result.yes_buy_price, no=result.no_buy_price,
+                          imb=round(share_imbalance, 1),
+                          bb_yes=best_bid_yes, bb_no=best_bid_no,
+                          ba_yes=best_ask_yes, ba_no=best_ask_no)
+        elif fair_value > 0.50 and result.no_buy_price > result.yes_buy_price and no_size > 0:
+            _qlog.warning("price_inversion_detected",
+                          fv=round(fair_value, 4),
+                          yes=result.yes_buy_price, no=result.no_buy_price,
+                          imb=round(share_imbalance, 1),
+                          bb_yes=best_bid_yes, bb_no=best_bid_no,
+                          ba_yes=best_ask_yes, ba_no=best_ask_no)
 
         return result
 
