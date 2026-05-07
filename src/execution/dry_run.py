@@ -129,6 +129,47 @@ class DryRunExecutor:
                  side=side, price=price, size=size)
         return order_id
 
+    async def place_buy_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
+        """Simulate batch placing multiple BUY orders with one network hop."""
+        await self._simulate_network_latency()
+
+        placed: dict[str, Optional[str]] = {}
+        for spec in orders:
+            token_id = spec["token_id"]
+            price = spec["price"]
+            size = spec["size"]
+            side = spec.get("side", "yes")
+            book_snapshot = spec.get("book_snapshot")
+
+            self._total_orders += 1
+
+            if book_snapshot:
+                best_ask = book_snapshot.best_ask if hasattr(book_snapshot, 'best_ask') else 0.99
+                if price >= best_ask:
+                    self._total_rejects += 1
+                    log.debug("dry_post_only_rejected", price=price,
+                             best_ask=best_ask, side=side)
+                    placed[side] = None
+                    continue
+
+            self._order_counter += 1
+            order_id = f"DRY-{self._order_counter:06d}"
+
+            self.open_orders[order_id] = SimulatedOrder(
+                order_id=order_id,
+                token_id=token_id,
+                side=side,
+                price=price,
+                size=size,
+                placed_at=time.time(),
+                fair_value_at_place=self._current_fv,
+            )
+            placed[side] = order_id
+            log.debug("dry_order_placed", order_id=order_id,
+                     side=side, price=price, size=size)
+
+        return placed
+
     def check_fills(self,
                     yes_book_snapshot=None,
                     no_book_snapshot=None) -> list[dict]:
@@ -259,6 +300,13 @@ class DryRunExecutor:
     async def cancel_order(self, order_id: str) -> bool:
         await self._simulate_network_latency()
         self.open_orders.pop(order_id, None)
+        return True
+
+    async def cancel_orders(self, order_ids: list[str]) -> bool:
+        """Simulate batch cancelling multiple orders with one network hop."""
+        await self._simulate_network_latency()
+        for order_id in order_ids:
+            self.open_orders.pop(order_id, None)
         return True
 
     async def cancel_all(self) -> bool:

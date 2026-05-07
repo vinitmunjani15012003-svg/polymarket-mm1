@@ -137,6 +137,19 @@ class GaslessMerger:
             "outputs": [],
         }
     ]
+    CTF_REDEEM_ABI = [
+        {
+            "name": "redeemPositions",
+            "type": "function",
+            "inputs": [
+                {"name": "collateralToken", "type": "address"},
+                {"name": "parentCollectionId", "type": "bytes32"},
+                {"name": "conditionId", "type": "bytes32"},
+                {"name": "indexSets", "type": "uint256[]"},
+            ],
+            "outputs": [],
+        }
+    ]
     NEG_RISK_MERGE_ABI = [
         {
             "name": "mergePositions",
@@ -288,6 +301,54 @@ class GaslessMerger:
 
         except Exception as e:
             log.error("gasless_merge_error",
+                      condition=condition_id[:12],
+                      error=str(e))
+            return None
+
+    async def redeem_positions(self, condition_id: str) -> Optional[str]:
+        """Redeem winning tokens via gasless Builder relayer."""
+        if not self._initialized:
+            log.error("gasless_not_initialized")
+            return None
+
+        try:
+            from py_builder_relayer_client.models import OperationType, SafeTransaction
+
+            condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+            contract = self._w3.eth.contract(
+                address=self._w3.to_checksum_address(CTF_CONTRACT),
+                abi=self.CTF_REDEEM_ABI,
+            )
+            data = contract.encode_abi(
+                "redeemPositions",
+                args=[
+                    self._w3.to_checksum_address(USDC_ADDRESS),
+                    bytes(32),
+                    condition_bytes,
+                    [1, 2],
+                ],
+            )
+
+            tx = SafeTransaction(
+                to=CTF_CONTRACT,
+                operation=OperationType.Call,
+                data=data,
+                value="0",
+            )
+
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._client.execute([tx], "Redeem Positions"),
+            )
+
+            tx_hash = response if isinstance(response, str) else str(response)
+            log.info("gasless_redeem_success",
+                     condition=condition_id[:12],
+                     tx=tx_hash[:16] if tx_hash else "submitted")
+            return tx_hash
+
+        except Exception as e:
+            log.error("gasless_redeem_error",
                       condition=condition_id[:12],
                       error=str(e))
             return None

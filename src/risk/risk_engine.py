@@ -115,6 +115,7 @@ def determine_phase(time_remaining: float, stop_seconds: int = 120,
 
 def apply_phase_params(phase: str, quote_engine, asset_config):
     """Adjust quote engine parameters based on current phase."""
+    min_order_size = getattr(asset_config, "min_order_size", 5)
     if phase == "FINAL_SECONDS":
         # Full stop unless inventory repair dictates it (Close only)
         quote_engine.max_order_size = asset_config.max_order_size
@@ -122,7 +123,7 @@ def apply_phase_params(phase: str, quote_engine, asset_config):
         quote_engine.min_spread = max(0.10, asset_config.max_spread)
     elif phase == "DEFENSIVE":
         # Stop two-sided quoting earlier, defensive mode
-        quote_engine.max_order_size = max(1, int(asset_config.max_order_size * 0.05))
+        quote_engine.max_order_size = max(min_order_size, int(asset_config.max_order_size * 0.05))
         quote_engine.gamma = asset_config.gamma_near_expiry * 1.5
         quote_engine.min_spread = max(0.08, asset_config.max_spread)
     elif phase == "DEAD_ZONE":
@@ -132,7 +133,7 @@ def apply_phase_params(phase: str, quote_engine, asset_config):
         quote_engine.min_spread = max(0.05, asset_config.max_spread)
     elif phase == "WIND_DOWN":
         # Reduce size earlier
-        quote_engine.max_order_size = max(2, int(asset_config.max_order_size * 0.10))
+        quote_engine.max_order_size = max(min_order_size, int(asset_config.max_order_size * 0.10))
         quote_engine.gamma = asset_config.gamma_near_expiry
         quote_engine.min_spread = 0.03  # 3 ticks near expiry
     else:  # ACTIVE

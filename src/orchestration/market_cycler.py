@@ -114,6 +114,93 @@ class UpDownFairValue:
         return (time.time() - self._last_update_ts) > 5.0
 
 
+def compute_inventory_repair_sizes(imbalance: float,
+                                   min_order_size: int,
+                                   max_order_size: int) -> tuple[int, int, str]:
+    """Return (up_size, down_size, mode) for guarded repair quoting.
+
+    Normal repair quotes only the light side. But a sub-minimum tail cannot be
+    repaired directly on Polymarket because live orders must be at least
+    min_order_size shares. For those dust tails, quote a small paired plan:
+    top up the heavy/dust side to a 5-share multiple and quote the opposite side
+    to the same resulting target.
+
+    Example: Down 3 / Up 0 => imbalance=-3. Quote Down 7 and Up 10, so if both
+    fill the book becomes Down 10 / Up 10 instead of carrying unrecoverable dust.
+    """
+    min_order_size = max(1, int(min_order_size or 1))
+    max_order_size = max(min_order_size, int(max_order_size or min_order_size))
+    tail = int(round(abs(imbalance)))
+
+    if tail <= 0:
+        return 0, 0, "flat"
+
+    if tail < min_order_size:
+        # Guardrail: dust normalization is capped to 2x min size (10 shares when
+        # min=5). This is intentionally small and distinct from normal quoting.
+        target = 2 * min_order_size
+        heavy_top_up = target - tail
+        if imbalance > 0:
+            # Too many Up: add Up dust-normalizer, quote matching Down target.
+            return heavy_top_up, target, "dust_up"
+        # Too many Down: add Down dust-normalizer, quote matching Up target.
+        return target, heavy_top_up, "dust_down"
+
+    repair_size = min(max_order_size, tail)
+    if imbalance > 0:
+        return 0, repair_size, "repair_down"
+    return repair_size, 0, "repair_up"
+
+
+def apply_dust_price_guardrails(quotes, mode: str,
+                                best_ask_yes: Optional[float] = None,
+                                best_ask_no: Optional[float] = None):
+    """Favor the repair side and make the dust top-up side less aggressive.
+
+    Dust normalization is not risk-free: if only the heavy-side top-up fills,
+    the bot makes the tail worse. Biasing prices makes the desired opposite-side
+    fill more likely while preserving the combined-cost invariant.
+    """
+    if mode not in ("dust_up", "dust_down"):
+        return quotes
+
+    yes = float(quotes.yes_buy_price or 0)
+    no = float(quotes.no_buy_price or 0)
+    if yes <= 0 or no <= 0:
+        return quotes
+
+    if mode == "dust_up":
+        # Too many Up: Down is the repair side. Pay up for Down, shade Up down.
+        yes -= 0.01
+        no += 0.01
+    else:
+        # Too many Down: Up is the repair side. Pay up for Up, shade Down down.
+        yes += 0.01
+        no -= 0.01
+
+    if best_ask_yes is not None and yes >= best_ask_yes:
+        yes = best_ask_yes - 0.01
+    if best_ask_no is not None and no >= best_ask_no:
+        no = best_ask_no - 0.01
+
+    yes = max(0.01, min(0.99, round(yes, 2)))
+    no = max(0.01, min(0.99, round(no, 2)))
+
+    # Keep the pair edge. If the repair-side bump pushed combined cost too high,
+    # lower the dust/top-up side first, because that is the dangerous fill.
+    if yes + no >= 1.0:
+        if mode == "dust_up":
+            yes = max(0.01, round(0.99 - no, 2))
+        else:
+            no = max(0.01, round(0.99 - yes, 2))
+
+    quotes.yes_buy_price = yes
+    quotes.no_buy_price = no
+    quotes.combined_cost = round(yes + no, 4)
+    quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
+    return quotes
+
+
 class MarketCycler:
     """
     Runs the quote loop for a single asset's 15-minute markets.
@@ -202,6 +289,12 @@ class MarketCycler:
 
         self._running = False
         self._last_market_slug = None  # Track to detect new market
+        self._quote_event = asyncio.Event()
+
+    def notify_price_update(self):
+        """Wake the quote loop on a fresh price tick, with rate limit in loop."""
+        if self._running and self.current_market:
+            self._quote_event.set()
 
     async def run(self):
         """Main loop: cycle through markets continuously."""
@@ -268,7 +361,20 @@ class MarketCycler:
                 # 3. Run the quote loop for this market
                 await self._run_market(market)
 
-                # 4. Market ended — settle
+                # 4. Market ended — settle. If the bot is being stopped before
+                # expiry (Ctrl+C/timeout/SIGTERM), do NOT treat the current
+                # inventory as final resolution tail. Just cancel quotes and
+                # leave accounting untouched; otherwise test harness timeouts
+                # pollute outcome/PnL with mid-window inventory.
+                if market.time_remaining > 0:
+                    log.info("market_interrupted_before_expiry",
+                             asset=self.asset,
+                             slug=market.slug,
+                             remaining_s=round(market.time_remaining, 1))
+                    await self.order_mgr.cancel_market_quotes(market.market_id)
+                    break
+
+                # Market actually expired — settle
                 await self._settle_market()
 
                 # 5. Wait for current window to expire, then look for next
@@ -336,12 +442,17 @@ class MarketCycler:
                                  tx=str(tx)[:16] if tx else "none")
 
             # Try to redeem any remaining tokens (if market resolved)
-            if self.ctf:
+            if self.ctf or self.gasless_merger:
                 condition_id = getattr(market, 'condition_id', None)
                 if condition_id:
-                    resolved = await self.ctf.is_market_resolved(condition_id)
+                    resolved = await self.ctf.is_market_resolved(condition_id) if self.ctf else False
                     if resolved:
-                        tx = await self.ctf.redeem_positions(condition_id)
+                        tx = None
+                        if self.gasless_merger and self.gasless_merger.is_available:
+                            tx = await self.gasless_merger.redeem_positions(condition_id)
+                        elif self.ctf:
+                            log.error("gasless_redeem_unavailable",
+                                      msg="Gasless redeem unavailable; on-chain fallback disabled by policy")
                         if tx:
                             # Calculate redemption value for unmatched tokens
                             unmatched_up = pos.yes_shares - pairs
@@ -448,8 +559,11 @@ class MarketCycler:
                 if not m:
                     continue
 
-                # Require inactive to prevent volatility false positives.
-                if m.active:
+                # Require actual Gamma closed/inactive/archived status to prevent
+                # volatility false positives while still supporting markets that
+                # remain active=True after close.
+                resolved = bool(getattr(m, "closed", False) or getattr(m, "archived", False) or not m.active)
+                if not resolved:
                     continue
 
                 up = m.up_price
@@ -466,7 +580,7 @@ class MarketCycler:
                 revenue = winning_shares * 1.0
                 net_profit = revenue - cost_of_winning - cost_of_losing
 
-                self.pnl.record_settlement(net_profit, market_id)
+                self.pnl.record_outcome_resolution(net_profit, market_id)
                 self.pnl.record_capital_recovery(revenue)
 
                 log.info(
@@ -475,6 +589,7 @@ class MarketCycler:
                     winner=winner_str,
                     winning_shares=winning_shares,
                     losing_shares=losing_shares,
+                    outcome_pnl=round(net_profit, 4),
                     pnl=f"${net_profit:.4f}",
                 )
 
@@ -558,6 +673,7 @@ class MarketCycler:
     async def _run_market(self, market: MarketInfo):
         """Run the quote loop for a single 15-minute market."""
         self._has_done_30s_merge = False
+        self._repair_mode_started_at = None
         start_price = None
         binance_start_price = None
 
@@ -682,6 +798,7 @@ class MarketCycler:
             if self.risk_engine.halted:
                 self.risk_engine.check_stops(self.pnl.net_pnl)
 
+            cycle_start = time.time()
             try:
                 await self._quote_cycle(market)
             except Exception as e:
@@ -689,7 +806,25 @@ class MarketCycler:
                           asset=self.asset)
                 await self.order_mgr.cancel_market_quotes(market.market_id)
 
-            await asyncio.sleep(self.gc.refresh_interval)
+            # Event-driven wakeup: quote quickly on Binance price ticks, but keep
+            # a hard minimum interval to avoid cancel/repost churn and API spam.
+            min_interval = max(0.05, float(getattr(self.gc, "min_quote_interval", 0.25)))
+            elapsed = time.time() - cycle_start
+            if elapsed < min_interval:
+                await asyncio.sleep(min_interval - elapsed)
+
+            if self._quote_event.is_set():
+                self._quote_event.clear()
+                continue
+
+            self._quote_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._quote_event.wait(),
+                    timeout=float(self.gc.refresh_interval),
+                )
+            except asyncio.TimeoutError:
+                pass
 
     async def _quote_cycle(self, market: MarketInfo):
         """Single quote cycle iteration."""
@@ -728,6 +863,26 @@ class MarketCycler:
         # Balance-only mode: last 5 minutes of the window.
         # Goal: stop building the heavy side and quote ONLY to repair inventory.
         balance_only = remaining <= 300
+        min_order_size = max(1, int(getattr(self.ac, "min_order_size", 5)))
+
+        def _repair_size(raw_size: int) -> int:
+            """Return a valid close-only repair size or 0 if below live minimum."""
+            raw_size = int(raw_size or 0)
+            if raw_size < min_order_size:
+                return 0
+            return raw_size
+
+        def _normalize_quote_sizes(yes_size: int, no_size: int, allow_round_up: bool = True) -> tuple[int, int]:
+            """Enforce Polymarket minimum order size on active quote sides."""
+            yes_size = int(yes_size or 0)
+            no_size = int(no_size or 0)
+            if allow_round_up:
+                yes_size = min_order_size if 0 < yes_size < min_order_size else yes_size
+                no_size = min_order_size if 0 < no_size < min_order_size else no_size
+            else:
+                yes_size = 0 if 0 < yes_size < min_order_size else yes_size
+                no_size = 0 if 0 < no_size < min_order_size else no_size
+            return yes_size, no_size
 
         # Get inventory position early for the DEAD_ZONE check
         pos = self.inventory.get_or_create(market.market_id, self.asset)
@@ -743,10 +898,17 @@ class MarketCycler:
         # 6. Regime filter
         self.regime_filter.update(fv)
         safe, spread_override = self.regime_filter.is_safe_to_quote()
+        regime_halted = False
         if not safe:
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-            self._update_dashboard(market, spot, fv, sigma, phase, remaining)
-            return
+            # If inventory is imbalanced, do not fully pause quoting. Continue
+            # close-only so the bot can repair exposure instead of freezing while
+            # one side is heavy.
+            if abs(pos.share_imbalance()) >= min_order_size:
+                regime_halted = True
+            else:
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self._update_dashboard(market, spot, fv, sigma, phase, remaining)
+                return
         if spread_override:
             self.quote_engine.spread_multiplier = max(
                 self.quote_engine.spread_multiplier, spread_override
@@ -757,12 +919,29 @@ class MarketCycler:
             current_pnl = self.portfolio_pnl_getter()
         else:
             current_pnl = pos.mark_to_market(fv) + self.pnl.net_pnl
-        is_halted = False
-        halt_reason = ""
+        is_halted = regime_halted
+        halt_reason = "REGIME_HALT" if regime_halted else ""
 
         if self.risk_engine.halted or not self.risk_engine.check_stops(current_pnl):
             is_halted = True
-            halt_reason = "HALTED"
+            halt_reason = self.risk_engine.halt_reason or "HALTED"
+
+        if is_halted:
+            if self._repair_mode_started_at is None:
+                self._repair_mode_started_at = now
+            repair_elapsed = now - self._repair_mode_started_at
+            if repair_elapsed > 120:
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self._update_dashboard(market, spot, fv, sigma, f"{halt_reason}_REPAIR_TIMEOUT", remaining)
+                return
+
+            # Repair-only during halts must be less aggressive: wider spread + no
+            # oversizing. This reduces getting picked off while still allowing
+            # imbalance repair.
+            self.quote_engine.spread_multiplier = max(self.quote_engine.spread_multiplier, 2.0)
+            self.quote_engine.min_spread = max(self.quote_engine.min_spread, 0.05)
+        else:
+            self._repair_mode_started_at = None
 
         # 8. Edge tracker reaction
         # This will auto-adjust the quote_engine.spread_multiplier if toxicity is high.
@@ -780,25 +959,55 @@ class MarketCycler:
         #     Uses SHARE COUNT imbalance (Up - Down), not dollar delta
         #     Pass t_normalized for time-aware dynamic thresholds
         imbalance = pos.share_imbalance()
+        abs_imbalance = abs(imbalance)
+        # Treat any leftover as actionable inventory risk. Live-minimum-sized
+        # leftovers use close-only repair; sub-minimum dust uses a tiny paired
+        # normalization plan because a 1-4 share order is invalid live.
+        inventory_repair = abs_imbalance >= min_order_size
+        dust_normalization = 0 < abs_imbalance < min_order_size
+        close_only_phase = phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]
+        repair_mode = "normal"
         inv_state = self.inventory.get_state(market.market_id, fv, t_norm)
         up_size, down_size = self.inventory.compute_size_adjustment(
             market.market_id, fv, self.quote_engine.max_order_size, t_norm
         )
 
-        # 10.25 Balance-only quoting in the last 5 minutes
-        if balance_only:
-            if imbalance > 0:
-                # Too many Up shares → quote Down only
-                up_size = 0
-                down_size = min(self.quote_engine.max_order_size, int(imbalance))
-            elif imbalance < 0:
-                # Too many Down shares → quote Up only
-                down_size = 0
-                up_size = min(self.quote_engine.max_order_size, int(abs(imbalance)))
+        # 10.25 Inventory repair / dust-normalization overrides normal quoting.
+        # Guardrails:
+        # - no unrelated normal two-sided quoting while carrying a tail
+        # - dust mode is capped at 2x min size by compute_inventory_repair_sizes()
+        # - do not open a two-sided dust plan during halts or close-only phases
+        if dust_normalization and not is_halted and not close_only_phase:
+            up_size, down_size, repair_mode = compute_inventory_repair_sizes(
+                imbalance,
+                min_order_size,
+                self.quote_engine.max_order_size,
+            )
+            log.info(
+                "dust_normalization_quote",
+                market=market.market_id,
+                imbalance=round(imbalance, 4),
+                up_size=up_size,
+                down_size=down_size,
+                mode=repair_mode,
+            )
+        elif balance_only or inventory_repair:
+            if imbalance != 0:
+                up_size, down_size, repair_mode = compute_inventory_repair_sizes(
+                    imbalance,
+                    min_order_size,
+                    self.quote_engine.max_order_size,
+                )
+                # Larger tails are close-only. If a tiny dust tail reaches a
+                # close-only context, cancel instead of making the tail worse.
+                if repair_mode.startswith("dust_"):
+                    up_size = 0
+                    down_size = 0
             else:
-                # Flat → stop quoting cleanly
                 up_size = 0
                 down_size = 0
+
+            if up_size == 0 and down_size == 0:
                 await self.order_mgr.cancel_market_quotes(market.market_id)
                 self._update_dashboard(market, spot, fv, sigma, phase, remaining)
                 return
@@ -808,10 +1017,10 @@ class MarketCycler:
             # Only allow quoting the side that reduces the imbalance
             if imbalance > 0:
                 up_size = 0
-                down_size = min(self.quote_engine.max_order_size, int(imbalance))
+                down_size = _repair_size(min(self.quote_engine.max_order_size, int(imbalance)))
             elif imbalance < 0:
                 down_size = 0
-                up_size = min(self.quote_engine.max_order_size, int(abs(imbalance)))
+                up_size = _repair_size(min(self.quote_engine.max_order_size, int(abs(imbalance))))
             else:
                 # If we're flat near expiry, we intentionally do not quote.
                 # IMPORTANT: Don't treat this as a "pre_trade_failed" condition;
@@ -840,9 +1049,24 @@ class MarketCycler:
         if blocks.get("block_no"):
             down_size = 0
 
-        # 11.5 Fetch live orderbook to prevent crossing the book
-        book_up = await self.book_reader.get_book(market.token_id_up)
-        book_down = await self.book_reader.get_book(market.token_id_down)
+        # Enforce live minimum order size before quote generation. In normal quoting
+        # modes, round active-but-small sides up to the minimum. In close-only modes,
+        # avoid over-repairing small residual inventory (< min_order_size).
+        up_size, down_size = _normalize_quote_sizes(
+            up_size,
+            down_size,
+            allow_round_up=not (inventory_repair or balance_only or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"] or is_halted),
+        )
+
+        if up_size == 0 and down_size == 0:
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
+
+        # 11.5 Fetch live orderbooks in one request to prevent crossing the book.
+        books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
+        book_up = books.get(market.token_id_up)
+        book_down = books.get(market.token_id_down)
         best_ask_yes = None
         best_ask_no = None
         best_bid_yes = None
@@ -877,6 +1101,12 @@ class MarketCycler:
             best_bid_no=best_bid_no,
         )
         quotes.phase = phase
+        quotes = apply_dust_price_guardrails(
+            quotes,
+            repair_mode,
+            best_ask_yes=best_ask_yes,
+            best_ask_no=best_ask_no,
+        )
 
         # 12.5 Capital guardrail (prevents negative capital in dry-run and
         # keeps live sizing within available funds).
@@ -915,9 +1145,29 @@ class MarketCycler:
                         yes_size=quotes.yes_buy_size,
                         no_size=quotes.no_buy_size,
                     )
+
+            # After capital scaling/backoff, drop any active side that fell below
+            # Polymarket's minimum order size. Dust-normalization is an atomic
+            # paired plan: if either leg is no longer valid, cancel both rather
+            # than leaving a one-sided top-up landmine.
+            quotes.yes_buy_size, quotes.no_buy_size = _normalize_quote_sizes(
+                quotes.yes_buy_size,
+                quotes.no_buy_size,
+                allow_round_up=False,
+            )
+            if repair_mode.startswith("dust_") and (
+                quotes.yes_buy_size < min_order_size or quotes.no_buy_size < min_order_size
+            ):
+                quotes.yes_buy_size = 0
+                quotes.no_buy_size = 0
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
+
+        if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
 
         # 13. Pre-trade checks
         fv_fresh = not self.fair_value_model.is_stale
@@ -938,6 +1188,7 @@ class MarketCycler:
             quotes=quotes,
             yes_book_snapshot=book_up,
             no_book_snapshot=book_down,
+            repair_mode=repair_mode,
         )
 
         # 15. Process fills (handle both dry-run and live CLOB modes)

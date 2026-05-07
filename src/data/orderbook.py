@@ -4,6 +4,7 @@ Order book reader for Polymarket CLOB.
 Fetches order book snapshots and computes micro-price.
 """
 
+import asyncio
 import time
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -61,6 +62,34 @@ class OrderBookReader:
         except Exception as e:
             log.error("book_fetch_error", token_id=token_id, error=str(e))
             return None
+
+    async def get_books(self, token_ids: list[str]) -> dict[str, Optional[BookSnapshot]]:
+        """Fetch multiple order books in one CLOB /books request."""
+        if not token_ids:
+            return {}
+        try:
+            resp = await self._client.post(
+                f"{self.host}/books",
+                json=[{"token_id": token_id} for token_id in token_ids],
+            )
+            resp.raise_for_status()
+            raw_books = resp.json()
+
+            books: dict[str, Optional[BookSnapshot]] = {token_id: None for token_id in token_ids}
+            for token_id, raw in zip(token_ids, raw_books):
+                books[token_id] = self._parse_book(token_id, raw)
+            return books
+        except Exception as e:
+            log.error("books_fetch_error", count=len(token_ids), error=str(e))
+            # Safe fallback: parallel single-book requests.
+            results = await asyncio.gather(
+                *(self.get_book(token_id) for token_id in token_ids),
+                return_exceptions=True,
+            )
+            return {
+                token_id: (book if isinstance(book, BookSnapshot) else None)
+                for token_id, book in zip(token_ids, results)
+            }
 
     def _parse_book(self, token_id: str, raw: dict) -> BookSnapshot:
         """Parse raw API response into BookSnapshot."""

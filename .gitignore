@@ -6,6 +6,10 @@ __pycache__/
 logs/
 *.log
 
+# Local runtime artifacts
+data/
+runs/
+
 # Environment variables
 .env
 .env.*

@@ -84,6 +84,7 @@ class PnLSnapshot:
     timestamp: float = 0.0
     spread_income: float = 0.0       # From matched pairs (Up+Down < $1)
     settlement_pnl: float = 0.0      # From resolved markets
+    outcome_pnl: float = 0.0         # From unmatched-token actual outcomes
     unrealized_pnl: float = 0.0      # MTM on open positions
     total_fees: float = 0.0          # Gas + platform fees (0 for makers)
     est_rebates: float = 0.0         # Estimated maker rebates
@@ -110,6 +111,7 @@ class PnLTracker:
 
         # Core P&L
         self.settlement_pnl = 0.0
+        self.outcome_pnl = 0.0
         self.total_fees = 0.0          # Maker fees = $0
         self.spread_income = 0.0
 
@@ -217,6 +219,15 @@ class PnLTracker:
                  pnl=round(pnl, 4),
                  total=round(self.settlement_pnl, 4))
 
+    def record_outcome_resolution(self, pnl: float, market_id: str = ""):
+        """Record P&L from unmatched inventory after actual market outcome."""
+        self.outcome_pnl += pnl
+        self.record_settlement(pnl, market_id)
+        log.info("outcome_pnl_recorded",
+                 market=market_id[:8] if market_id else "",
+                 pnl=round(pnl, 4),
+                 total_outcome_pnl=round(self.outcome_pnl, 4))
+
     def record_fee(self, amount: float):
         """Record platform fee (should be $0 for makers)."""
         self.total_fees += amount
@@ -230,6 +241,7 @@ class PnLTracker:
             timestamp=time.time(),
             spread_income=self.spread_income,
             settlement_pnl=self.settlement_pnl,
+            outcome_pnl=self.outcome_pnl,
             unrealized_pnl=unrealized,
             total_fees=self.total_fees,
             est_rebates=self.est_rebates,

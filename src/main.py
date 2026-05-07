@@ -294,6 +294,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
         asset_order_manager = OrderManager(
             executor=asset_executor,
             reprice_threshold=config.global_params.reprice_threshold,
+            min_update_interval=config.global_params.min_order_update_interval,
         )
 
         # Per-asset inventory manager
@@ -359,6 +360,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
     # Build symbol -> asset lookup and cycler lookup for live price piping
     symbol_to_asset = {ac.symbol.upper(): name for name, ac in active_assets.items()}
     cycler_by_asset = {}
+    last_dashboard_fv_ts: dict[str, float] = {}
 
     # Market cycler tasks
     for cycler in cyclers:
@@ -372,15 +374,22 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
         if not asset_name:
             return
         cycler = cycler_by_asset.get(asset_name)
+        if cycler:
+            cycler.notify_price_update()
         spread = getattr(cycler, 'chainlink_spread', 0) if cycler else 0
         adjusted = price + spread
         
-        # Compute real-time live FV for the dashboard
+        # Compute live FV for the dashboard at a bounded rate. Binance bookTicker
+        # can fire many times/sec; recomputing sigma+FV on every tick is avoidable
+        # event-loop noise and quote cycles compute the authoritative FV anyway.
         live_fv = None
-        if cycler and getattr(cycler, 'fair_value_model', None) is not None:
+        last_fv_ts = last_dashboard_fv_ts.get(asset_name, 0.0)
+        if (cycler and getattr(cycler, 'fair_value_model', None) is not None
+                and ts - last_fv_ts >= 0.25):
             sigma = cycler.vol_estimator.sigma_for_model() if hasattr(cycler, 'vol_estimator') else cycler.ac.default_sigma
             # We use 'adjusted' price to match Chainlink assumption
             live_fv = cycler.fair_value_model.fair_value(adjusted, sigma, ts)
+            last_dashboard_fv_ts[asset_name] = ts
             
         # Initialize dashboard state if it doesn't exist yet (e.g., between windows)
         if asset_name not in dashboard._states:
@@ -474,6 +483,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
         session_pnl._session_start = min(cycler.pnl._session_start for cycler in cyclers)
         for cycler in cyclers:
             session_pnl.settlement_pnl += cycler.pnl.settlement_pnl
+            session_pnl.outcome_pnl += getattr(cycler.pnl, "outcome_pnl", 0.0)
             session_pnl.spread_income += cycler.pnl.spread_income
             session_pnl.total_fees += cycler.pnl.total_fees
             session_pnl.est_rebates += cycler.pnl.est_rebates
@@ -497,6 +507,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
     print(f"  Total Shares: {snap.total_shares:.0f}")
     print("-" * 60)
     print(f"  Trading P&L:     ${snap.net_trading_pnl:.4f}")
+    print(f"  Outcome P&L:     ${snap.outcome_pnl:.4f}")
     print(f"  Est. Rebates:    ${snap.est_rebates:.4f}   ")
     print(f"  Rebates/Hour:    ${session_pnl.rebates_per_hour():.4f}")
     print(f"  Net P&L (total): ${snap.net_pnl_with_rebates:.4f}")

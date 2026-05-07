@@ -35,7 +35,8 @@ class OrderManager:
     Enforces BUY-only + post_only at this level.
     """
 
-    def __init__(self, executor, reprice_threshold: float = 0.005):
+    def __init__(self, executor, reprice_threshold: float = 0.005,
+                 min_update_interval: float = 0.0):
         """
         Args:
             executor: Either ClobClientWrapper (live) or DryRunExecutor (dry-run).
@@ -45,6 +46,13 @@ class OrderManager:
         """
         self.executor = executor
         self.reprice_threshold = reprice_threshold
+        self.min_update_interval = min_update_interval
+        # Repair quotes are intentionally sticky. The bot is buy-only/post-only,
+        # so imbalance repair depends on resting the light-side bid long enough
+        # to earn queue priority. Chasing every FV/book wiggle cancels exactly
+        # the order we need filled and leaves one-sided inventory into expiry.
+        self.repair_reprice_threshold = max(0.05, reprice_threshold)
+        self.repair_min_update_interval = max(10.0, min_update_interval)
         # Active quotes per market
         self.active: dict[str, ActiveQuotes] = {}
 
@@ -58,7 +66,8 @@ class OrderManager:
                              quotes: QuoteResult,
                              book_snapshot=None,
                              yes_book_snapshot=None,
-                             no_book_snapshot=None) -> bool:
+                             no_book_snapshot=None,
+                             repair_mode: str = "normal") -> bool:
         """
         Update quotes for a market. Only cancel+replace if materially different.
 
@@ -68,30 +77,6 @@ class OrderManager:
         active = self.get_active(market_id)
         updated = False
 
-        # Check if YES quote needs repricing
-        yes_needs = self._needs_reprice(
-            active.yes_price, quotes.yes_buy_price,
-            active.yes_size, quotes.yes_buy_size
-        )
-
-        # Check if NO quote needs repricing
-        no_needs = self._needs_reprice(
-            active.no_price, quotes.no_buy_price,
-            active.no_size, quotes.no_buy_size
-        )
-
-        if not yes_needs and not no_needs:
-            return False  # No change needed
-
-        # Cancel existing orders if they need repricing
-        if yes_needs and active.yes_order_id:
-            await self.executor.cancel_order(active.yes_order_id)
-            active.yes_order_id = None
-
-        if no_needs and active.no_order_id:
-            await self.executor.cancel_order(active.no_order_id)
-            active.no_order_id = None
-
         # Allow per-side book snapshots (preferred). Fall back to shared
         # book_snapshot for legacy callers.
         if yes_book_snapshot is None:
@@ -99,40 +84,131 @@ class OrderManager:
         if no_book_snapshot is None:
             no_book_snapshot = book_snapshot
 
-        # Place new YES buy if we have a price and size
-        if yes_needs and quotes.yes_buy_price and quotes.yes_buy_size > 0:
-            order_id = await self._place_buy(
-                token_id_yes, quotes.yes_buy_price,
-                quotes.yes_buy_size, "yes", yes_book_snapshot
-            )
-            if order_id:
-                active.yes_order_id = order_id
-                active.yes_price = quotes.yes_buy_price
-                active.yes_size = quotes.yes_buy_size
-                updated = True
-            else:
-                active.yes_order_id = None
-                active.yes_price = None
-                active.yes_size = 0
+        # Check if quotes need repricing. Urgent changes are adverse-risk
+        # reductions/removals/crossing-book fixes and are never delayed.
+        sticky_repair = repair_mode in ("repair_up", "repair_down")
+        yes_repair_side = repair_mode == "repair_up"
+        no_repair_side = repair_mode == "repair_down"
 
-        # Place new NO buy if we have a price and size
-        if no_needs and quotes.no_buy_price and quotes.no_buy_size > 0:
-            order_id = await self._place_buy(
-                token_id_no, quotes.no_buy_price,
-                quotes.no_buy_size, "no", no_book_snapshot
-            )
-            if order_id:
-                active.no_order_id = order_id
-                active.no_price = quotes.no_buy_price
-                active.no_size = quotes.no_buy_size
-                updated = True
+        yes_needs, yes_urgent = self._reprice_decision(
+            active.yes_price, quotes.yes_buy_price,
+            active.yes_size, quotes.yes_buy_size,
+            yes_book_snapshot,
+            sticky_repair=yes_repair_side,
+        )
+
+        no_needs, no_urgent = self._reprice_decision(
+            active.no_price, quotes.no_buy_price,
+            active.no_size, quotes.no_buy_size,
+            no_book_snapshot,
+            sticky_repair=no_repair_side,
+        )
+
+        min_interval = self.repair_min_update_interval if sticky_repair else self.min_update_interval
+        if min_interval > 0 and active.last_update > 0:
+            elapsed = time.time() - active.last_update
+            if elapsed < min_interval:
+                # Do not cancel/repost just to improve a bid or increase size
+                # too frequently; that burns queue priority. Still allow
+                # adverse reprices and quote removals immediately.
+                if yes_needs and not yes_urgent:
+                    yes_needs = False
+                if no_needs and not no_urgent:
+                    no_needs = False
+
+        if not yes_needs and not no_needs:
+            return False  # No change needed
+
+        # Cancel existing orders if they need repricing
+        cancel_ids = []
+        if yes_needs and active.yes_order_id:
+            cancel_ids.append(active.yes_order_id)
+            active.yes_order_id = None
+            active.yes_price = None
+            active.yes_size = 0
+
+        if no_needs and active.no_order_id:
+            cancel_ids.append(active.no_order_id)
+            active.no_order_id = None
+            active.no_price = None
+            active.no_size = 0
+
+        total_start = time.perf_counter()
+        cancel_ms = 0.0
+        place_ms = 0.0
+
+        if cancel_ids:
+            cancel_start = time.perf_counter()
+            if hasattr(self.executor, 'cancel_orders'):
+                await self.executor.cancel_orders(cancel_ids)
             else:
-                active.no_order_id = None
-                active.no_price = None
-                active.no_size = 0
+                for order_id in cancel_ids:
+                    await self.executor.cancel_order(order_id)
+            cancel_ms = (time.perf_counter() - cancel_start) * 1000
+
+        place_specs = []
+        if yes_needs and quotes.yes_buy_price and quotes.yes_buy_size > 0:
+            place_specs.append({
+                "token_id": token_id_yes,
+                "price": quotes.yes_buy_price,
+                "size": quotes.yes_buy_size,
+                "side": "yes",
+                "book_snapshot": yes_book_snapshot,
+            })
+        elif yes_needs:
+            active.yes_order_id = None
+            active.yes_price = None
+            active.yes_size = 0
+
+        if no_needs and quotes.no_buy_price and quotes.no_buy_size > 0:
+            place_specs.append({
+                "token_id": token_id_no,
+                "price": quotes.no_buy_price,
+                "size": quotes.no_buy_size,
+                "side": "no",
+                "book_snapshot": no_book_snapshot,
+            })
+        elif no_needs:
+            active.no_order_id = None
+            active.no_price = None
+            active.no_size = 0
+
+        placed = {}
+        if place_specs:
+            place_start = time.perf_counter()
+            placed = await self._place_buys(place_specs)
+            place_ms = (time.perf_counter() - place_start) * 1000
+
+        yes_order_id = placed.get("yes")
+        if yes_needs and yes_order_id:
+            active.yes_order_id = yes_order_id
+            active.yes_price = quotes.yes_buy_price
+            active.yes_size = quotes.yes_buy_size
+            updated = True
+
+        no_order_id = placed.get("no")
+        if no_needs and no_order_id:
+            active.no_order_id = no_order_id
+            active.no_price = quotes.no_buy_price
+            active.no_size = quotes.no_buy_size
+            updated = True
 
         if updated:
             active.last_update = time.time()
+
+        if cancel_ids or place_specs:
+            log.info("order_update_latency",
+                     market=market_id[:8],
+                     mode=repair_mode,
+                     cancels=len(cancel_ids),
+                     placements=len(place_specs),
+                     yes_price=quotes.yes_buy_price,
+                     yes_size=quotes.yes_buy_size,
+                     no_price=quotes.no_buy_price,
+                     no_size=quotes.no_buy_size,
+                     cancel_ms=round(cancel_ms, 1),
+                     place_ms=round(place_ms, 1),
+                     total_ms=round((time.perf_counter() - total_start) * 1000, 1))
 
         return updated
 
@@ -176,6 +252,19 @@ class OrderManager:
                 )
         return None
 
+    async def _place_buys(self, orders: list[dict]) -> dict[str, Optional[str]]:
+        """Place one or more BUY orders, using executor batch API when available."""
+        if hasattr(self.executor, 'place_buy_orders'):
+            return await self.executor.place_buy_orders(orders)
+
+        placed = {}
+        for order in orders:
+            placed[order["side"]] = await self._place_buy(
+                order["token_id"], order["price"], order["size"],
+                order["side"], order.get("book_snapshot")
+            )
+        return placed
+
     def _needs_reprice(self, existing_price: Optional[float],
                        new_price: Optional[float],
                        existing_size: int,
@@ -205,6 +294,52 @@ class OrderManager:
                 return True
 
         return False
+
+    def _reprice_decision(self, existing_price: Optional[float],
+                          new_price: Optional[float],
+                          existing_size: int,
+                          new_size: int,
+                          book_snapshot=None,
+                          sticky_repair: bool = False) -> tuple[bool, bool]:
+        """Return (needs_reprice, urgent)."""
+        # Always place if no existing quote; not urgent because there is no
+        # stale risk, but no cooldown applies before first placement anyway.
+        if existing_price is None:
+            return (new_price is not None and new_size > 0), False
+
+        # Remove quote if new is None or zero size. This is urgent because a
+        # risk phase/capital guard decided the quote should not exist.
+        if new_price is None or new_size <= 0:
+            return True, True
+
+        # If our BUY bid crosses/touches best ask, cancel immediately.
+        if book_snapshot is not None and existing_price >= book_snapshot.best_ask:
+            return True, True
+
+        price_delta = new_price - existing_price
+
+        if sticky_repair:
+            # In repair mode, queue priority is the product. Keep the existing
+            # light-side bid resting unless it is dangerously stale. Small FV
+            # wiggles should not cancel the only order that can flatten us.
+            if abs(price_delta) > self.repair_reprice_threshold:
+                return True, price_delta < 0
+            if existing_size > 0 and new_size > existing_size * 2.0:
+                return True, False
+            return False, False
+
+        if abs(price_delta) > self.reprice_threshold:
+            # Lowering a BUY bid reduces adverse selection / overpaying risk.
+            # Raising a BUY bid is just chasing/improving and can be throttled.
+            return True, price_delta < 0
+
+        # To preserve queue position, DO NOT reprice if size merely decreases.
+        # Only reprice if we need significantly MORE size (>50% increase), and
+        # treat that as non-urgent so it can be rate-limited.
+        if existing_size > 0 and new_size > existing_size * 1.5:
+            return True, False
+
+        return False, False
 
     def check_stale_quotes(self, market_id: str,
                             yes_book=None, no_book=None) -> bool:
