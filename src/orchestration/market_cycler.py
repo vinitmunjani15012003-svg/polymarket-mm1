@@ -1083,13 +1083,6 @@ class MarketCycler:
             best_ask_no = book_down.best_ask
             best_bid_no = book_down.best_bid
 
-        # 11.6 Enforce minimum order size (Polymarket rejects orders < ~$5)
-        MIN_SHARES = 5
-        if 0 < up_size < MIN_SHARES:
-            up_size = MIN_SHARES
-        if 0 < down_size < MIN_SHARES:
-            down_size = MIN_SHARES
-
         # 12. Generate quotes using share imbalance for price skewing
         #     yes_buy = Up buy price, no_buy = Down buy price
         quotes = self.quote_engine.generate_quotes(

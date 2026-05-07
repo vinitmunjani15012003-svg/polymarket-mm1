@@ -47,6 +47,14 @@ class OrderManager:
         self.executor = executor
         self.reprice_threshold = reprice_threshold
         self.min_update_interval = min_update_interval
+        # Cache whether executor.place_buy_order accepts a 'side' param
+        # (DryRunExecutor does, ClobClientWrapper also does now).
+        # Avoids calling inspect.signature on every order placement.
+        self._executor_accepts_side = False
+        if hasattr(executor, 'place_buy_order'):
+            import inspect
+            sig = inspect.signature(executor.place_buy_order)
+            self._executor_accepts_side = 'side' in sig.parameters
         # Repair quotes are intentionally sticky. The bot is buy-only/post-only,
         # so imbalance repair depends on resting the light-side bid long enough
         # to earn queue priority. Chasing every FV/book wiggle cancels exactly
@@ -236,12 +244,8 @@ class OrderManager:
         """
         Place a BUY order. This is the single enforcement point.
         """
-        # Dry-run executor accepts side parameter
         if hasattr(self.executor, 'place_buy_order'):
-            # Check if executor is DryRunExecutor (accepts side param)
-            import inspect
-            sig = inspect.signature(self.executor.place_buy_order)
-            if 'side' in sig.parameters:
+            if self._executor_accepts_side:
                 return await self.executor.place_buy_order(
                     token_id, price, size, side=side,
                     book_snapshot=book_snapshot

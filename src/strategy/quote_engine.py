@@ -14,9 +14,6 @@ spreads 10-25x wider than actual market spreads.
 import math
 import time
 
-from src.monitoring.logger import get_logger
-
-_qlog = get_logger("quote_engine")
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -288,14 +285,14 @@ class QuoteEngine:
         # Sanity check: YES bid should never exceed NO bid when FV < 0.50
         # (and vice versa). If this fires, something upstream is swapping prices.
         if fair_value < 0.50 and result.yes_buy_price > result.no_buy_price and yes_size > 0:
-            _qlog.warning("price_inversion_detected",
+            log.warning("price_inversion_detected",
                           fv=round(fair_value, 4),
                           yes=result.yes_buy_price, no=result.no_buy_price,
                           imb=round(share_imbalance, 1),
                           bb_yes=best_bid_yes, bb_no=best_bid_no,
                           ba_yes=best_ask_yes, ba_no=best_ask_no)
         elif fair_value > 0.50 and result.no_buy_price > result.yes_buy_price and no_size > 0:
-            _qlog.warning("price_inversion_detected",
+            log.warning("price_inversion_detected",
                           fv=round(fair_value, 4),
                           yes=result.yes_buy_price, no=result.no_buy_price,
                           imb=round(share_imbalance, 1),
