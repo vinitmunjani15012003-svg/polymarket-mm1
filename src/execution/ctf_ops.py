@@ -578,6 +578,7 @@ class BalanceMonitor:
                             pair_profit, market_id
                         )
                         pnl_tracker.record_capital_recovery(usdc_recovery)
+                    pos.acknowledge_settlement()
 
                     # Deduct merged pairs from inventory
                     avg_yes = pos.yes_avg_entry
@@ -1001,6 +1002,7 @@ class SimulatedBalanceMonitor:
                 pnl_tracker.record_settlement(pair_profit, market_id)
             if pnl_tracker:
                 pnl_tracker.record_capital_recovery(usdc_recovery)
+            pos.acknowledge_settlement()
                 
             avg_yes = pos.yes_avg_entry
             avg_no = pos.no_avg_entry
