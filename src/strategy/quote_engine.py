@@ -203,16 +203,25 @@ class QuoteEngine:
             no_buy = best_ask_no - 0.01
 
         # 6.5. Spread Re-Centering (Orderbook Shadowing)
+        #    When one side gets clamped by the book, nudge the OTHER side
+        #    up by the same amount to keep spreads tight.
+        #    CRITICAL: Cap the adjustment to MAX_RECENTER (3 cents).
+        #    At extreme FVs (e.g. 0.04) the model price diverges hugely
+        #    from the book, creating clamp drops of 90+ cents which would
+        #    otherwise catapult the opposite side to a nonsensical price.
+        MAX_RECENTER = 0.03
         yes_clamp_drop = orig_yes - yes_buy
         no_clamp_drop = orig_no - no_buy
 
         if yes_clamp_drop > 0 and no_clamp_drop <= 0:
-            no_buy += yes_clamp_drop
+            adjustment = min(yes_clamp_drop, MAX_RECENTER)
+            no_buy += adjustment
             if best_ask_no is not None and no_buy >= best_ask_no:
                 no_buy = best_ask_no - 0.01
 
         elif no_clamp_drop > 0 and yes_clamp_drop <= 0:
-            yes_buy += no_clamp_drop
+            adjustment = min(no_clamp_drop, MAX_RECENTER)
+            yes_buy += adjustment
             if best_ask_yes is not None and yes_buy >= best_ask_yes:
                 yes_buy = best_ask_yes - 0.01
 
