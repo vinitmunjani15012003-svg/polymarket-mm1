@@ -1013,9 +1013,16 @@ class MarketCycler:
                 return
 
         # 10.5 Enforce Close-Only quoting during near-expiry phases OR HALTS
+        #      Exception: dust tails (< min_order_size) already have their own
+        #      paired normalization plan from step 10.25 — don't override it
+        #      because _repair_size() would return 0 for sub-minimum tails,
+        #      causing the bot to stop quoting entirely.
         if is_halted or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]:
-            # Only allow quoting the side that reduces the imbalance
-            if imbalance > 0:
+            if dust_normalization and repair_mode.startswith("dust_"):
+                # Keep the dust normalization plan — it's already small
+                # and capped at 2x min_order_size
+                pass
+            elif imbalance > 0:
                 up_size = 0
                 down_size = _repair_size(min(self.quote_engine.max_order_size, int(imbalance)))
             elif imbalance < 0:
@@ -1023,8 +1030,6 @@ class MarketCycler:
                 up_size = _repair_size(min(self.quote_engine.max_order_size, int(abs(imbalance))))
             else:
                 # If we're flat near expiry, we intentionally do not quote.
-                # IMPORTANT: Don't treat this as a "pre_trade_failed" condition;
-                # it would spam warnings and look like terrible quote uptime.
                 up_size = 0
                 down_size = 0
 
