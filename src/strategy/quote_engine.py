@@ -104,7 +104,9 @@ class QuoteEngine:
                         max_imbalance: float,
                         yes_size: int, no_size: int,
                         best_ask_yes: Optional[float] = None,
-                        best_ask_no: Optional[float] = None) -> QuoteResult:
+                        best_ask_no: Optional[float] = None,
+                        best_bid_yes: Optional[float] = None,
+                        best_bid_no: Optional[float] = None) -> QuoteResult:
         """
         Generate BUY quotes for Up and Down tokens.
 
@@ -112,8 +114,10 @@ class QuoteEngine:
         1. Start with fair_value as the center
         2. Apply inventory skew based on SHARE COUNT imbalance
         3. Place buy orders edge_ticks below the center
-        4. Ensure combined cost < $1.00
-        5. Widen near expiry
+        4. Anchor to live orderbook (never fall behind best_bid)
+        5. Tighten light side when imbalanced (complementary pricing)
+        6. Ensure combined cost < $1.00 (symmetric enforcement)
+        7. Widen near expiry
 
         Args:
             fair_value: P(Up) ∈ [0.01, 0.99].
@@ -123,6 +127,8 @@ class QuoteEngine:
             max_imbalance: Maximum share imbalance for ratio calculation.
             yes_size: Adjusted buy size for Up token.
             no_size: Adjusted buy size for Down token.
+            best_bid_yes: Live orderbook best bid for YES token.
+            best_bid_no: Live orderbook best bid for NO token.
         """
         result = QuoteResult(t_normalized=t_normalized)
 
@@ -130,7 +136,13 @@ class QuoteEngine:
         #    Positive imbalance = too many Up → push Up buy lower, Down buy higher
         imb_ratio = share_imbalance / max(1.0, max_imbalance)
         imb_ratio = max(-1.0, min(1.0, imb_ratio))
-        skew = imb_ratio * self.gamma * 0.5  # Max skew = ±gamma/2 per side
+
+        # Time-escalating skew: stronger adjustment as window progresses
+        # At t=1.0 (fresh): use base gamma
+        # At t=0.33 (5min left): ~2x gamma for faster pair completion
+        time_urgency = 1.0 + max(0.0, 1.0 - t_normalized / 0.5)
+        effective_gamma = self.gamma * min(2.5, time_urgency)
+        skew = imb_ratio * effective_gamma * 0.5
 
         # Reservation price = inventory-adjusted center
         reservation = fair_value - skew
@@ -147,28 +159,32 @@ class QuoteEngine:
 
         result.spread = round(half_spread * 2, 4)
 
-        # 4. Compute buy prices
-        #    Up buy = reservation - half_spread (skewed by inventory)
-        #    Down buy = (1 - reservation) - half_spread
-        yes_buy = reservation - half_spread
-        no_buy = (1.0 - reservation) - half_spread
+        # 4. Compute buy prices with ASYMMETRIC spread
+        #    Light side (needs fills) gets tighter spread
+        #    Heavy side (too much inventory) gets wider spread
+        if abs(imb_ratio) > 0.15:
+            # Scale: at imb_ratio=1.0, light gets 40% tighter, heavy 40% wider
+            tighten = min(0.4, abs(imb_ratio) * 0.4)
+            light_spread = half_spread * (1.0 - tighten)
+            heavy_spread = half_spread * (1.0 + tighten)
+        else:
+            light_spread = half_spread
+            heavy_spread = half_spread
 
-        # 5. Additional inventory skew on spread:
-        #    Heavy side (in shares) gets wider spread, light side gets tighter
-        if abs(imb_ratio) > 0.3:
-            skew_adjustment = abs(imb_ratio) * TICK_SIZE * 2
-            if imb_ratio > 0:
-                # Too many Up shares: widen Up buy, tighten Down buy
-                yes_buy -= skew_adjustment
-                no_buy += min(skew_adjustment * 0.5, TICK_SIZE)
-            else:
-                # Too many Down shares: widen Down buy, tighten Up buy
-                no_buy -= skew_adjustment
-                yes_buy += min(skew_adjustment * 0.5, TICK_SIZE)
+        if imb_ratio > 0:
+            # Too many YES → tighten NO (light), widen YES (heavy)
+            yes_buy = reservation - heavy_spread
+            no_buy = (1.0 - reservation) - light_spread
+        elif imb_ratio < 0:
+            # Too many NO → tighten YES (light), widen NO (heavy)
+            yes_buy = reservation - light_spread
+            no_buy = (1.0 - reservation) - heavy_spread
+        else:
+            yes_buy = reservation - half_spread
+            no_buy = (1.0 - reservation) - half_spread
 
-        # 6. Clamp to valid range and live orderbook asks (prevent crossing book and rejection 4)
+        # 5. Clamp to valid range
         # If our calculated price is practically zero, we shouldn't bid at all
-        # because clamping it to 0.01 would mean paying more than we want to (0 edge).
         if yes_buy < 0.005:
             yes_size = 0
         if no_buy < 0.005:
@@ -177,6 +193,7 @@ class QuoteEngine:
         yes_buy = max(0.01, min(0.99, yes_buy))
         no_buy = max(0.01, min(0.99, no_buy))
 
+        # 6. Orderbook clamping: prevent crossing the book
         orig_yes = yes_buy
         orig_no = no_buy
 
@@ -186,45 +203,62 @@ class QuoteEngine:
             no_buy = best_ask_no - 0.01
 
         # 6.5. Spread Re-Centering (Orderbook Shadowing)
-        # If the live orderbook clamped our bid down, it means our internal Fair Value
-        # is lagging the market. To maintain a tight spread and ensure we get filled,
-        # we shift the opposite side UP by the exact same amount we were clamped down.
         yes_clamp_drop = orig_yes - yes_buy
         no_clamp_drop = orig_no - no_buy
 
         if yes_clamp_drop > 0 and no_clamp_drop <= 0:
             no_buy += yes_clamp_drop
-            # Safety: don't cross the book while re-centering
             if best_ask_no is not None and no_buy >= best_ask_no:
                 no_buy = best_ask_no - 0.01
 
         elif no_clamp_drop > 0 and yes_clamp_drop <= 0:
             yes_buy += no_clamp_drop
-            # Safety: don't cross the book while re-centering
             if best_ask_yes is not None and yes_buy >= best_ask_yes:
                 yes_buy = best_ask_yes - 0.01
+
+        # 7. Orderbook anchoring: light side should never fall behind best_bid
+        #    If our bid is more than 1 tick below the book's best bid, join the queue.
+        #    This prevents the light side from going stale while the market moves.
+        if abs(imb_ratio) > 0.1:
+            if imb_ratio > 0 and best_bid_no is not None:
+                # NO is light side — anchor to book
+                if no_buy < best_bid_no and yes_size > 0:
+                    no_buy = best_bid_no
+                    # Safety: don't cross the book
+                    if best_ask_no is not None and no_buy >= best_ask_no:
+                        no_buy = best_ask_no - 0.01
+            elif imb_ratio < 0 and best_bid_yes is not None:
+                # YES is light side — anchor to book
+                if yes_buy < best_bid_yes and no_size > 0:
+                    yes_buy = best_bid_yes
+                    if best_ask_yes is not None and yes_buy >= best_ask_yes:
+                        yes_buy = best_ask_yes - 0.01
 
         yes_buy = max(0.01, yes_buy)
         no_buy = max(0.01, no_buy)
 
-        # 7. CRITICAL: combined cost must be < $1.00
-        # If we want a 0.99 combined cost (1 cent total spread), we can't use math.floor
-        # on both sides, because that guarantees 2 cents of edge lost to rounding.
-        
-        # First, round to nearest cent
+        # 8. CRITICAL: combined cost must be < $1.00
+        #    Symmetric enforcement: drop the HEAVY side (not always YES)
         yes_buy = round(yes_buy, 2)
         no_buy = round(no_buy, 2)
-        
+
         combined = yes_buy + no_buy
-        
-        # If combined cost is exactly 1.00 or higher, we must push it down to 0.99
+
         if combined >= 1.0:
-            # Drop the side that was rounded up the most (or arbitrarily)
-            yes_buy -= 0.01
-            combined = yes_buy + no_buy
-            if combined >= 1.0:
-                no_buy -= 0.01
-                
+            overshoot = combined - 0.99
+            cents_to_drop = max(1, round(overshoot * 100))
+            if imb_ratio > 0:
+                # YES is heavy → drop YES price (preserve NO for fill attraction)
+                yes_buy -= cents_to_drop * 0.01
+            elif imb_ratio < 0:
+                # NO is heavy → drop NO price (preserve YES for fill attraction)
+                no_buy -= cents_to_drop * 0.01
+            else:
+                # Balanced → split the drop evenly
+                yes_buy -= 0.01
+                if yes_buy + no_buy >= 1.0:
+                    no_buy -= 0.01
+
         yes_buy = max(0.01, yes_buy)
         no_buy = max(0.01, no_buy)
         combined = round(yes_buy + no_buy, 4)

@@ -98,7 +98,7 @@ global:
   refresh_interval: 0.25
   stop_quoting_seconds: 90     # Quote closer to expiry (more volume)
   reduce_size_seconds: 240
-  reprice_threshold: 0.01      # Increased to 1 cent to protect queue position
+  reprice_threshold: 0.005     # Half-cent: faster repricing reduces adverse selection
   starting_capital: 50
   max_daily_loss_pct: 0.50     # 50% — generous, rebates offset losses
   max_drawdown_pct: 0.30       # 30% drawdown pause (auto-resumes 60s)

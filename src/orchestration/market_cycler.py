@@ -845,10 +845,21 @@ class MarketCycler:
         book_down = await self.book_reader.get_book(market.token_id_down)
         best_ask_yes = None
         best_ask_no = None
+        best_bid_yes = None
+        best_bid_no = None
         if book_up:
             best_ask_yes = book_up.best_ask
+            best_bid_yes = book_up.best_bid
         if book_down:
             best_ask_no = book_down.best_ask
+            best_bid_no = book_down.best_bid
+
+        # 11.6 Enforce minimum order size (Polymarket rejects orders < ~$5)
+        MIN_SHARES = 5
+        if 0 < up_size < MIN_SHARES:
+            up_size = MIN_SHARES
+        if 0 < down_size < MIN_SHARES:
+            down_size = MIN_SHARES
 
         # 12. Generate quotes using share imbalance for price skewing
         #     yes_buy = Up buy price, no_buy = Down buy price
@@ -862,6 +873,8 @@ class MarketCycler:
             no_size=down_size,
             best_ask_yes=best_ask_yes,
             best_ask_no=best_ask_no,
+            best_bid_yes=best_bid_yes,
+            best_bid_no=best_bid_no,
         )
         quotes.phase = phase
 
@@ -960,6 +973,25 @@ class MarketCycler:
             self.edge_tracker.record_fill(
                 fill["side"], fill["price"], fv
             )
+
+            # 15.1 FILL-REACTIVE REPRICING
+            # After a fill creates imbalance, immediately cancel the OPPOSITE
+            # side's stale quote so the next cycle places a fresh, competitive
+            # bid. Without this, the stale opposite-side quote sits at an
+            # unattractive price and never fills, causing one-sided inventory.
+            active = self.order_mgr.get_active(market.market_id)
+            if fill["side"] in ("no", "down") and active.yes_order_id:
+                await self.order_mgr.executor.cancel_order(active.yes_order_id)
+                active.yes_order_id = None
+                active.yes_price = None
+                log.debug("fill_reactive_reprice", cancelled="yes",
+                          trigger_side="no", imbalance=pos.share_imbalance())
+            elif fill["side"] in ("yes", "up") and active.no_order_id:
+                await self.order_mgr.executor.cancel_order(active.no_order_id)
+                active.no_order_id = None
+                active.no_price = None
+                log.debug("fill_reactive_reprice", cancelled="no",
+                          trigger_side="yes", imbalance=pos.share_imbalance())
 
         # 15.5. Auto-merge check: dollar-based threshold OR low balance OR near expiry
         force_merge = False

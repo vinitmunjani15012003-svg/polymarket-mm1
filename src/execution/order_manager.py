@@ -35,11 +35,13 @@ class OrderManager:
     Enforces BUY-only + post_only at this level.
     """
 
-    def __init__(self, executor, reprice_threshold: float = 0.01):
+    def __init__(self, executor, reprice_threshold: float = 0.005):
         """
         Args:
             executor: Either ClobClientWrapper (live) or DryRunExecutor (dry-run).
             reprice_threshold: Minimum price change to trigger cancel+replace.
+                               Default 0.005 (half a cent) to stay competitive
+                               in 1-cent tick markets.
         """
         self.executor = executor
         self.reprice_threshold = reprice_threshold
@@ -178,7 +180,12 @@ class OrderManager:
                        new_price: Optional[float],
                        existing_size: int,
                        new_size: int) -> bool:
-        """Check if a quote needs to be repriced."""
+        """Check if a quote needs to be repriced.
+
+        Uses >= (not >) so that half-cent changes trigger repricing in a
+        1-cent tick market.  Also reprices on significant size changes in
+        EITHER direction — stale large orders accumulate adverse fills.
+        """
         # Always reprice if no existing quote
         if existing_price is None:
             return new_price is not None and new_size > 0
@@ -187,14 +194,15 @@ class OrderManager:
         if new_price is None or new_size <= 0:
             return True
 
-        # Reprice if price moved more than threshold
-        if abs(new_price - existing_price) > self.reprice_threshold:
+        # Reprice if price moved more than threshold (>= not >)
+        if abs(new_price - existing_price) >= self.reprice_threshold:
             return True
 
-        # To preserve queue position, DO NOT reprice if size merely decreases.
-        # Only reprice if we need significantly MORE size (>50% increase)
-        if existing_size > 0 and new_size > existing_size * 1.5:
-            return True
+        # Reprice on significant size change in EITHER direction (>50%)
+        if existing_size > 0:
+            ratio = new_size / existing_size
+            if ratio < 0.5 or ratio > 1.5:
+                return True
 
         return False
 
