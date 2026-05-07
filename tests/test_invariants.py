@@ -437,101 +437,43 @@ def test_dry_run_partial_fill_keeps_order_live():
 
 
 # ---------------------------------------------------------------------------
-# FIFO pair-matching P&L accuracy tests
+# Merge P&L accuracy tests: pairs × (1 - (avg_yes + avg_no))
 # ---------------------------------------------------------------------------
 
-def test_fifo_pair_profit_identical_prices():
-    """Basic: YES@$0.49 + NO@$0.49 → $0.02 edge per share."""
+def test_merge_pnl_basic():
+    """10 pairs at $0.49 YES + $0.49 NO = $0.02 edge per pair."""
     inv = InventoryManager()
     inv.record_fill("M1", "yes", 10, 0.49)
     inv.record_fill("M1", "no",  10, 0.49)
 
     pos = inv.positions["M1"]
     profit = pos.matched_pair_profit()
-    # 10 shares × (1.0 - 0.98) = $0.20
+    # 10 × (1.0 - (0.49 + 0.49)) = 10 × 0.02 = $0.20
     assert abs(profit - 0.20) < 1e-9
 
 
-def test_fifo_pair_profit_respects_chronological_pairing():
-    """FIFO must pair the FIRST yes fill with the FIRST no fill.
-
-    YES fills: 10@$0.60, then 10@$0.40  (different times / FV regimes)
-    NO  fills: 10@$0.39, then 10@$0.59
-
-    FIFO pairs:
-      pair-1: 10 × (1 - 0.60 - 0.39) = 10 × 0.01 = $0.10
-      pair-2: 10 × (1 - 0.40 - 0.59) = 10 × 0.01 = $0.10
-    Total FIFO profit = $0.20
-
-    Old averaged method would give:
-      yes_avg = 0.50, no_avg = 0.49 → 20 × 0.01 = $0.20  (coincidentally same)
-
-    The important invariant is *which* fills get paired — verify no cross-pairing.
-    """
+def test_merge_pnl_uses_average_entry():
+    """Multiple fills at different prices → averaged correctly."""
     inv = InventoryManager()
     inv.record_fill("M1", "yes", 10, 0.60)
-    inv.record_fill("M1", "no",  10, 0.39)
-    inv.record_fill("M1", "yes", 10, 0.40)
-    inv.record_fill("M1", "no",  10, 0.59)
+    inv.record_fill("M1", "yes", 10, 0.40)  # avg_yes = 0.50
+    inv.record_fill("M1", "no",  20, 0.45)  # avg_no  = 0.45
 
     pos = inv.positions["M1"]
     profit = pos.matched_pair_profit()
-    assert abs(profit - 0.20) < 1e-9
+    # 20 pairs × (1.0 - (0.50 + 0.45)) = 20 × 0.05 = $1.00
+    assert abs(profit - 1.00) < 1e-9
 
 
-def test_fifo_pair_profit_prevents_fv_swing_inflation():
-    """The exact case that was inflating dry-run P&L ~10x.
-
-    YES@$0.09 filled when FV was low near expiry.
-    NO @$0.51 filled earlier when FV was high.
-
-    Old averaged method:  1 × (1 - 0.09 - 0.51) = $0.40  ← fake edge
-    FIFO method (correct): same pair, same result = $0.40
-
-    BUT in practice the bot always places BOTH orders simultaneously at the
-    same FV. To simulate the real problematic case we need DIFFERENT fills:
-
-    Scenario: bot earned real edge of $0.02 per pair.
-      YES@$0.49, NO@$0.49 — correctly paired, $0.02 edge ✓
-      Then a rogue cross-time pairing would have been:
-      YES@$0.09, NO@$0.89 — that's $0.02 edge too ✓ (FIFO ensures this)
-
-    The bug was that averaged entry mixed these prices. FIFO prevents that
-    by forcing strict pairing, so we test the worst case: partial fills
-    that would have been mis-averaged.
-    """
+def test_merge_pnl_unmatched_ignored():
+    """Only matched pairs count; excess shares don't affect profit."""
     inv = InventoryManager()
-    # Pair 1: at FV=0.50, combined $0.98, edge $0.02
-    inv.record_fill("M1", "yes", 5, 0.49)
-    inv.record_fill("M1", "no",  5, 0.49)
-    # Pair 2: at FV=0.80 high, combined $0.98, edge $0.02
-    inv.record_fill("M1", "yes", 5, 0.79)
-    inv.record_fill("M1", "no",  5, 0.19)
+    inv.record_fill("M1", "yes", 30, 0.50)
+    inv.record_fill("M1", "no",  10, 0.45)
 
     pos = inv.positions["M1"]
     profit = pos.matched_pair_profit()
-    # Both pairs have $0.02 edge → total $0.10 for 5 shares each
-    expected = 5 * (1.0 - (0.49 + 0.49)) + 5 * (1.0 - (0.79 + 0.19))
-    assert abs(profit - expected) < 1e-9
-    # Critically: profit must be << $0.40 (the inflated old result)
-    assert profit < 0.50
+    # 10 matched pairs × (1.0 - (0.50 + 0.45)) = 10 × 0.05 = $0.50
+    assert abs(profit - 0.50) < 1e-9
+    assert pos.matched_pairs() == 10
 
-
-def test_acknowledge_settlement_prevents_double_counting():
-    """After acknowledging, matched_pair_profit() returns 0 until new pairs form."""
-    inv = InventoryManager()
-    inv.record_fill("M1", "yes", 10, 0.49)
-    inv.record_fill("M1", "no",  10, 0.49)
-
-    pos = inv.positions["M1"]
-    profit_before = pos.matched_pair_profit()
-    assert profit_before > 0
-
-    pos.acknowledge_settlement()
-    # Immediately after ack: no new pairs → should return 0
-    assert pos.matched_pair_profit() == 0.0
-
-    # New fills form a new pair → profit resumes
-    inv.record_fill("M1", "yes", 5, 0.48)
-    inv.record_fill("M1", "no",  5, 0.48)
-    assert pos.matched_pair_profit() > 0

@@ -436,7 +436,6 @@ class MarketCycler:
                         pair_profit = pos.matched_pair_profit()
                         self.pnl.record_settlement(pair_profit, market.market_id)
                         self.pnl.record_capital_recovery(pairs * 1.0)
-                        pos.acknowledge_settlement()
                         log.info("pairs_merged",
                                  pairs=pairs,
                                  profit=f"${pair_profit:.4f}",
@@ -469,7 +468,6 @@ class MarketCycler:
                     pair_profit = pos.matched_pair_profit()
                     self.pnl.record_settlement(pair_profit, market.market_id)
                     self.pnl.record_capital_recovery(pairs * 1.0)
-                    pos.acknowledge_settlement()
                     log.info("dry_run_pairs_merged",
                              pairs=pairs,
                              profit=f"${pair_profit:.4f}")
