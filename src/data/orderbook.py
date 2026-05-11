@@ -29,6 +29,9 @@ class BookSnapshot:
     best_ask_size: float
     mid_price: float
     micro_price: float
+    tick_size: str = "0.01"
+    min_order_size: float = 5.0
+    neg_risk: bool = False
 
 
 class OrderBookReader:
@@ -157,6 +160,9 @@ class OrderBookReader:
             best_ask_size=best_ask_size,
             mid_price=mid,
             micro_price=micro,
+            tick_size=str(raw.get("tick_size") or raw.get("minimum_tick_size") or "0.01"),
+            min_order_size=float(raw.get("min_order_size") or 5),
+            neg_risk=bool(raw.get("neg_risk", False)),
         )
 
     async def close(self):

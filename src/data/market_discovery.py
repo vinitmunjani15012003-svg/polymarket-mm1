@@ -305,11 +305,23 @@ class MarketDiscovery:
             else:
                 outcomes = outcomes_raw
 
+            token_id_up = clob_ids[0]
+            token_id_down = clob_ids[1]
+            try:
+                outcome_to_token = {
+                    str(outcome).strip().lower(): clob_ids[i]
+                    for i, outcome in enumerate(outcomes[:len(clob_ids)])
+                }
+                token_id_up = outcome_to_token.get("up") or outcome_to_token.get("yes") or token_id_up
+                token_id_down = outcome_to_token.get("down") or outcome_to_token.get("no") or token_id_down
+            except Exception:
+                log.warning("token_outcome_mapping_fallback", slug=slug)
+
             return MarketInfo(
                 market_id=condition_id,
                 condition_id=condition_id,
-                token_id_up=clob_ids[0],     # First token = Up
-                token_id_down=clob_ids[1],   # Second token = Down
+                token_id_up=token_id_up,
+                token_id_down=token_id_down,
                 question=raw.get("question", ""),
                 asset=asset.upper(),
                 slug=slug,

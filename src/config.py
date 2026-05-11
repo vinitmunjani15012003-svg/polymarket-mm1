@@ -60,11 +60,16 @@ class CredentialsConfig:
     api_passphrase: str = ""
     chain_id: int = 137
     host: str = "https://clob.polymarket.com"
+    signature_type: int = 3
+    funder: str = ""
+    collateral_token: str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # pUSD on Polygon
     # Polymarket Builder (for gasless merge/split/redeem)
     builder_api_key: str = ""
     builder_secret: str = ""
     builder_passphrase: str = ""
     builder_relayer_url: str = "https://relayer-v2.polymarket.com"
+    relayer_api_key: str = ""
+    relayer_api_key_address: str = ""
     # Polygon RPC (for balance monitoring and on-chain ops)
     # NOTE: polygon-rpc.com has become unreliable/paid for many tenants.
     polygon_rpc_url: str = "https://polygon-bor.publicnode.com"
@@ -136,6 +141,16 @@ class BotConfig:
                 raise ValueError("private_key is required in live mode")
             if not self.credentials.api_key:
                 raise ValueError("api_key is required in live mode")
+            if not self.credentials.api_secret:
+                raise ValueError("api_secret is required in live mode")
+            if not self.credentials.api_passphrase:
+                raise ValueError("api_passphrase is required in live mode")
+            if self.credentials.signature_type not in (0, 1, 2, 3):
+                raise ValueError("signature_type must be one of 0, 1, 2, 3")
+            if self.credentials.signature_type in (1, 2, 3) and not self.credentials.funder:
+                raise ValueError("funder is required in live mode for proxy/safe/deposit wallets")
+            if not self.credentials.collateral_token:
+                raise ValueError("collateral_token is required in live mode")
                 
         for name, asset in self.assets.items():
             if asset.min_spread >= asset.max_spread:
@@ -216,10 +231,15 @@ def load_config(config_path: str = "config/default.yaml",
         api_passphrase=pm.get("api_passphrase", ""),
         chain_id=pm.get("chain_id", 137),
         host=pm.get("host", "https://clob.polymarket.com"),
+        signature_type=int(pm.get("signature_type", 3)),
+        funder=pm.get("funder", pm.get("funder_address", "")),
+        collateral_token=pm.get("collateral_token", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"),
         builder_api_key=builder.get("api_key", ""),
         builder_secret=builder.get("secret", ""),
         builder_passphrase=builder.get("passphrase", ""),
         builder_relayer_url=builder.get("relayer_url", "https://relayer-v2.polymarket.com"),
+        relayer_api_key=builder.get("relayer_api_key", builder.get("api_key", "")),
+        relayer_api_key_address=builder.get("relayer_api_key_address", builder.get("api_key_address", "")),
         polygon_rpc_url=pm.get("polygon_rpc_url", "https://polygon-bor.publicnode.com"),
         binance_ws_url=bn.get("ws_url", "wss://stream.binance.com:9443/ws"),
         binance_rest_url=bn.get("rest_url", "https://api.binance.com/api/v3"),

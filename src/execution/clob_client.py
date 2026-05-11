@@ -6,6 +6,8 @@ All orders are BUY-only.
 """
 
 import asyncio
+import hashlib
+import json
 import time
 from typing import Optional
 from src.monitoring.logger import get_logger
@@ -20,13 +22,16 @@ class ClobClientWrapper:
     """
 
     def __init__(self, host: str, private_key: str, chain_id: int,
-                 api_key: str, api_secret: str, api_passphrase: str):
+                 api_key: str, api_secret: str, api_passphrase: str,
+                 signature_type: int = 3, funder: str = ""):
         self.host = host
         self._private_key = private_key
         self._chain_id = chain_id
         self._api_key = api_key
         self._api_secret = api_secret
         self._api_passphrase = api_passphrase
+        self._signature_type = signature_type
+        self._funder = funder
         self._client = None
         self._initialized = False
         # Track open orders: order_id -> {token_id, price, size, side}
@@ -70,26 +75,46 @@ class ClobClientWrapper:
     async def initialize(self):
         """Initialize the CLOB client with credentials."""
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
+            try:
+                from py_clob_client_v2 import ClobClient, ApiCreds
+                client_version = "v2"
+            except ImportError:
+                from py_clob_client.client import ClobClient
+                from py_clob_client.clob_types import ApiCreds
+                client_version = "v1"
 
             creds = ApiCreds(
                 api_key=self._api_key,
                 api_secret=self._api_secret,
                 api_passphrase=self._api_passphrase,
             )
-            self._client = ClobClient(
-                host=self.host,
-                chain_id=self._chain_id,
-                key=self._private_key,
-                creds=creds,
-            )
+            client_kwargs = {
+                "host": self.host,
+                "chain_id": self._chain_id,
+                "key": self._private_key,
+                "creds": creds,
+                "signature_type": self._signature_type,
+            }
+            if self._funder:
+                client_kwargs["funder"] = self._funder
+
+            try:
+                self._client = ClobClient(**client_kwargs)
+            except TypeError as e:
+                raise RuntimeError(
+                    "Installed py-clob-client does not support the required "
+                    "signature_type/funder live parameters. Upgrade to "
+                    "py-clob-client-v2 or a compatible Polymarket SDK."
+                ) from e
             self._client.set_api_creds(creds)
             self._initialized = True
             
             # Verify auth is working
             addr = self._client.get_address()
-            log.info("clob_client_initialized", address=addr)
+            log.info("clob_client_initialized", address=addr,
+                     client_version=client_version,
+                     signature_type=self._signature_type,
+                     funder=self._funder)
         except ImportError:
             log.error("py_clob_client_not_installed",
                      msg="Install with: pip install py-clob-client")
@@ -125,9 +150,9 @@ class ClobClientWrapper:
                     side=BUY,  # ALWAYS BUY
                 )
 
-                # Crypto up/down markets are 1-cent tick. If we don't pass tick_size,
-                # the API may reject with order_version_mismatch.
-                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+                tick_size = str(getattr(book_snapshot, "tick_size", "0.01") or "0.01")
+                neg_risk = bool(getattr(book_snapshot, "neg_risk", False))
+                opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
                 signed_order = self._client.create_order(order_args, opts)
 
                 # GTC = Good-Til-Cancelled, maker-only on Polymarket CLOB
@@ -166,6 +191,27 @@ class ClobClientWrapper:
                      price=price, size=size)
             return None
 
+    @staticmethod
+    def _normalize_post_orders_response(response, expected_count: int) -> list[dict]:
+        """Normalize py-clob-client post_orders responses across SDK versions."""
+        if isinstance(response, list):
+            return [item if isinstance(item, dict) else {} for item in response[:expected_count]]
+        if isinstance(response, dict):
+            raw = (
+                response.get("orders")
+                or response.get("data")
+                or response.get("results")
+                or response.get("responses")
+            )
+            if isinstance(raw, list):
+                return [item if isinstance(item, dict) else {} for item in raw[:expected_count]]
+            # Some SDKs return a single-order response dict when len==1.
+            if expected_count == 1 and (response.get("orderID") or response.get("id")):
+                return [response]
+            if response.get("error") or response.get("status") in ("error", "failed", "rejected"):
+                return [response for _ in range(expected_count)]
+        return [{} for _ in range(expected_count)]
+
     async def place_buy_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Place multiple BUY orders in one CLOB post_orders request."""
         if not self._initialized:
@@ -180,10 +226,13 @@ class ClobClientWrapper:
                 from py_clob_client.clob_types import PartialCreateOrderOptions, PostOrdersArgs
                 from py_clob_client.order_builder.constants import BUY
 
-                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
                 post_args = []
 
                 for spec in orders:
+                    book_snapshot = spec.get("book_snapshot")
+                    tick_size = str(getattr(book_snapshot, "tick_size", "0.01") or "0.01")
+                    neg_risk = bool(getattr(book_snapshot, "neg_risk", False))
+                    opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
                     order_args = OrderArgs(
                         token_id=spec["token_id"],
                         price=spec["price"],
@@ -200,7 +249,7 @@ class ClobClientWrapper:
                 return self._client.post_orders(post_args)
 
             response = await self._run_client_call(_create_and_post_batch)
-            results = response if isinstance(response, list) else response.get("orders", []) if isinstance(response, dict) else []
+            results = self._normalize_post_orders_response(response, len(orders))
 
             placed: dict[str, Optional[str]] = {side: None for side in sides}
             for idx, side in enumerate(sides):
@@ -279,6 +328,67 @@ class ClobClientWrapper:
             log.error("cancel_all_error", error=str(e))
             return False
 
+    async def reconcile_on_startup(self) -> dict:
+        """Best-effort startup reconciliation before canceling stale orders.
+
+        Live safety rule: inspect exchange-side open orders and recent trades
+        before clearing local state. This method intentionally does not mutate
+        inventory because market-specific token maps are owned by MarketCycler;
+        it refreshes known open order context and records observability so a
+        future inventory reconciliation can consume the same data path.
+        """
+        result = {"open_orders": 0, "recent_trades": 0, "ok": False}
+        if not self._initialized:
+            return result
+
+        try:
+            try:
+                open_resp = await self._run_client_call(self._client.get_orders)
+            except TypeError:
+                open_resp = await self._run_client_call(self._client.get_orders, None)
+            open_orders = open_resp if isinstance(open_resp, list) else open_resp.get("data", []) if isinstance(open_resp, dict) else []
+
+            refreshed = {}
+            for order in open_orders:
+                order_id = order.get("id") or order.get("orderID") or order.get("order_id")
+                if not order_id:
+                    continue
+                original = float(order.get("original_size") or order.get("size") or 0)
+                matched = float(order.get("size_matched") or order.get("matched_size") or 0)
+                remaining = max(0.0, original - matched)
+                outcome = str(order.get("outcome") or "").strip().lower()
+                token_side = "yes" if outcome in ("yes", "up") else "no" if outcome in ("no", "down") else None
+                refreshed[order_id] = {
+                    "token_id": str(order.get("asset_id") or order.get("token_id") or ""),
+                    "price": float(order.get("price") or 0),
+                    "size": remaining,
+                    "side": order.get("side", "BUY"),
+                    "token_side": token_side,
+                    "placed_at": float(order.get("created_at") or time.time()),
+                }
+
+            if refreshed:
+                self.open_orders.update(refreshed)
+                self._save_orders_state()
+
+            try:
+                trades_resp = await self._run_client_call(self._client.get_trades)
+                trades = trades_resp if isinstance(trades_resp, list) else trades_resp.get("data", []) if isinstance(trades_resp, dict) else []
+            except Exception:
+                trades = []
+
+            result.update({
+                "open_orders": len(open_orders),
+                "recent_trades": len(trades),
+                "ok": True,
+            })
+            log.info("startup_reconciliation_complete", **result)
+            return result
+
+        except Exception as e:
+            log.error("startup_reconciliation_error", error=str(e))
+            return result
+
     async def get_fills(self, market_id: str) -> list[dict]:
         """Fetch recent fills for a market using TradeParams.
         
@@ -306,25 +416,49 @@ class ClobClientWrapper:
 
     def process_fills(self, fills: list[dict], inventory_mgr,
                       market_id: str, edge_tracker=None,
-                      current_mid: float = None) -> list[dict]:
+                      current_mid: float = None,
+                      token_id_to_side: dict[str, str] | None = None) -> list[dict]:
         """Process fills with deduplication and update trackers."""
         processed = []
         fills_changed = False
         orders_changed = False
         for fill in fills:
-            fill_id = fill.get("id", f"{fill.get('order_id', '')}_{fill.get('size', '')}")
+            fill_id = self._fill_dedupe_key(fill, market_id)
             if fill_id in self._processed_fills:
                 continue
-            self._processed_fills.add(fill_id)
-            fills_changed = True
 
             size = float(fill.get("size", 0))
             price = float(fill.get("price", 0))
-            order_id = fill.get("order_id", "")
+            order_id = fill.get("order_id") or fill.get("orderID") or fill.get("maker_order_id", "")
 
-            # Determine if this was YES or NO based on our order tracker
+            # Determine side from token id first. Never default unknown fills to
+            # Up/YES; that corrupts live inventory after restarts/reconcile gaps.
             order_ctx = self.open_orders.get(order_id, {})
-            side = order_ctx.get("token_side", "up")
+            token_id = str(
+                fill.get("asset_id")
+                or fill.get("token_id")
+                or fill.get("assetId")
+                or order_ctx.get("token_id", "")
+            )
+            side = None
+            if token_id_to_side and token_id in token_id_to_side:
+                side = token_id_to_side[token_id]
+            elif order_ctx.get("token_side"):
+                side = order_ctx["token_side"]
+            else:
+                outcome = str(fill.get("outcome") or fill.get("side") or "").strip().lower()
+                if outcome in ("yes", "up"):
+                    side = "yes"
+                elif outcome in ("no", "down"):
+                    side = "no"
+
+            if side is None:
+                log.error("unknown_fill_side",
+                          market=market_id[:12],
+                          fill_id=fill_id,
+                          order_id=str(order_id)[:12],
+                          token_id=token_id[:16])
+                continue
 
             # Update remaining size and remove if filled
             if order_id in self.open_orders:
@@ -336,9 +470,12 @@ class ClobClientWrapper:
             # Update inventory and edge tracker (MarketCycler loops this)
             # Actually MarketCycler is expected to handle inventory directly from fills.
             # So we will just return the standardized fill dict.
+            self._processed_fills.add(fill_id)
+            fills_changed = True
+
             std_fill = {
                 "order_id": order_id,
-                "token_id": order_ctx.get("token_id", ""),
+                "token_id": token_id,
                 "side": side,
                 "price": price,
                 "size": size,
@@ -352,3 +489,33 @@ class ClobClientWrapper:
         if orders_changed:
             self._save_orders_state()
         return processed
+
+    @staticmethod
+    def _fill_dedupe_key(fill: dict, market_id: str = "") -> str:
+        """Build a robust idempotency key for CLOB fills/trades.
+
+        Prefer provider IDs when available. If the SDK omits IDs, include enough
+        stable fields to distinguish partial fills on the same order.
+        """
+        for key in ("id", "trade_id", "transaction_hash", "tx_hash", "hash"):
+            value = fill.get(key)
+            if value:
+                return f"{key}:{value}"
+
+        material = {
+            "market": market_id,
+            "order_id": fill.get("order_id") or fill.get("orderID") or fill.get("maker_order_id") or "",
+            "asset_id": fill.get("asset_id") or fill.get("token_id") or fill.get("assetId") or "",
+            "price": str(fill.get("price", "")),
+            "size": str(fill.get("size", "")),
+            "side": str(fill.get("side", "")),
+            "timestamp": str(
+                fill.get("timestamp")
+                or fill.get("created_at")
+                or fill.get("match_time")
+                or fill.get("time")
+                or ""
+            ),
+        }
+        encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
+        return "synthetic:" + hashlib.sha256(encoded.encode()).hexdigest()

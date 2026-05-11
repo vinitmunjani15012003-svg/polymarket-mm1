@@ -5,6 +5,8 @@ import pytest
 from src.config import AssetConfig, BotConfig
 import time
 
+from src.execution.clob_client import ClobClientWrapper
+from src.execution.ctf_ops import BalanceMonitor
 from src.execution.dry_run import DryRunExecutor, SimulatedOrder
 from src.execution.order_manager import OrderManager
 from src.orchestration.market_cycler import (
@@ -36,6 +38,7 @@ class DummyBatchExecutor(DummyExecutor):
         super().__init__()
         self.cancel_batches = []
         self.place_batches = []
+        self.cancel_ok = True
 
     async def place_buy_orders(self, orders):
         self.place_batches.append(orders)
@@ -43,7 +46,7 @@ class DummyBatchExecutor(DummyExecutor):
 
     async def cancel_orders(self, order_ids):
         self.cancel_batches.append(order_ids)
-        return True
+        return self.cancel_ok
 
 
 def test_config_validation_rejects_invalid_spreads():
@@ -63,6 +66,151 @@ def test_config_validation_rejects_invalid_spreads():
 
     with pytest.raises(ValueError, match="min_spread"):
         cfg.validate()
+
+
+def test_live_config_requires_funder_for_deposit_wallets():
+    cfg = BotConfig(
+        mode="live",
+        assets={
+            "BTC": AssetConfig(
+                enabled=True,
+                symbol="BTCUSDT",
+                min_spread=0.01,
+                max_spread=0.05,
+                soft_limit=10,
+                hard_limit=20,
+                emergency=30,
+            )
+        },
+    )
+    cfg.credentials.private_key = "0xabc"
+    cfg.credentials.api_key = "key"
+    cfg.credentials.api_secret = "secret"
+    cfg.credentials.api_passphrase = "pass"
+    cfg.credentials.signature_type = 3
+    cfg.credentials.funder = ""
+
+    with pytest.raises(ValueError, match="funder"):
+        cfg.validate()
+
+
+def test_live_fill_side_uses_token_id_mapping_not_default_up():
+    wrapper = ClobClientWrapper(
+        host="https://clob.polymarket.com",
+        private_key="0xabc",
+        chain_id=137,
+        api_key="key",
+        api_secret="secret",
+        api_passphrase="pass",
+        signature_type=3,
+        funder="0xfunder",
+    )
+    fills = [{"id": "T1", "asset_id": "NO_TOKEN", "size": "5", "price": "0.42"}]
+
+    processed = wrapper.process_fills(
+        fills,
+        inventory_mgr=None,
+        market_id="MARKET1",
+        token_id_to_side={"YES_TOKEN": "yes", "NO_TOKEN": "no"},
+    )
+
+    assert processed == [{
+        "order_id": "",
+        "token_id": "NO_TOKEN",
+        "side": "no",
+        "price": 0.42,
+        "size": 5.0,
+        "fill_time": processed[0]["fill_time"],
+        "simulated": False,
+    }]
+
+
+def test_live_fill_unknown_side_is_skipped_fail_closed():
+    wrapper = ClobClientWrapper(
+        host="https://clob.polymarket.com",
+        private_key="0xabc",
+        chain_id=137,
+        api_key="key",
+        api_secret="secret",
+        api_passphrase="pass",
+    )
+    fills = [{"id": "T2", "asset_id": "MYSTERY", "size": "5", "price": "0.42"}]
+
+    processed = wrapper.process_fills(
+        fills,
+        inventory_mgr=None,
+        market_id="MARKET1",
+        token_id_to_side={"YES_TOKEN": "yes", "NO_TOKEN": "no"},
+    )
+
+    assert processed == []
+
+
+def test_live_fill_side_can_fall_back_to_outcome_label():
+    wrapper = ClobClientWrapper(
+        host="https://clob.polymarket.com",
+        private_key="0xabc",
+        chain_id=137,
+        api_key="key",
+        api_secret="secret",
+        api_passphrase="pass",
+    )
+    fills = [{"id": "T3", "outcome": "Down", "size": "5", "price": "0.42"}]
+
+    processed = wrapper.process_fills(
+        fills,
+        inventory_mgr=None,
+        market_id="MARKET1",
+        token_id_to_side={},
+    )
+
+    assert processed[0]["side"] == "no"
+
+
+def test_live_fill_dedupe_distinguishes_partial_fills_without_provider_id():
+    wrapper = ClobClientWrapper(
+        host="https://clob.polymarket.com",
+        private_key="0xabc",
+        chain_id=137,
+        api_key="key",
+        api_secret="secret",
+        api_passphrase="pass",
+    )
+    fills = [
+        {"order_id": "OID1", "asset_id": "YES_TOKEN", "size": "2", "price": "0.42", "timestamp": "1"},
+        {"order_id": "OID1", "asset_id": "YES_TOKEN", "size": "3", "price": "0.42", "timestamp": "2"},
+    ]
+
+    processed = wrapper.process_fills(
+        fills,
+        inventory_mgr=None,
+        market_id="MARKET1",
+        token_id_to_side={"YES_TOKEN": "yes", "NO_TOKEN": "no"},
+    )
+
+    assert [f["size"] for f in processed] == [2.0, 3.0]
+
+
+def test_post_orders_response_normalization_handles_common_sdk_shapes():
+    assert ClobClientWrapper._normalize_post_orders_response(
+        [{"orderID": "A"}, {"id": "B"}], 2
+    ) == [{"orderID": "A"}, {"id": "B"}]
+    assert ClobClientWrapper._normalize_post_orders_response(
+        {"orders": [{"orderID": "A"}]}, 2
+    ) == [{"orderID": "A"}]
+    assert ClobClientWrapper._normalize_post_orders_response(
+        {"orderID": "ONLY"}, 1
+    ) == [{"orderID": "ONLY"}]
+    assert ClobClientWrapper._normalize_post_orders_response("weird", 2) == [{}, {}]
+
+
+def test_balance_monitor_accepts_explicit_funder_balance_address():
+    monitor = BalanceMonitor(
+        private_key="0xabc",
+        balance_address="0xFunder000000000000000000000000000000000001",
+    )
+
+    assert monitor._balance_address == "0xFunder000000000000000000000000000000000001"
 
 
 def test_order_manager_places_buy_orders_through_executor():
@@ -129,6 +277,42 @@ def test_order_manager_batches_cancel_and_replace_when_available():
     active = om.get_active("MARKET1")
     assert active.yes_order_id == "OID-yes"
     assert active.no_order_id == "OID-no"
+
+
+def test_order_manager_does_not_clear_or_replace_when_cancel_batch_fails():
+    executor = DummyBatchExecutor()
+    executor.cancel_ok = False
+    om = OrderManager(executor)
+    active = om.get_active("MARKET1")
+    active.yes_order_id = "OLD-YES"
+    active.yes_price = 0.40
+    active.yes_size = 5
+
+    quotes = SimpleNamespace(
+        yes_buy_price=0.45,
+        no_buy_price=None,
+        yes_buy_size=10,
+        no_buy_size=0,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+        )
+    )
+
+    assert updated is False
+    assert executor.cancel_batches == [["OLD-YES"]]
+    assert executor.place_batches == []
+    active = om.get_active("MARKET1")
+    assert active.yes_order_id == "OLD-YES"
+    assert active.yes_price == 0.40
+    assert active.yes_size == 5
 
 
 def test_order_manager_throttles_non_urgent_bid_improvements():
@@ -341,6 +525,48 @@ def test_quote_invariant_combined_cost_below_one():
     assert quotes.yes_buy_price + quotes.no_buy_price < 1.0
 
 
+def test_quote_direction_guard_prevents_flat_inventory_price_inversion():
+    qe = QuoteEngine()
+
+    quotes = qe.generate_quotes(
+        fair_value=0.4623,
+        t_normalized=0.75,
+        sigma=0.8,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+        best_bid_yes=0.52,
+        best_bid_no=0.47,
+        best_ask_yes=0.53,
+        best_ask_no=0.48,
+    )
+
+    assert quotes.yes_buy_price <= quotes.no_buy_price
+    assert quotes.combined_cost < 1.0
+
+
+def test_quote_direction_guard_allows_inventory_repair_inversion():
+    qe = QuoteEngine()
+
+    quotes = qe.generate_quotes(
+        fair_value=0.4623,
+        t_normalized=0.75,
+        sigma=0.8,
+        share_imbalance=-200.0,  # Too many NO; YES is the repair side.
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+        best_bid_yes=0.52,
+        best_bid_no=0.47,
+        best_ask_yes=0.53,
+        best_ask_no=0.48,
+    )
+
+    assert quotes.yes_buy_price > quotes.no_buy_price
+    assert quotes.combined_cost < 1.0
+
+
 def test_emergency_inventory_behavior():
     inv = InventoryManager(emergency=100.0)
     inv.record_fill("MARKET1", "yes", 105.0, 0.5)
@@ -390,6 +616,23 @@ def test_markets_settled_counts_unique_markets():
     pnl.record_settlement(2.0, "MARKET2")
 
     assert pnl.markets_settled == 2
+
+
+def test_outcome_pnl_is_reported_separately_from_merge_pnl():
+    from src.monitoring.pnl_tracker import PnLTracker
+
+    pnl = PnLTracker()
+    pnl.record_settlement(10.0, "MARKET1")
+    pnl.record_outcome_resolution(3.0, "MARKET1")
+    pnl.est_rebates = 0.5
+
+    snap = pnl.snapshot()
+
+    assert pnl.markets_settled == 1
+    assert snap.net_trading_pnl == 10.0
+    assert snap.outcome_pnl == 3.0
+    assert snap.net_pnl_with_rebates == 10.5
+    assert snap.economic_pnl == 13.5
 
 
 def test_toxicity_monitor_respects_conservative_thresholds():

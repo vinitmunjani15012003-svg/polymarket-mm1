@@ -11,6 +11,11 @@ class AlertManager:
     def __init__(self, webhook_url: str = None):
         self.webhook_url = webhook_url
         self.last_alert_time = {}
+
+    def configure(self, webhook_url: str = None):
+        """Set or replace the webhook URL at runtime."""
+        if webhook_url:
+            self.webhook_url = webhook_url
         
     def send_alert(self, title: str, message: str, level: str = "ERROR", cooldown: int = 300):
         """
@@ -24,7 +29,8 @@ class AlertManager:
         self.last_alert_time[title] = now
         
         full_message = f"[{level}] {title}: {message}"
-        log.error("system_alert", title=title, message=message, level=level)
+        log_fn = log.error if level.upper() in {"ERROR", "CRITICAL", "FATAL"} else log.info
+        log_fn("system_alert", title=title, message=message, level=level)
         
         if self.webhook_url:
             try:

@@ -14,6 +14,8 @@ import argparse
 import signal
 import time
 import logging
+from dataclasses import dataclass
+from typing import Optional
 
 from src.config import load_config, BotConfig
 from src.monitoring.logger import setup_logging, get_logger
@@ -32,9 +34,21 @@ from src.execution.ctf_ops import (
 )
 from src.risk.risk_engine import RiskEngine
 from src.orchestration.market_cycler import MarketCycler
+from src.monitoring.alerter import alerter
 
 
 log = None  # Initialized after logging setup
+
+
+@dataclass
+class RunResult:
+    success: bool
+    mode: str
+    target_windows: Optional[int]
+    markets_settled: int
+    total_fills: int
+    net_pnl_with_rebates: float
+    failure_reason: Optional[str] = None
 
 
 def parse_args():
@@ -66,10 +80,28 @@ def parse_args():
         "--headless", action="store_true",
         help="Run in headless mode (no dashboard, no confirmation prompts)"
     )
+    parser.add_argument(
+        "--target-windows", type=int, default=None,
+        help="Required settled-window count. Run exits non-zero if stopped before this target."
+    )
+    parser.add_argument(
+        "--progress-heartbeat-minutes", type=float, default=30.0,
+        help="Log run progress heartbeat every N minutes (default: 30)."
+    )
+    parser.add_argument(
+        "--alert-webhook", default=None,
+        help="Optional Slack/Discord-compatible webhook for immediate failure alerts. Also reads POLYMARKET_ALERT_WEBHOOK_URL, OPENCLAW_ALERT_WEBHOOK_URL, or DISCORD_WEBHOOK_URL."
+    )
     return parser.parse_args()
 
 
-async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: bool = False):
+async def run_bot(
+    config: BotConfig,
+    assets_filter: list[str] = None,
+    headless: bool = False,
+    target_windows: int | None = None,
+    progress_heartbeat_minutes: float = 30.0,
+) -> RunResult:
     """Main bot runner."""
     global log
 
@@ -92,7 +124,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
 
     if not active_assets:
         log.error("no_active_assets")
-        return
+        return RunResult(False, mode, target_windows, 0, 0, 0.0, "no active assets")
 
     log.info("active_assets", assets=list(active_assets.keys()))
 
@@ -154,7 +186,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
             print(f"\n[FATAL] Missing required live credentials: {', '.join(missing)}")
             print("  Set them via environment variables or in config/live.yaml")
             print("  Example: export POLYMARKET_PK='0x...'\n")
-            return
+            return RunResult(False, mode, target_windows, 0, 0, 0.0, f"missing live credentials: {', '.join(missing)}")
 
         from src.execution.clob_client import ClobClientWrapper
         executor = ClobClientWrapper(
@@ -164,13 +196,19 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
             api_key=config.credentials.api_key,
             api_secret=config.credentials.api_secret,
             api_passphrase=config.credentials.api_passphrase,
+            signature_type=config.credentials.signature_type,
+            funder=config.credentials.funder,
         )
         executor.set_state_manager(state_manager)
         await executor.initialize()
         log.info("live_executor_initialized")
 
-        # Reconcile state: cancel all orders on startup, which will also clear state.
-        # This prevents fake state or duplicate exposure.
+        # Reconcile exchange-side state before canceling stale orders. This keeps
+        # restarts from blindly discarding order/fill context.
+        await executor.reconcile_on_startup()
+
+        # Cancel all orders on startup after reconciliation. This prevents fake
+        # state or duplicate exposure.
         await executor.cancel_all()
         log.info("startup_cleanup", msg="Cancelled all stale orders from previous session")
 
@@ -182,6 +220,9 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
             builder_passphrase=config.credentials.builder_passphrase,
             relayer_url=config.credentials.builder_relayer_url,
             chain_id=config.credentials.chain_id,
+            collateral_token=config.credentials.collateral_token,
+            relayer_api_key=config.credentials.relayer_api_key,
+            relayer_api_key_address=config.credentials.relayer_api_key_address,
         )
         gasless_ok = await gasless_merger.initialize()
         if gasless_ok:
@@ -192,22 +233,38 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
                         msg="Will fall back to on-chain merge (requires POL for gas)")
 
         # --- Initialize on-chain CTF ops (fallback for merge) ---
-        ctf_ops = CTFOperations(
-            private_key=config.credentials.private_key,
-            rpc_url=config.credentials.polygon_rpc_url,
-            dry_run=False,
-        )
-        await ctf_ops.initialize()
+        # Proxy/deposit-wallet modes hold tokens in the funder wallet, not the
+        # signer EOA. Direct on-chain fallback signs from the EOA, so it cannot
+        # safely merge/redeem funder-held positions. Use gasless relayer only in
+        # those modes and fail safe if gasless is unavailable.
+        if config.credentials.signature_type in (1, 2, 3) and config.credentials.funder:
+            ctf_ops = None
+            log.warning("onchain_ctf_fallback_disabled",
+                        reason="proxy/deposit wallet uses funder address; gasless relayer required")
+        else:
+            ctf_ops = CTFOperations(
+                private_key=config.credentials.private_key,
+                rpc_url=config.credentials.polygon_rpc_url,
+                collateral_token=config.credentials.collateral_token,
+                dry_run=False,
+            )
+            await ctf_ops.initialize()
 
         # --- Initialize balance monitor (auto-merge on low USDC) ---
         if config.balance_monitor.enabled:
             balance_monitor = BalanceMonitor(
                 private_key=config.credentials.private_key,
                 rpc_url=config.credentials.polygon_rpc_url,
+                collateral_token=config.credentials.collateral_token,
                 warn_balance=config.balance_monitor.warn_balance,
                 merge_balance=config.balance_monitor.merge_balance,
                 min_merge_pairs=config.balance_monitor.min_merge_pairs,
                 check_interval=config.balance_monitor.check_interval,
+                balance_address=(
+                    config.credentials.funder
+                    if config.credentials.signature_type in (1, 2, 3)
+                    else ""
+                ),
             )
             bal_ok = await balance_monitor.initialize()
             if bal_ok:
@@ -225,7 +282,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
                     print(f"  Address: {balance_monitor._address}")
                     print("  Fund with at least $50 USDC.e before running live mode.")
                     print("  Deposit at: https://polymarket.com/deposit\n")
-                    return
+                    return RunResult(False, mode, target_windows, 0, 0, 0.0, "zero live wallet balance")
             else:
                 log.warning("balance_monitor_failed",
                             msg="Balance monitoring disabled")
@@ -235,10 +292,36 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
     cyclers = []
     tasks = []
     shutdown_event = asyncio.Event()
+    failure_reason: str | None = None
+
+    def mark_failure(reason: str):
+        nonlocal failure_reason
+        if failure_reason is None:
+            failure_reason = reason
+            log.error("run_failure", reason=reason)
+            alerter.send_alert("Polymarket run failed", reason, level="ERROR", cooldown=0)
+        if not shutdown_event.is_set():
+            shutdown_event.set()
 
     def request_shutdown():
         if not shutdown_event.is_set():
             shutdown_event.set()
+
+    def start_task(coro, name: str):
+        task = asyncio.create_task(coro, name=name)
+
+        def _done(t: asyncio.Task):
+            if t.cancelled() or shutdown_event.is_set():
+                return
+            exc = t.exception()
+            if exc is not None:
+                mark_failure(f"task {name} crashed: {type(exc).__name__}: {exc}")
+            else:
+                mark_failure(f"task {name} exited before shutdown")
+
+        task.add_done_callback(_done)
+        tasks.append(task)
+        return task
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -340,8 +423,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
     log.info("starting_tasks", count=len(cyclers) + 1)
 
     # Price feed task
-    price_task = asyncio.create_task(price_feed.start())
-    tasks.append(price_task)
+    price_task = start_task(price_feed.start(), "price_feed")
 
     # Wait for initial prices (up to 10s)
     log.info("waiting_for_prices")
@@ -365,8 +447,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
     # Market cycler tasks
     for cycler in cyclers:
         cycler_by_asset[cycler.asset] = cycler
-        task = asyncio.create_task(cycler.run())
-        tasks.append(task)
+        start_task(cycler.run(), f"cycler_{cycler.asset}")
 
     # --- Real-time price callback: pipe every WS tick directly into dashboard ---
     def on_live_price(symbol: str, price: float, ts: float):
@@ -420,9 +501,44 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
             state_manager.save_state()
             await asyncio.sleep(30)
 
-    tasks.append(asyncio.create_task(state_heartbeat_loop()))
+    async def progress_heartbeat_loop():
+        heartbeat_interval = max(60.0, progress_heartbeat_minutes * 60.0)
+        last_heartbeat = 0.0
+        while not shutdown_event.is_set():
+            settled = sum(c.pnl.markets_settled for c in cyclers)
+            fills = sum(c.pnl.total_fills for c in cyclers)
+            volume = sum(c.pnl.total_volume for c in cyclers)
+            net_pnl = sum(c.pnl.snapshot().economic_pnl for c in cyclers)
+            now = time.time()
 
-    log.info("bot_running", assets=list(active_assets.keys()), mode=mode)
+            if target_windows is not None and settled >= target_windows:
+                log.info("target_windows_reached", target_windows=target_windows, markets_settled=settled)
+                shutdown_event.set()
+                return
+
+            if now - last_heartbeat >= heartbeat_interval:
+                msg = (
+                    f"mode={mode} settled={settled}/{target_windows or 'open'} "
+                    f"fills={fills} volume=${volume:.2f} net=${net_pnl:.4f}"
+                )
+                log.info(
+                    "run_heartbeat",
+                    mode=mode,
+                    target_windows=target_windows,
+                    markets_settled=settled,
+                    total_fills=fills,
+                    total_volume=round(volume, 2),
+                    economic_pnl=round(net_pnl, 4),
+                )
+                alerter.send_alert("Polymarket run heartbeat", msg, level="INFO", cooldown=int(heartbeat_interval * 0.9))
+                last_heartbeat = now
+
+            await asyncio.sleep(min(60.0, heartbeat_interval))
+
+    start_task(state_heartbeat_loop(), "state_heartbeat")
+    start_task(progress_heartbeat_loop(), "progress_heartbeat")
+
+    log.info("bot_running", assets=list(active_assets.keys()), mode=mode, target_windows=target_windows)
 
     # Switch to dashboard-only output (suppress console, keep file logs)
     from src.monitoring.logger import suppress_console, restore_console
@@ -441,8 +557,7 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
                     log.error("dashboard_error", error=str(e))
                 await asyncio.sleep(1)
 
-        dash_task = asyncio.create_task(dashboard_loop())
-        tasks.append(dash_task)
+        start_task(dashboard_loop(), "dashboard")
 
     # --- Wait for shutdown (Windows-compatible) ---
     try:
@@ -498,20 +613,51 @@ async def run_bot(config: BotConfig, assets_filter: list[str] = None, headless: 
 
     snap = session_pnl.snapshot()
 
+    success = failure_reason is None
+    final_failure_reason = failure_reason
+    if target_windows is not None and snap.markets_settled < target_windows:
+        success = False
+        final_failure_reason = (
+            final_failure_reason
+            or f"incomplete target: settled {snap.markets_settled}/{target_windows} windows"
+        )
+        log.error(
+            "target_windows_incomplete",
+            target_windows=target_windows,
+            markets_settled=snap.markets_settled,
+            reason=final_failure_reason,
+        )
+        alerter.send_alert("Polymarket run incomplete", final_failure_reason, level="ERROR", cooldown=0)
+
     print("\n" + "=" * 60)
-    print(f"  SESSION COMPLETE — {mode.upper()}")
+    print(f"  SESSION {'COMPLETE' if success else 'FAILED'} — {mode.upper()}")
     print(f"  Duration: {session_pnl.session_duration_hours:.2f} hours")
+    if target_windows is not None:
+        print(f"  Target Windows:  {target_windows}")
     print(f"  Markets Settled: {snap.markets_settled}")
     print(f"  Total Fills: {snap.total_fills}")
     print(f"  Total Volume: ${snap.total_volume:.2f}")
     print(f"  Total Shares: {snap.total_shares:.0f}")
     print("-" * 60)
-    print(f"  Trading P&L:     ${snap.net_trading_pnl:.4f}")
-    print(f"  Outcome P&L:     ${snap.outcome_pnl:.4f}")
-    print(f"  Est. Rebates:    ${snap.est_rebates:.4f}   ")
-    print(f"  Rebates/Hour:    ${session_pnl.rebates_per_hour():.4f}")
-    print(f"  Net P&L (total): ${snap.net_pnl_with_rebates:.4f}")
+    print(f"  Merge/Pair P&L:       ${snap.net_trading_pnl:.4f}")
+    print(f"  Outcome P&L:          ${snap.outcome_pnl:.4f}")
+    print(f"  Est. Rebates:         ${snap.est_rebates:.4f}")
+    print(f"  Rebates/Hour:         ${session_pnl.rebates_per_hour():.4f}")
+    print(f"  Merge+Rebate P&L:     ${snap.net_pnl_with_rebates:.4f}")
+    print(f"  Economic P&L (total): ${snap.economic_pnl:.4f}")
+    if final_failure_reason:
+        print(f"  Failure Reason:  {final_failure_reason}")
     print("=" * 60)
+
+    return RunResult(
+        success=success,
+        mode=mode,
+        target_windows=target_windows,
+        markets_settled=snap.markets_settled,
+        total_fills=snap.total_fills,
+        net_pnl_with_rebates=snap.economic_pnl,
+        failure_reason=final_failure_reason,
+    )
 
 
 def main():
@@ -533,6 +679,13 @@ def main():
     # Setup logging
     setup_logging(level=args.log_level)
     log = get_logger("main")
+    alert_webhook = (
+        args.alert_webhook
+        or os.environ.get("POLYMARKET_ALERT_WEBHOOK_URL")
+        or os.environ.get("OPENCLAW_ALERT_WEBHOOK_URL")
+        or os.environ.get("DISCORD_WEBHOOK_URL")
+    )
+    alerter.configure(alert_webhook)
 
     # Banner
     print("\n" + "=" * 60)
@@ -553,9 +706,28 @@ def main():
 
     # Run
     try:
-        asyncio.run(run_bot(config, args.assets, args.headless))
+        result = asyncio.run(
+            run_bot(
+                config,
+                args.assets,
+                args.headless,
+                target_windows=args.target_windows,
+                progress_heartbeat_minutes=args.progress_heartbeat_minutes,
+            )
+        )
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
+        alerter.send_alert("Polymarket run interrupted", "KeyboardInterrupt", level="ERROR", cooldown=0)
+        sys.exit(130)
+    except Exception as e:
+        message = f"unhandled exception: {type(e).__name__}: {e}"
+        log.exception("run_unhandled_exception")
+        alerter.send_alert("Polymarket run crashed", message, level="ERROR", cooldown=0)
+        print(f"\n[FATAL] {message}")
+        sys.exit(1)
+
+    if not result.success:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ These interact directly with the CTF smart contract on Polygon,
 NOT through the CLOB API (which only handles order placement).
 
 Contract: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045 (Polygon)
-Collateral: USDC.e 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+Collateral: pUSD by default 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB
 """
 
 import asyncio
@@ -22,7 +22,7 @@ log = get_logger("ctf_ops")
 
 # Polygon contract addresses
 CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+DEFAULT_COLLATERAL_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
 # Minimal ABIs for the CTF operations we need
 CTF_ABI = [
@@ -169,23 +169,37 @@ class GaslessMerger:
                  builder_secret: str = "",
                  builder_passphrase: str = "",
                  relayer_url: str = "https://relayer-v2.polymarket.com",
-                 chain_id: int = 137):
+                 chain_id: int = 137,
+                 collateral_token: str = DEFAULT_COLLATERAL_TOKEN,
+                 relayer_api_key: str = "",
+                 relayer_api_key_address: str = ""):
         self._private_key = private_key
         self._builder_api_key = builder_api_key
         self._builder_secret = builder_secret
         self._builder_passphrase = builder_passphrase
+        self._relayer_api_key = relayer_api_key
+        self._relayer_api_key_address = relayer_api_key_address
         self._relayer_url = relayer_url
         self._chain_id = chain_id
+        self._collateral_token = collateral_token or DEFAULT_COLLATERAL_TOKEN
         self._client = None
         self._w3 = None
         self._initialized = False
 
     async def initialize(self) -> bool:
         """Initialize the gasless relayer client."""
-        if not all([self._builder_api_key, self._builder_secret,
-                    self._builder_passphrase]):
+        has_current_relayer_creds = all([
+            self._relayer_api_key,
+            self._relayer_api_key_address,
+        ])
+        has_legacy_builder_creds = all([
+            self._builder_api_key,
+            self._builder_secret,
+            self._builder_passphrase,
+        ])
+        if not has_current_relayer_creds and not has_legacy_builder_creds:
             log.warning("gasless_no_builder_creds",
-                        msg="Builder credentials not configured. "
+                        msg="Relayer credentials not configured. "
                             "Gasless merge unavailable.")
             return False
 
@@ -194,25 +208,41 @@ class GaslessMerger:
             self._w3 = Web3()  # Only for ABI encoding, no RPC needed
 
             from py_builder_relayer_client.client import RelayClient
-            # py-builder-signing-sdk does not export these from __init__ in newer versions
-            from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
+            import inspect
 
-            builder_config = BuilderConfig(
-                local_builder_creds=BuilderApiKeyCreds(
-                    key=self._builder_api_key,
-                    secret=self._builder_secret,
-                    passphrase=self._builder_passphrase,
+            relay_sig = inspect.signature(RelayClient)
+            if "relayer_api_key" in relay_sig.parameters:
+                # Current docs flow: RELAYER_API_KEY + RELAYER_API_KEY_ADDRESS.
+                self._client = RelayClient(
+                    host=self._relayer_url,
+                    chain=self._chain_id,
+                    signer=self._private_key,
+                    relayer_api_key=self._relayer_api_key,
+                    relayer_api_key_address=self._relayer_api_key_address,
                 )
-            )
-            self._client = RelayClient(
-                self._relayer_url,
-                self._chain_id,
-                self._private_key,
-                builder_config,
-            )
+                auth_mode = "relayer_api_key"
+            else:
+                # Backward-compatible path for older py-builder-relayer-client.
+                from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
+
+                builder_config = BuilderConfig(
+                    local_builder_creds=BuilderApiKeyCreds(
+                        key=self._builder_api_key,
+                        secret=self._builder_secret,
+                        passphrase=self._builder_passphrase,
+                    )
+                )
+                self._client = RelayClient(
+                    self._relayer_url,
+                    self._chain_id,
+                    self._private_key,
+                    builder_config,
+                )
+                auth_mode = "legacy_builder_creds"
             self._initialized = True
             log.info("gasless_merger_initialized",
-                     relayer=self._relayer_url)
+                     relayer=self._relayer_url,
+                     auth_mode=auth_mode)
             return True
 
         except ImportError as e:
@@ -272,7 +302,7 @@ class GaslessMerger:
                 data = contract.encode_abi(
                     "mergePositions",
                     args=[
-                        self._w3.to_checksum_address(USDC_ADDRESS),
+                        self._w3.to_checksum_address(self._collateral_token),
                         parent,
                         condition_bytes,
                         [1, 2],  # Binary partition
@@ -322,7 +352,7 @@ class GaslessMerger:
             data = contract.encode_abi(
                 "redeemPositions",
                 args=[
-                    self._w3.to_checksum_address(USDC_ADDRESS),
+                    self._w3.to_checksum_address(self._collateral_token),
                     bytes(32),
                     condition_bytes,
                     [1, 2],
@@ -378,10 +408,12 @@ class BalanceMonitor:
     def __init__(self,
                  private_key: str,
                  rpc_url: str = "https://polygon-bor.publicnode.com",
+                 collateral_token: str = DEFAULT_COLLATERAL_TOKEN,
                  warn_balance: float = 20.0,
                  merge_balance: float = 10.0,
                  min_merge_pairs: int = 5,
-                 check_interval: float = 30.0):
+                 check_interval: float = 30.0,
+                 balance_address: str = ""):
         """
         Args:
             private_key: Wallet private key.
@@ -390,9 +422,14 @@ class BalanceMonitor:
             merge_balance: USDC balance to trigger auto-merge.
             min_merge_pairs: Minimum matched pairs to trigger merge.
             check_interval: Seconds between balance checks.
+            balance_address: Optional wallet address whose collateral balance
+                should be checked. Required for proxy/deposit-wallet modes where
+                the signer EOA differs from the funded trading wallet.
         """
         self._private_key = private_key
+        self._balance_address = balance_address
         self._rpc_url = rpc_url
+        self._collateral_token = collateral_token or DEFAULT_COLLATERAL_TOKEN
         self.warn_balance = warn_balance
         self.merge_balance = merge_balance
         self.min_merge_pairs = min_merge_pairs
@@ -424,9 +461,14 @@ class BalanceMonitor:
                 return False
             self._rpc_url = rpc or self._rpc_url
 
-            self._address = self._w3.eth.account.from_key(
+            signer_address = self._w3.eth.account.from_key(
                 self._private_key
             ).address
+            self._address = (
+                self._w3.to_checksum_address(self._balance_address)
+                if self._balance_address
+                else signer_address
+            )
 
             # USDC.e balance check ABI
             usdc_abi = [
@@ -440,12 +482,14 @@ class BalanceMonitor:
                 }
             ]
             self._usdc = self._w3.eth.contract(
-                address=self._w3.to_checksum_address(USDC_ADDRESS),
+                address=self._w3.to_checksum_address(self._collateral_token),
                 abi=usdc_abi,
             )
             self._initialized = True
             log.info("balance_monitor_initialized",
                      address=self._address,
+                     signer_address=signer_address,
+                     address_source="configured" if self._balance_address else "signer",
                      warn_at=f"${self.warn_balance:.2f}",
                      merge_at=f"${self.merge_balance:.2f}")
             return True
@@ -644,6 +688,7 @@ class CTFOperations:
 
     def __init__(self, private_key: str,
                  rpc_url: str = "https://polygon-bor.publicnode.com",
+                 collateral_token: str = DEFAULT_COLLATERAL_TOKEN,
                  dry_run: bool = True):
         """
         Args:
@@ -653,6 +698,7 @@ class CTFOperations:
         """
         self._private_key = private_key
         self._rpc_url = rpc_url
+        self._collateral_token = collateral_token or DEFAULT_COLLATERAL_TOKEN
         self._dry_run = dry_run
         self._w3 = None
         self._ctf = None
@@ -682,7 +728,7 @@ class CTFOperations:
                 abi=CTF_ABI,
             )
             self._usdc = self._w3.eth.contract(
-                address=Web3.to_checksum_address(USDC_ADDRESS),
+                address=Web3.to_checksum_address(self._collateral_token),
                 abi=ERC20_APPROVE_ABI,
             )
             self._initialized = True
@@ -728,7 +774,7 @@ class CTFOperations:
 
         try:
             tx = self._ctf.functions.mergePositions(
-                self._w3.to_checksum_address(USDC_ADDRESS),
+                self._w3.to_checksum_address(self._collateral_token),
                 PARENT_COLLECTION_ID,
                 condition_bytes,
                 BINARY_PARTITION,
@@ -794,7 +840,7 @@ class CTFOperations:
 
         try:
             tx = self._ctf.functions.redeemPositions(
-                self._w3.to_checksum_address(USDC_ADDRESS),
+                self._w3.to_checksum_address(self._collateral_token),
                 PARENT_COLLECTION_ID,
                 condition_bytes,
                 BINARY_PARTITION,
@@ -854,7 +900,7 @@ class CTFOperations:
             await self._ensure_usdc_approval(amount)
 
             tx = self._ctf.functions.splitPosition(
-                self._w3.to_checksum_address(USDC_ADDRESS),
+                self._w3.to_checksum_address(self._collateral_token),
                 PARENT_COLLECTION_ID,
                 condition_bytes,
                 BINARY_PARTITION,

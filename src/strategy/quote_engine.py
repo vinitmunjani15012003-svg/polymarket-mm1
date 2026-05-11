@@ -234,14 +234,14 @@ class QuoteEngine:
         if abs(imb_ratio) > 0.1:
             if imb_ratio > 0 and best_bid_no is not None:
                 # NO is light side — anchor to book
-                if no_buy < best_bid_no and yes_size > 0:
+                if no_buy < best_bid_no and no_size > 0:
                     no_buy = best_bid_no
                     # Safety: don't cross the book
                     if best_ask_no is not None and no_buy >= best_ask_no:
                         no_buy = best_ask_no - 0.01
             elif imb_ratio < 0 and best_bid_yes is not None:
                 # YES is light side — anchor to book
-                if yes_buy < best_bid_yes and no_size > 0:
+                if yes_buy < best_bid_yes and yes_size > 0:
                     yes_buy = best_bid_yes
                     if best_ask_yes is not None and yes_buy >= best_ask_yes:
                         yes_buy = best_ask_yes - 0.01
@@ -273,6 +273,36 @@ class QuoteEngine:
 
         yes_buy = max(0.01, yes_buy)
         no_buy = max(0.01, no_buy)
+
+        # 9. Directional sanity guard.
+        #
+        # Orderbook clamping + re-centering can otherwise create quotes that
+        # contradict our own fair value when inventory is flat. Example from
+        # the 35-window run: FV≈0.46, NO ask clamps to 0.48, then re-centering
+        # pushes YES to 0.48 while NO is 0.47. That is not an inventory repair;
+        # it is the bot chasing a book that disagrees with its model.
+        #
+        # Allow the inversion only when it is explicitly the inventory repair
+        # side: too many NO -> bid YES harder, or too many YES -> bid NO harder.
+        repair_allows_yes_over_no = fair_value < 0.50 and imb_ratio < -0.1
+        repair_allows_no_over_yes = fair_value > 0.50 and imb_ratio > 0.1
+        if (
+            fair_value < 0.50
+            and yes_size > 0
+            and no_size > 0
+            and yes_buy > no_buy
+            and not repair_allows_yes_over_no
+        ):
+            yes_buy = no_buy
+        elif (
+            fair_value > 0.50
+            and yes_size > 0
+            and no_size > 0
+            and no_buy > yes_buy
+            and not repair_allows_no_over_yes
+        ):
+            no_buy = yes_buy
+
         combined = round(yes_buy + no_buy, 4)
 
         result.yes_buy_price = round(yes_buy, 2)
@@ -281,23 +311,6 @@ class QuoteEngine:
         result.no_buy_size = no_size
         result.combined_cost = combined
         result.edge_per_pair = round(1.0 - combined, 4)
-
-        # Sanity check: YES bid should never exceed NO bid when FV < 0.50
-        # (and vice versa). If this fires, something upstream is swapping prices.
-        if fair_value < 0.50 and result.yes_buy_price > result.no_buy_price and yes_size > 0:
-            log.warning("price_inversion_detected",
-                          fv=round(fair_value, 4),
-                          yes=result.yes_buy_price, no=result.no_buy_price,
-                          imb=round(share_imbalance, 1),
-                          bb_yes=best_bid_yes, bb_no=best_bid_no,
-                          ba_yes=best_ask_yes, ba_no=best_ask_no)
-        elif fair_value > 0.50 and result.no_buy_price > result.yes_buy_price and no_size > 0:
-            log.warning("price_inversion_detected",
-                          fv=round(fair_value, 4),
-                          yes=result.yes_buy_price, no=result.no_buy_price,
-                          imb=round(share_imbalance, 1),
-                          bb_yes=best_bid_yes, bb_no=best_bid_no,
-                          ba_yes=best_ask_yes, ba_no=best_ask_no)
 
         return result
 

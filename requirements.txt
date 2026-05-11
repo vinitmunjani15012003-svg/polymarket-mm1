@@ -1,5 +1,5 @@
 # Polymarket Market Maker Dependencies
-py-clob-client==0.34.6
+py-clob-client-v2
 web3==7.14.0
 websockets==15.0.1
 aiohttp==3.13.3

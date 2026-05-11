@@ -127,19 +127,16 @@ class OrderManager:
         if not yes_needs and not no_needs:
             return False  # No change needed
 
-        # Cancel existing orders if they need repricing
+        # Cancel existing orders if they need repricing. Do not clear local
+        # active state until the exchange confirms cancellation; otherwise a
+        # failed cancel leaves live exposure invisible to the bot.
         cancel_ids = []
-        if yes_needs and active.yes_order_id:
+        cancel_yes = bool(yes_needs and active.yes_order_id)
+        cancel_no = bool(no_needs and active.no_order_id)
+        if cancel_yes:
             cancel_ids.append(active.yes_order_id)
-            active.yes_order_id = None
-            active.yes_price = None
-            active.yes_size = 0
-
-        if no_needs and active.no_order_id:
+        if cancel_no:
             cancel_ids.append(active.no_order_id)
-            active.no_order_id = None
-            active.no_price = None
-            active.no_size = 0
 
         total_start = time.perf_counter()
         cancel_ms = 0.0
@@ -147,12 +144,26 @@ class OrderManager:
 
         if cancel_ids:
             cancel_start = time.perf_counter()
+            cancel_ok = True
             if hasattr(self.executor, 'cancel_orders'):
-                await self.executor.cancel_orders(cancel_ids)
+                cancel_ok = await self.executor.cancel_orders(cancel_ids)
             else:
                 for order_id in cancel_ids:
-                    await self.executor.cancel_order(order_id)
+                    cancel_ok = bool(await self.executor.cancel_order(order_id)) and cancel_ok
             cancel_ms = (time.perf_counter() - cancel_start) * 1000
+            if not cancel_ok:
+                log.error("quote_cancel_failed_halt_reprice",
+                          market=market_id[:8],
+                          order_ids=[oid[:8] for oid in cancel_ids])
+                return False
+            if cancel_yes:
+                active.yes_order_id = None
+                active.yes_price = None
+                active.yes_size = 0
+            if cancel_no:
+                active.no_order_id = None
+                active.no_price = None
+                active.no_size = 0
 
         place_specs = []
         if yes_needs and quotes.yes_buy_price and quotes.yes_buy_size > 0:
@@ -226,12 +237,16 @@ class OrderManager:
         if not active:
             return
 
+        ok = True
         if active.yes_order_id:
-            await self.executor.cancel_order(active.yes_order_id)
+            ok = bool(await self.executor.cancel_order(active.yes_order_id)) and ok
         if active.no_order_id:
-            await self.executor.cancel_order(active.no_order_id)
+            ok = bool(await self.executor.cancel_order(active.no_order_id)) and ok
 
-        self.active[market_id] = ActiveQuotes()
+        if ok:
+            self.active[market_id] = ActiveQuotes()
+        else:
+            log.error("cancel_market_quotes_failed", market=market_id[:8])
 
     async def cancel_all(self):
         """Cancel all orders across all markets."""

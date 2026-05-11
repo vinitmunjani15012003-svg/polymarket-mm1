@@ -1203,7 +1203,15 @@ class MarketCycler:
             # Live CLOB API
             try:
                 raw_fills = await self.order_mgr.executor.get_fills(market.market_id)
-                fills = self.order_mgr.executor.process_fills(raw_fills, self.inventory, market.market_id)
+                fills = self.order_mgr.executor.process_fills(
+                    raw_fills,
+                    self.inventory,
+                    market.market_id,
+                    token_id_to_side={
+                        str(market.token_id_up): "yes",
+                        str(market.token_id_down): "no",
+                    },
+                )
             except Exception as e:
                 log.error("live_fill_check_error", error=str(e))
 
@@ -1232,17 +1240,29 @@ class MarketCycler:
             # unattractive price and never fills, causing one-sided inventory.
             active = self.order_mgr.get_active(market.market_id)
             if fill["side"] in ("no", "down") and active.yes_order_id:
-                await self.order_mgr.executor.cancel_order(active.yes_order_id)
-                active.yes_order_id = None
-                active.yes_price = None
-                log.debug("fill_reactive_reprice", cancelled="yes",
-                          trigger_side="no", imbalance=pos.share_imbalance())
+                cancelled = await self.order_mgr.executor.cancel_order(active.yes_order_id)
+                if cancelled:
+                    active.yes_order_id = None
+                    active.yes_price = None
+                    log.debug("fill_reactive_reprice", cancelled="yes",
+                              trigger_side="no", imbalance=pos.share_imbalance())
+                else:
+                    log.error("fill_reactive_cancel_failed",
+                              side="yes", market=market.market_id[:8])
+                    self._running = False
+                    return
             elif fill["side"] in ("yes", "up") and active.no_order_id:
-                await self.order_mgr.executor.cancel_order(active.no_order_id)
-                active.no_order_id = None
-                active.no_price = None
-                log.debug("fill_reactive_reprice", cancelled="no",
-                          trigger_side="yes", imbalance=pos.share_imbalance())
+                cancelled = await self.order_mgr.executor.cancel_order(active.no_order_id)
+                if cancelled:
+                    active.no_order_id = None
+                    active.no_price = None
+                    log.debug("fill_reactive_reprice", cancelled="no",
+                              trigger_side="yes", imbalance=pos.share_imbalance())
+                else:
+                    log.error("fill_reactive_cancel_failed",
+                              side="no", market=market.market_id[:8])
+                    self._running = False
+                    return
 
         # 15.5. Auto-merge check: dollar-based threshold OR low balance OR near expiry
         force_merge = False

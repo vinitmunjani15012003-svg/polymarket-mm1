@@ -88,8 +88,9 @@ class PnLSnapshot:
     unrealized_pnl: float = 0.0      # MTM on open positions
     total_fees: float = 0.0          # Gas + platform fees (0 for makers)
     est_rebates: float = 0.0         # Estimated maker rebates
-    net_trading_pnl: float = 0.0     # settlement - fees
-    net_pnl_with_rebates: float = 0.0  # trading + rebates
+    net_trading_pnl: float = 0.0     # matched-pair/merge P&L - fees
+    net_pnl_with_rebates: float = 0.0  # matched-pair/merge P&L + rebates (legacy)
+    economic_pnl: float = 0.0        # matched-pair/merge + outcome + rebates
     markets_traded: int = 0
     markets_settled: int = 0
     total_fills: int = 0
@@ -219,10 +220,24 @@ class PnLTracker:
                  pnl=round(pnl, 4),
                  total=round(self.settlement_pnl, 4))
 
+    def _mark_market_settled(self, market_id: str = ""):
+        """Count a settled market once without changing any P&L bucket."""
+        if market_id:
+            if market_id not in self._settled_markets:
+                self._settled_markets.add(market_id)
+                self.markets_settled += 1
+        else:
+            self.markets_settled += 1
+
     def record_outcome_resolution(self, pnl: float, market_id: str = ""):
-        """Record P&L from unmatched inventory after actual market outcome."""
+        """Record P&L from unmatched inventory after actual market outcome.
+
+        Outcome P&L is intentionally separate from matched-pair/merge P&L.
+        Older code routed this through record_settlement(), which made reports
+        ambiguous and risked double-counting in summary displays.
+        """
         self.outcome_pnl += pnl
-        self.record_settlement(pnl, market_id)
+        self._mark_market_settled(market_id)
         log.info("outcome_pnl_recorded",
                  market=market_id[:8] if market_id else "",
                  pnl=round(pnl, 4),
@@ -234,6 +249,8 @@ class PnLTracker:
 
     def snapshot(self, unrealized: float = 0.0) -> PnLSnapshot:
         trading_pnl = self.settlement_pnl + self.spread_income - self.total_fees
+        net_with_rebates = trading_pnl + unrealized + self.est_rebates
+        economic_pnl = net_with_rebates + self.outcome_pnl
         avg_rebate = self.est_rebates / max(1, self.total_fills)
         rebate_bps = (self.est_rebates / max(0.01, self.total_volume)) * 10000
 
@@ -246,7 +263,8 @@ class PnLTracker:
             total_fees=self.total_fees,
             est_rebates=self.est_rebates,
             net_trading_pnl=trading_pnl + unrealized,
-            net_pnl_with_rebates=trading_pnl + unrealized + self.est_rebates,
+            net_pnl_with_rebates=net_with_rebates,
+            economic_pnl=economic_pnl,
             markets_traded=self.markets_traded,
             markets_settled=self.markets_settled,
             total_fills=self.total_fills,
@@ -261,8 +279,13 @@ class PnLTracker:
 
     @property
     def net_pnl(self) -> float:
-        """Net P&L including estimated rebates."""
+        """Legacy net P&L: matched-pair/merge P&L plus estimated rebates."""
         return self.settlement_pnl + self.spread_income - self.total_fees + self.est_rebates
+
+    @property
+    def economic_pnl(self) -> float:
+        """Total economic P&L: matched-pair/merge + outcome + rebates."""
+        return self.net_pnl + self.outcome_pnl
 
     @property
     def net_trading_pnl(self) -> float:
