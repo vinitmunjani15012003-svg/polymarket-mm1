@@ -289,6 +289,7 @@ class MarketCycler:
         self.last_fair_value: Optional[float] = None
         self.stop_reason: str | None = None
         self._last_close_only_repair_mode: str | None = None
+        self._merge_unavailable_until: float = 0.0
 
         self._running = False
         self._last_market_slug = None  # Track to detect new market
@@ -1211,12 +1212,14 @@ class MarketCycler:
                             current_capital=f"${avail:.2f}",
                         )
                     else:
+                        self._merge_unavailable_until = _time.time() + 60.0
                         log.warning(
                             "pre_quote_merge_no_recovery",
                             asset=self.asset,
                             matched_pairs=matched_pairs,
                             balance=f"${bm_balance:.2f}",
                             current_capital=f"${avail:.2f}",
+                            blocked_until=round(self._merge_unavailable_until, 1),
                         )
 
             if planned > 0 and avail <= 0:
@@ -1279,6 +1282,24 @@ class MarketCycler:
                 quotes.no_buy_size = 0
             elif repair_mode == "repair_down":
                 quotes.yes_buy_size = 0
+
+            # Normal/balanced quoting is atomic: both sides or neither. Capital
+            # scaling/backoff must never turn a balanced market into a one-sided
+            # bet. This exact failure produced mode=normal yes_size=5/no_size=0.
+            if repair_mode == "normal" and abs_imbalance < min_order_size:
+                one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
+                merge_blocked = self._merge_unavailable_until > _time.time()
+                if one_sided_normal or merge_blocked:
+                    log.warning(
+                        "normal_quote_blocked_not_atomic",
+                        asset=self.asset,
+                        yes_size=quotes.yes_buy_size,
+                        no_size=quotes.no_buy_size,
+                        merge_blocked=merge_blocked,
+                        imbalance=round(imbalance, 4),
+                    )
+                    quotes.yes_buy_size = 0
+                    quotes.no_buy_size = 0
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
