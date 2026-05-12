@@ -730,11 +730,33 @@ class BalanceMonitor:
                 # for the deposit/funder wallet before submitting to relayer.
                 yes_token_id = getattr(pos, "yes_token_id", "") or getattr(pos, "token_id_yes", "")
                 no_token_id = getattr(pos, "no_token_id", "") or getattr(pos, "token_id_no", "")
+                deposit_wallet_merge = bool(
+                    gasless_merger
+                    and getattr(gasless_merger, "_signature_type", 0) == 3
+                    and getattr(gasless_merger, "_funder", "")
+                )
+                if deposit_wallet_merge and (not yes_token_id or not no_token_id):
+                    log.warning(
+                        "auto_merge_skipped_missing_token_ids",
+                        market=market_id[:12],
+                        local_pairs=pairs,
+                        condition=condition_id[:12] if condition_id else "",
+                    )
+                    continue
+
                 if self._ctf is not None and yes_token_id and no_token_id:
                     try:
                         yes_raw = int(self._ctf.functions.balanceOf(self._address, int(yes_token_id)).call())
                         no_raw = int(self._ctf.functions.balanceOf(self._address, int(no_token_id)).call())
                         onchain_pairs = min(yes_raw, no_raw) // 1_000_000
+                        log.info(
+                            "auto_merge_onchain_preflight",
+                            market=market_id[:12],
+                            local_pairs=pairs,
+                            onchain_pairs=int(onchain_pairs),
+                            yes_balance=f"{yes_raw / 1e6:.2f}",
+                            no_balance=f"{no_raw / 1e6:.2f}",
+                        )
                         if onchain_pairs < pairs:
                             log.warning(
                                 "auto_merge_capped_to_onchain_balance",
@@ -758,6 +780,8 @@ class BalanceMonitor:
                             market=market_id[:12],
                             error=str(e),
                         )
+                        if deposit_wallet_merge:
+                            continue
 
                 usdc_recovery = pairs * 1.0  # 1 pair = $1 USDC
                 pair_profit = pos.matched_pair_profit()

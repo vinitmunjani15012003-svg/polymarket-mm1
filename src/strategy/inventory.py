@@ -69,12 +69,15 @@ class InventoryPosition:
             "yes_total_cost": self.yes_total_cost,
             "no_total_cost": self.no_total_cost,
             "yes_fill_count": self.yes_fill_count,
-            "no_fill_count": self.no_fill_count
+            "no_fill_count": self.no_fill_count,
+            "condition_id": getattr(self, "condition_id", ""),
+            "yes_token_id": getattr(self, "yes_token_id", ""),
+            "no_token_id": getattr(self, "no_token_id", ""),
         }
 
     @classmethod
     def from_dict(cls, data):
-        return cls(
+        pos = cls(
             market_id=data["market_id"],
             asset=data.get("asset", ""),
             yes_shares=data.get("yes_shares", 0.0),
@@ -84,6 +87,10 @@ class InventoryPosition:
             yes_fill_count=data.get("yes_fill_count", 0),
             no_fill_count=data.get("no_fill_count", 0)
         )
+        pos.condition_id = data.get("condition_id", "")
+        pos.yes_token_id = str(data.get("yes_token_id", "") or "")
+        pos.no_token_id = str(data.get("no_token_id", "") or "")
+        return pos
 
     @property
     def yes_avg_entry(self) -> float:
