@@ -278,6 +278,57 @@ class OrderManager:
             for oid in stray_ids:
                 await self.executor.cancel_order(oid)
 
+    async def cancel_side_quotes(self, market_id: str, side: str, token_id: str):
+        """Cancel all known quotes for one side/token of a market."""
+        active = self.active.get(market_id)
+        cancel_ids = []
+
+        if side in ("yes", "up") and active and active.yes_order_id:
+            cancel_ids.append(active.yes_order_id)
+        if side in ("no", "down") and active and active.no_order_id:
+            cancel_ids.append(active.no_order_id)
+
+        open_orders = getattr(self.executor, "open_orders", None)
+        if isinstance(open_orders, dict):
+            for oid, info in list(open_orders.items()):
+                if str((info or {}).get("token_id")) == str(token_id) and oid not in cancel_ids:
+                    cancel_ids.append(oid)
+
+        if not cancel_ids:
+            return True
+
+        ok = True
+        if hasattr(self.executor, "cancel_orders"):
+            ok = bool(await self.executor.cancel_orders(cancel_ids))
+        else:
+            for oid in cancel_ids:
+                ok = bool(await self.executor.cancel_order(oid)) and ok
+
+        if ok and active:
+            if side in ("yes", "up"):
+                active.yes_order_id = None
+                active.yes_price = None
+                active.yes_size = 0
+            else:
+                active.no_order_id = None
+                active.no_price = None
+                active.no_size = 0
+            log.warning(
+                "side_quotes_cancelled",
+                market=market_id[:8],
+                side=side,
+                count=len(cancel_ids),
+                order_ids=[oid[:8] for oid in cancel_ids[:8]],
+            )
+        elif not ok:
+            log.error(
+                "side_quote_cancel_failed",
+                market=market_id[:8],
+                side=side,
+                order_ids=[oid[:8] for oid in cancel_ids[:8]],
+            )
+        return ok
+
     async def cancel_market_quotes(self, market_id: str):
         """Cancel all quotes for a specific market."""
         active = self.active.get(market_id)

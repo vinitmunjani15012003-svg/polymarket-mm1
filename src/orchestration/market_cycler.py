@@ -1117,6 +1117,19 @@ class MarketCycler:
                 )
                 await self.order_mgr.cancel_all()
                 self._last_close_only_repair_mode = repair_mode
+
+            # Every repair cycle, explicitly cancel the heavy-side token. This is
+            # intentionally harsher than normal repricing: live CLOB reconciliation
+            # is incomplete on this SDK, and stale heavy-side orders are worse
+            # than losing queue priority.
+            if repair_mode == "repair_up":
+                ok = await self.order_mgr.cancel_side_quotes(market.market_id, "no", market.token_id_down)
+            else:
+                ok = await self.order_mgr.cancel_side_quotes(market.market_id, "yes", market.token_id_up)
+            if not ok:
+                self.stop_reason = f"heavy_side_cancel_failed:{repair_mode}"
+                self._running = False
+                return
         else:
             self._last_close_only_repair_mode = None
 
