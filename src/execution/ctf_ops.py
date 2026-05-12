@@ -577,12 +577,16 @@ class BalanceMonitor:
             total_pairs = 0
             total_usdc = 0.0
 
+            eligible_markets = 0
             for market_id, pos in inventory_mgr.positions.items():
                 pairs = int(pos.matched_pairs())
                 if not force and pairs < self.min_merge_pairs:
                     continue
+                if pairs <= 0:
+                    continue
+                eligible_markets += 1
 
-                condition_id = market_id
+                condition_id = getattr(pos, "condition_id", None) or market_id
                 usdc_recovery = pairs * 1.0  # 1 pair = $1 USDC
                 pair_profit = pos.matched_pair_profit()
                 amount = int(pairs * 1e6)
@@ -640,6 +644,14 @@ class BalanceMonitor:
 
                     self._total_merged_usdc += usdc_recovery
                     self._total_merges += 1
+
+            if eligible_markets == 0:
+                log.warning(
+                    "auto_merge_no_eligible_pairs",
+                    force=force,
+                    min_merge_pairs=self.min_merge_pairs,
+                    markets=len(getattr(inventory_mgr, "positions", {}) or {}),
+                )
 
             if total_pairs > 0:
                 inventory_mgr._save_state()

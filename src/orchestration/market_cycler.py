@@ -893,8 +893,11 @@ class MarketCycler:
                 no_size = 0 if 0 < no_size < min_order_size else no_size
             return yes_size, no_size
 
-        # Get inventory position early for the DEAD_ZONE check
+        # Get inventory position early for the DEAD_ZONE check. Attach the
+        # condition id for mid-market CTF merge calls; persisted inventory only
+        # stores market_id, but live merge needs a condition id.
         pos = self.inventory.get_or_create(market.market_id, self.asset)
+        pos.condition_id = getattr(market, "condition_id", None) or market.market_id
 
         if phase == "DEAD_ZONE" and pos.share_imbalance() == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
@@ -1072,6 +1075,22 @@ class MarketCycler:
             allow_round_up=not (inventory_repair or balance_only or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"] or is_halted),
         )
 
+        # Defensive invariant: dust mode is ONLY for sub-minimum tails. If any
+        # earlier sizing path mislabels a real imbalance as dust, convert it
+        # back to close-only repair instead of stopping or quoting the wrong side.
+        if repair_mode.startswith("dust_") and abs_imbalance >= min_order_size:
+            log.warning(
+                "dust_mode_invariant_corrected",
+                asset=self.asset,
+                imbalance=round(imbalance, 4),
+                min_order_size=min_order_size,
+                previous_mode=repair_mode,
+            )
+            if imbalance > 0:
+                up_size, down_size, repair_mode = 0, min(self.quote_engine.max_order_size, int(abs_imbalance)), "repair_down"
+            else:
+                up_size, down_size, repair_mode = min(self.quote_engine.max_order_size, int(abs_imbalance)), 0, "repair_up"
+
         if up_size == 0 and down_size == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
@@ -1124,7 +1143,64 @@ class MarketCycler:
             no_notional = float(quotes.no_buy_price or 0) * float(quotes.no_buy_size or 0)
             planned = yes_notional + no_notional
 
-            if avail > 0 and planned > avail and planned > 0:
+            # Live capital can be trapped in matched pairs. If available balance
+            # is at/under the merge threshold, or the next repair/quote cannot be
+            # funded, force a merge BEFORE trying to place orders. Waiting until
+            # after order placement fails leaves the bot unable to repair a
+            # 35-vs-15 style imbalance.
+            if self.balance_monitor and planned > 0:
+                bm_balance = float(getattr(self.balance_monitor, "_last_balance", 0) or 0)
+                bm_merge_at = float(getattr(self.balance_monitor, "merge_balance", 0) or 0)
+                bm_min_pairs = int(getattr(self.balance_monitor, "min_merge_pairs", 1) or 1)
+                matched_pairs = int(pos.matched_pairs())
+                balance_pressure = (bm_balance <= bm_merge_at) or (avail <= 0) or (avail < planned)
+                if balance_pressure and matched_pairs >= bm_min_pairs:
+                    log.info(
+                        "pre_quote_merge_triggered",
+                        asset=self.asset,
+                        balance=f"${bm_balance:.2f}",
+                        current_capital=f"${avail:.2f}",
+                        planned=f"${planned:.2f}",
+                        matched_pairs=matched_pairs,
+                    )
+                    merge_result = await self.balance_monitor.check_and_merge(
+                        inventory_mgr=self.inventory,
+                        gasless_merger=self.gasless_merger,
+                        ctf_ops=self.ctf,
+                        pnl_tracker=self.pnl,
+                        force=True,
+                    )
+                    if merge_result.get("merged"):
+                        recovered = float(merge_result.get("usdc_recovered", 0) or 0)
+                        avail = float(getattr(self.pnl, "current_capital", 0) or 0)
+                        if self.inventory.capital_arbiter and recovered > 0:
+                            self.inventory.capital_arbiter.record_recovery(self.asset, recovered)
+                        log.info(
+                            "pre_quote_merge_complete",
+                            asset=self.asset,
+                            pairs=merge_result.get("pairs_merged", 0),
+                            usdc=f"${recovered:.2f}",
+                            current_capital=f"${avail:.2f}",
+                        )
+                    else:
+                        log.warning(
+                            "pre_quote_merge_no_recovery",
+                            asset=self.asset,
+                            matched_pairs=matched_pairs,
+                            balance=f"${bm_balance:.2f}",
+                            current_capital=f"${avail:.2f}",
+                        )
+
+            if planned > 0 and avail <= 0:
+                log.warning(
+                    "quote_blocked_no_available_capital",
+                    asset=self.asset,
+                    planned=f"${planned:.2f}",
+                    matched_pairs=int(pos.matched_pairs()),
+                )
+                quotes.yes_buy_size = 0
+                quotes.no_buy_size = 0
+            elif avail > 0 and planned > avail:
                 scale = max(0.0, min(1.0, avail / planned))
                 quotes.yes_buy_size = int(quotes.yes_buy_size * scale)
                 quotes.no_buy_size = int(quotes.no_buy_size * scale)
