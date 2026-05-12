@@ -33,6 +33,7 @@ class ClobClientWrapper:
         self._signature_type = signature_type
         self._funder = funder
         self._client = None
+        self._client_version = "unknown"
         self._initialized = False
         # Track open orders: order_id -> {token_id, price, size, side}
         self.open_orders: dict[str, dict] = {}
@@ -48,6 +49,48 @@ class ClobClientWrapper:
         """Run a blocking py-clob-client call in a worker thread."""
         async with self._client_lock:
             return await asyncio.to_thread(fn, *args, **kwargs)
+
+    @staticmethod
+    def _ensure_builder_code(order_args):
+        """SDK compatibility for py-clob-client-v2 builds.
+
+        Some Polymarket SDK builds expect OrderArgs.builder_code during
+        signing but ship an OrderArgs type that does not define it. A blank
+        builder code is the safe default: no builder attribution, same order.
+        """
+        if not hasattr(order_args, "builder_code"):
+            try:
+                setattr(order_args, "builder_code", "")
+            except Exception:
+                try:
+                    object.__setattr__(order_args, "builder_code", "")
+                except Exception:
+                    pass
+        return order_args
+
+    def _order_type_imports(self):
+        """Return SDK types matching the initialized CLOB client version."""
+        if self._client_version == "v2":
+            from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
+            from py_clob_client_v2 import PostOrdersV2Args as BatchPostOrdersArgs
+            from py_clob_client_v2.order_builder.constants import BUY
+            return OrderArgs, OrderType, PartialCreateOrderOptions, BatchPostOrdersArgs, BUY, "v2"
+
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import PartialCreateOrderOptions, PostOrdersArgs
+        from py_clob_client.order_builder.constants import BUY
+        return OrderArgs, OrderType, PartialCreateOrderOptions, PostOrdersArgs, BUY, "v1"
+
+    def _post_order_compat(self, signed_order, order_type):
+        """Post a single order across SDK variants.
+
+        v1 supports post_only as a request flag. Official v2 examples post the
+        signed GTC order directly; if a build rejects post_only, retry without it.
+        """
+        try:
+            return self._client.post_order(signed_order, order_type, post_only=True)
+        except TypeError:
+            return self._client.post_order(signed_order, order_type)
 
     def set_state_manager(self, state_manager):
         self.state_manager = state_manager
@@ -107,6 +150,7 @@ class ClobClientWrapper:
                     "py-clob-client-v2 or a compatible Polymarket SDK."
                 ) from e
             self._client.set_api_creds(creds)
+            self._client_version = client_version
             self._initialized = True
             
             # Verify auth is working
@@ -139,9 +183,7 @@ class ClobClientWrapper:
 
         try:
             def _create_and_post():
-                from py_clob_client.clob_types import OrderArgs, OrderType
-                from py_clob_client.clob_types import PartialCreateOrderOptions
-                from py_clob_client.order_builder.constants import BUY
+                OrderArgs, OrderType, PartialCreateOrderOptions, _, BUY, _ = self._order_type_imports()
 
                 order_args = OrderArgs(
                     token_id=token_id,
@@ -153,14 +195,12 @@ class ClobClientWrapper:
                 tick_size = str(getattr(book_snapshot, "tick_size", "0.01") or "0.01")
                 neg_risk = bool(getattr(book_snapshot, "neg_risk", False))
                 opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+                order_args = self._ensure_builder_code(order_args)
                 signed_order = self._client.create_order(order_args, opts)
 
-                # GTC = Good-Til-Cancelled, maker-only on Polymarket CLOB
-                return self._client.post_order(
-                    signed_order,
-                    OrderType.GTC,
-                    post_only=True,
-                )
+                # GTC = Good-Til-Cancelled. _post_order_compat uses maker-only
+                # post_only where supported by the installed SDK.
+                return self._post_order_compat(signed_order, OrderType.GTC)
 
             response = await self._run_client_call(_create_and_post)
 
@@ -222,9 +262,7 @@ class ClobClientWrapper:
             sides = [spec.get("side", "up") for spec in orders]
 
             def _create_and_post_batch():
-                from py_clob_client.clob_types import OrderArgs, OrderType
-                from py_clob_client.clob_types import PartialCreateOrderOptions, PostOrdersArgs
-                from py_clob_client.order_builder.constants import BUY
+                OrderArgs, OrderType, PartialCreateOrderOptions, BatchPostOrdersArgs, BUY, sdk_version = self._order_type_imports()
 
                 post_args = []
 
@@ -239,12 +277,19 @@ class ClobClientWrapper:
                         size=spec["size"],
                         side=BUY,
                     )
+                    order_args = self._ensure_builder_code(order_args)
                     signed_order = self._client.create_order(order_args, opts)
-                    post_args.append(PostOrdersArgs(
-                        signed_order,
-                        OrderType.GTC,
-                        postOnly=True,
-                    ))
+                    if sdk_version == "v2":
+                        post_args.append(BatchPostOrdersArgs(
+                            order=signed_order,
+                            orderType=OrderType.GTC,
+                        ))
+                    else:
+                        post_args.append(BatchPostOrdersArgs(
+                            signed_order,
+                            OrderType.GTC,
+                            postOnly=True,
+                        ))
 
                 return self._client.post_orders(post_args)
 

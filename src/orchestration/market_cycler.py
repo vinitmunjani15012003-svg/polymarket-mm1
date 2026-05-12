@@ -830,7 +830,10 @@ class MarketCycler:
 
     async def _quote_cycle(self, market: MarketInfo):
         """Single quote cycle iteration."""
-        now = time.time()
+        # Defensive local import: some live reload / packaging paths have shown
+        # a transient global-name failure for `time` during quote cycles.
+        import time as _time
+        now = _time.time()
         remaining = market.time_remaining
 
         # 1. Get live spot price (shifted to Chainlink estimate)
