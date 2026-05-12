@@ -14,6 +14,7 @@ Collateral: pUSD by default 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB
 """
 
 import asyncio
+import json
 import time
 from typing import Optional
 from src.monitoring.logger import get_logger
@@ -173,7 +174,9 @@ class GaslessMerger:
                  chain_id: int = 137,
                  collateral_token: str = DEFAULT_COLLATERAL_TOKEN,
                  relayer_api_key: str = "",
-                 relayer_api_key_address: str = ""):
+                 relayer_api_key_address: str = "",
+                 funder: str = "",
+                 signature_type: int = 0):
         self._private_key = private_key
         self._builder_api_key = builder_api_key
         self._builder_secret = builder_secret
@@ -182,6 +185,8 @@ class GaslessMerger:
         self._relayer_api_key_address = relayer_api_key_address
         self._relayer_url = relayer_url
         self._chain_id = chain_id
+        self._funder = funder
+        self._signature_type = int(signature_type or 0)
         self._collateral_token = collateral_token or DEFAULT_COLLATERAL_TOKEN
         self._client = None
         self._w3 = None
@@ -243,7 +248,8 @@ class GaslessMerger:
             self._initialized = True
             log.info("gasless_merger_initialized",
                      relayer=self._relayer_url,
-                     auth_mode=auth_mode)
+                     auth_mode=auth_mode,
+                     wallet_mode=("deposit_wallet" if self._signature_type == 3 and self._funder else "safe"))
             return True
 
         except ImportError as e:
@@ -312,14 +318,28 @@ class GaslessMerger:
                 )
                 target = CTF_CONTRACT
 
-            # Execute via relayer (gasless)
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self._client.execute(
-                    [{"to": target, "data": data, "value": "0"}],
-                    "Merge Positions",
-                ),
-            )
+            # Deposit-wallet (POLY_1271) accounts hold positions in the
+            # configured funder/deposit wallet, not in the relayer SDK's
+            # derived Safe. The installed Python relayer client only supports
+            # Safe execution, so submit the current Relayer API WALLET request
+            # directly. This fixes `expected safe ... is not deployed` and, more
+            # importantly, executes mergePositions from the wallet that actually
+            # owns the outcome tokens.
+            if self._signature_type == 3 and self._funder:
+                response = await self._execute_deposit_wallet_call(
+                    target=target,
+                    data=data,
+                    metadata="Merge Positions",
+                )
+            else:
+                # Legacy Safe/proxy path via the installed SDK.
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._client.execute(
+                        [{"to": target, "data": data, "value": "0"}],
+                        "Merge Positions",
+                    ),
+                )
 
             tx_hash = (response if isinstance(response, str)
                        else str(response))
@@ -335,6 +355,116 @@ class GaslessMerger:
                       condition=condition_id[:12],
                       error=str(e))
             return None
+
+    async def _execute_deposit_wallet_call(self, target: str, data: str, metadata: str = ""):
+        """Submit one gasless call through Polymarket's deposit-wallet relayer flow."""
+        import requests
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+
+        signer = Account.from_key(self._private_key)
+        from_address = signer.address
+        wallet = self._w3.to_checksum_address(self._funder)
+        deadline = str(int(time.time()) + 300)
+
+        def _get_json(path: str, params: dict | None = None):
+            resp = requests.get(f"{self._relayer_url}{path}", params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+
+        nonce_payload = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _get_json("/nonce", {"address": from_address, "type": "WALLET"}),
+        )
+        nonce = str(nonce_payload.get("nonce"))
+        if not nonce or nonce == "None":
+            raise RuntimeError(f"invalid deposit wallet nonce payload: {nonce_payload}")
+
+        calls = [{
+            "target": self._w3.to_checksum_address(target),
+            "value": "0",
+            "data": data,
+        }]
+        domain = {
+            "name": "DepositWallet",
+            "version": "1",
+            "chainId": self._chain_id,
+            "verifyingContract": wallet,
+        }
+        types = {
+            "Call": [
+                {"name": "target", "type": "address"},
+                {"name": "value", "type": "uint256"},
+                {"name": "data", "type": "bytes"},
+            ],
+            "Batch": [
+                {"name": "wallet", "type": "address"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"},
+                {"name": "calls", "type": "Call[]"},
+            ],
+        }
+        message = {
+            "wallet": wallet,
+            "nonce": int(nonce),
+            "deadline": int(deadline),
+            "calls": calls,
+        }
+        signable = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
+        signature = Account.sign_message(signable, self._private_key).signature.hex()
+        if not signature.startswith("0x"):
+            signature = "0x" + signature
+
+        payload = {
+            "type": "WALLET",
+            "from": from_address,
+            "to": "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07",
+            "nonce": nonce,
+            "signature": signature,
+            "depositWalletParams": {
+                "depositWallet": wallet,
+                "deadline": deadline,
+                "calls": calls,
+            },
+        }
+        if metadata:
+            payload["metadata"] = metadata
+
+        body = json.dumps(payload, separators=(",", ":"))
+        headers = {"Content-Type": "application/json"}
+        if self._relayer_api_key and self._relayer_api_key_address:
+            headers.update({
+                "RELAYER_API_KEY": self._relayer_api_key,
+                "RELAYER_API_KEY_ADDRESS": self._relayer_api_key_address,
+            })
+        elif getattr(self._client, "builder_config", None) is not None:
+            builder_headers = self._client.builder_config.generate_builder_headers(
+                "POST", "/submit", body
+            )
+            if builder_headers is not None:
+                headers.update(builder_headers.to_dict())
+
+        def _post():
+            resp = requests.post(
+                f"{self._relayer_url}/submit",
+                headers=headers,
+                data=body,
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"deposit wallet relayer submit failed {resp.status_code}: {resp.text[:300]}")
+            return resp.json()
+
+        response = await asyncio.get_event_loop().run_in_executor(None, _post)
+        tx_id = response.get("transactionID") or response.get("transactionId")
+        state = response.get("state")
+        log.info(
+            "deposit_wallet_relayer_submitted",
+            wallet=wallet,
+            tx_id=tx_id,
+            state=state,
+        )
+        return tx_id or response
 
     async def redeem_positions(self, condition_id: str) -> Optional[str]:
         """Redeem winning tokens via gasless Builder relayer."""
