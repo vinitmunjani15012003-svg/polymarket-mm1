@@ -35,8 +35,12 @@ class ClobClientWrapper:
         self._client = None
         self._client_version = "unknown"
         self._initialized = False
-        # Track open orders: order_id -> {token_id, price, size, side}
+        # Track open orders: order_id -> {token_id, price, size, side}.
+        # Keep a recent closed-order cache too: CLOB trade events can arrive
+        # after a cancel/reprice removed the order from open_orders. Without
+        # this, repair fills are skipped and the bot keeps quoting the same side.
         self.open_orders: dict[str, dict] = {}
+        self._recent_order_context: dict[str, dict] = {}
         self._processed_fills: set = set()
         self._last_fill_check_ts_by_market: dict[str, float] = {}
         self.state_manager = None
@@ -106,6 +110,27 @@ class ClobClientWrapper:
         if loaded_fills:
             self._processed_fills = set(loaded_fills)
             log.info("loaded_processed_fills", count=len(self._processed_fills))
+
+    def _remember_order_context(self, order_id: str):
+        ctx = self.open_orders.get(order_id)
+        if not ctx:
+            return
+        cached = dict(ctx)
+        cached["closed_at"] = time.time()
+        self._recent_order_context[order_id] = cached
+        # Keep cache bounded and fresh enough for delayed fill/trade events.
+        cutoff = time.time() - 900
+        if len(self._recent_order_context) > 500:
+            for oid, info in list(self._recent_order_context.items()):
+                if float(info.get("closed_at", 0) or 0) < cutoff:
+                    self._recent_order_context.pop(oid, None)
+
+    def _pop_open_order(self, order_id: str):
+        self._remember_order_context(order_id)
+        self.open_orders.pop(order_id, None)
+
+    def _order_context(self, order_id: str) -> dict:
+        return self.open_orders.get(order_id) or self._recent_order_context.get(order_id, {})
 
     def _save_orders_state(self):
         if self.state_manager:
@@ -423,7 +448,7 @@ class ClobClientWrapper:
             if callable(batch_fn):
                 try:
                     await self._run_client_call(batch_fn, [order_id])
-                    self.open_orders.pop(order_id, None)
+                    self._pop_open_order(order_id)
                     self._save_orders_state()
                     return True
                 except Exception as batch_error:
@@ -455,7 +480,7 @@ class ClobClientWrapper:
                         self.order_id = oid
                 await self._run_client_call(fn, CancelOrderArgs(order_id))
 
-            self.open_orders.pop(order_id, None)
+            self._pop_open_order(order_id)
             self._save_orders_state()
             return True
         except Exception as e:
@@ -474,7 +499,7 @@ class ClobClientWrapper:
                 raise AttributeError("CLOB client missing cancel_orders")
             await self._run_client_call(fn, order_ids)
             for order_id in order_ids:
-                self.open_orders.pop(order_id, None)
+                self._pop_open_order(order_id)
             self._save_orders_state()
             log.info("orders_cancelled", count=len(order_ids))
             return True
@@ -489,6 +514,8 @@ class ClobClientWrapper:
             return False
         try:
             await self._run_client_call(self._client.cancel_all)
+            for order_id in list(self.open_orders.keys()):
+                self._remember_order_context(order_id)
             self.open_orders.clear()
             self._save_orders_state()
             log.info("all_orders_cancelled")
@@ -643,7 +670,7 @@ class ClobClientWrapper:
                         or mo.get("orderId")
                         or mo.get("id")
                     )
-                    if mo_id in self.open_orders:
+                    if self._order_context(mo_id):
                         matched = mo
                         order_id = mo_id
                         break
@@ -675,9 +702,10 @@ class ClobClientWrapper:
             # Live safety: if we cannot tie the fill to an order we placed in
             # this process, do not book it into inventory. Startup reconciliation
             # is currently best-effort on this SDK, so guessing is dangerous.
-            if order_id not in self.open_orders:
+            order_ctx = self._order_context(order_id)
+            if not order_ctx:
                 log.warning(
-                    "skip_fill_without_open_order_context",
+                    "skip_fill_without_order_context",
                     market=market_id[:12],
                     order_id=str(order_id)[:12],
                 )
@@ -685,8 +713,8 @@ class ClobClientWrapper:
 
             # Hard safety cap: never book more filled size than the remaining
             # open order context we placed locally.
-            if order_id in self.open_orders:
-                remaining_ctx = float(self.open_orders[order_id].get("size") or 0)
+            if order_ctx:
+                remaining_ctx = float(order_ctx.get("size") or 0)
                 if remaining_ctx > 0 and size > remaining_ctx:
                     log.warning(
                         "fill_size_capped_to_open_order",
@@ -701,7 +729,6 @@ class ClobClientWrapper:
             # aggregate trade, not our maker leg. The current live bug recorded
             # NO maker fills as YES because this code trusted trade-level token
             # before the order we actually placed.
-            order_ctx = self.open_orders.get(order_id, {})
             token_id = str(
                 matched_maker_token_id
                 or order_ctx.get("token_id", "")
@@ -744,7 +771,7 @@ class ClobClientWrapper:
             if order_id in self.open_orders:
                 self.open_orders[order_id]["size"] -= size
                 if self.open_orders[order_id]["size"] <= 0.0001:  # Floating point safety
-                    del self.open_orders[order_id]
+                    self._pop_open_order(order_id)
                 orders_changed = True
 
             # Update inventory and edge tracker (MarketCycler loops this)
