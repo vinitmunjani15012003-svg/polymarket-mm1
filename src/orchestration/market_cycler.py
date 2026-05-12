@@ -131,23 +131,23 @@ def compute_inventory_repair_sizes(imbalance: float,
     """
     min_order_size = max(1, int(min_order_size or 1))
     max_order_size = max(min_order_size, int(max_order_size or min_order_size))
-    tail = int(round(abs(imbalance)))
+    tail = abs(float(imbalance or 0))
 
     if tail <= 0:
         return 0, 0, "flat"
 
     if tail < min_order_size:
-        # Guardrail: dust normalization is capped to 2x min size (10 shares when
-        # min=5). This is intentionally small and distinct from normal quoting.
-        target = 2 * min_order_size
-        heavy_top_up = target - tail
+        # Live invariant: never top up the already-filled/heavy side. Even for
+        # sub-minimum partial tails, quote only the light side at the minimum
+        # valid order size. This may overshoot by a few shares, but it avoids
+        # digging the imbalance deeper.
         if imbalance > 0:
-            # Too many Up: add Up dust-normalizer, quote matching Down target.
-            return heavy_top_up, target, "dust_up"
-        # Too many Down: add Down dust-normalizer, quote matching Up target.
-        return target, heavy_top_up, "dust_down"
+            # Too many Up: quote Down only.
+            return 0, min_order_size, "repair_down"
+        # Too many Down: quote Up only.
+        return min_order_size, 0, "repair_up"
 
-    repair_size = min(max_order_size, tail)
+    repair_size = min(max_order_size, int(round(tail)))
     if imbalance > 0:
         return 0, repair_size, "repair_down"
     return repair_size, 0, "repair_up"
@@ -976,9 +976,8 @@ class MarketCycler:
         #     Pass t_normalized for time-aware dynamic thresholds
         imbalance = pos.share_imbalance()
         abs_imbalance = abs(imbalance)
-        # Treat any leftover as actionable inventory risk. Live-minimum-sized
-        # leftovers use close-only repair; sub-minimum dust uses a tiny paired
-        # normalization plan because a 1-4 share order is invalid live.
+        # Treat any leftover as actionable inventory risk. If one side filled and
+        # the other did not, quote ONLY the light side until balanced again.
         inventory_repair = abs_imbalance >= min_order_size
         dust_normalization = 0 < abs_imbalance < min_order_size
         close_only_phase = phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]
@@ -1000,7 +999,7 @@ class MarketCycler:
                 self.quote_engine.max_order_size,
             )
             log.info(
-                "dust_normalization_quote",
+                "sub_minimum_repair_quote",
                 market=market.market_id,
                 imbalance=round(imbalance, 4),
                 up_size=up_size,
@@ -1028,22 +1027,14 @@ class MarketCycler:
                 self._update_dashboard(market, spot, fv, sigma, phase, remaining)
                 return
 
-        # 10.5 Enforce Close-Only quoting during near-expiry phases OR HALTS
-        #      Exception: dust tails (< min_order_size) already have their own
-        #      paired normalization plan from step 10.25 — don't override it
-        #      because _repair_size() would return 0 for sub-minimum tails,
-        #      causing the bot to stop quoting entirely.
+        # 10.5 Enforce Close-Only quoting during near-expiry phases OR HALTS.
         if is_halted or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]:
-            if dust_normalization and repair_mode.startswith("dust_"):
-                # Keep the dust normalization plan — it's already small
-                # and capped at 2x min_order_size
-                pass
-            elif imbalance > 0:
+            if imbalance > 0:
                 up_size = 0
-                down_size = _repair_size(min(self.quote_engine.max_order_size, int(imbalance)))
+                down_size = min_order_size if abs_imbalance < min_order_size else _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
             elif imbalance < 0:
                 down_size = 0
-                up_size = _repair_size(min(self.quote_engine.max_order_size, int(abs(imbalance))))
+                up_size = min_order_size if abs_imbalance < min_order_size else _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
             else:
                 # If we're flat near expiry, we intentionally do not quote.
                 up_size = 0
