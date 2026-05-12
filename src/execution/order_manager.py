@@ -92,6 +92,22 @@ class OrderManager:
         if no_book_snapshot is None:
             no_book_snapshot = book_snapshot
 
+        # Live safety: py-clob-client startup reconciliation may not list all
+        # open orders, and batch/fill paths can leave extras outside ActiveQuotes.
+        # Before each quote update, cancel any locally-known extra order on this
+        # market's tokens so live behavior stays one-order-per-side like dry-run.
+        await self._cancel_stray_live_orders(
+            market_id, token_id_yes, token_id_no, active
+        )
+
+        # In repair modes, only the LIGHT side may be quoted. Enforce this at the
+        # order manager too so upstream sizing bugs cannot keep buying the heavy
+        # side with real funds.
+        if repair_mode == "repair_up":
+            quotes.no_buy_size = 0
+        elif repair_mode == "repair_down":
+            quotes.yes_buy_size = 0
+
         # Check if quotes need repricing. Urgent changes are adverse-risk
         # reductions/removals/crossing-book fixes and are never delayed.
         sticky_repair = repair_mode in ("repair_up", "repair_down")
@@ -230,6 +246,37 @@ class OrderManager:
                      total_ms=round((time.perf_counter() - total_start) * 1000, 1))
 
         return updated
+
+    async def _cancel_stray_live_orders(self, market_id: str, token_id_yes: str,
+                                        token_id_no: str, active: ActiveQuotes):
+        """Cancel locally-known live orders for this market not in ActiveQuotes."""
+        open_orders = getattr(self.executor, "open_orders", None)
+        if not isinstance(open_orders, dict):
+            return
+
+        tracked = {oid for oid in (active.yes_order_id, active.no_order_id) if oid}
+        token_ids = {str(token_id_yes), str(token_id_no)}
+        stray_ids = []
+        for oid, info in list(open_orders.items()):
+            if oid in tracked:
+                continue
+            if str((info or {}).get("token_id")) in token_ids:
+                stray_ids.append(oid)
+
+        if not stray_ids:
+            return
+
+        log.warning(
+            "stray_live_orders_cancelled_before_quote",
+            market=market_id[:8],
+            count=len(stray_ids),
+            order_ids=[oid[:8] for oid in stray_ids[:8]],
+        )
+        if hasattr(self.executor, "cancel_orders"):
+            await self.executor.cancel_orders(stray_ids)
+        else:
+            for oid in stray_ids:
+                await self.executor.cancel_order(oid)
 
     async def cancel_market_quotes(self, market_id: str):
         """Cancel all quotes for a specific market."""

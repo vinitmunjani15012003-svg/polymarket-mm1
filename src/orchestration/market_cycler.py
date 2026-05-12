@@ -1243,6 +1243,14 @@ class MarketCycler:
             ):
                 quotes.yes_buy_size = 0
                 quotes.no_buy_size = 0
+
+            # Final invariant after all capital/backoff transforms: repair mode
+            # is close-only. repair_up means Down is heavy, so quote YES only;
+            # repair_down means Up is heavy, so quote NO only.
+            if repair_mode == "repair_up":
+                quotes.no_buy_size = 0
+            elif repair_mode == "repair_down":
+                quotes.yes_buy_size = 0
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
@@ -1322,28 +1330,35 @@ class MarketCycler:
             # bid. Without this, the stale opposite-side quote sits at an
             # unattractive price and never fills, causing one-sided inventory.
             active = self.order_mgr.get_active(market.market_id)
-            if fill["side"] in ("no", "down") and active.yes_order_id:
-                cancelled = await self.order_mgr.executor.cancel_order(active.yes_order_id)
-                if cancelled:
-                    active.yes_order_id = None
-                    active.yes_price = None
-                    log.debug("fill_reactive_reprice", cancelled="yes",
-                              trigger_side="no", imbalance=pos.share_imbalance())
-                else:
-                    log.error("fill_reactive_cancel_failed",
-                              side="yes", market=market.market_id[:8])
-                    self._running = False
-                    return
-            elif fill["side"] in ("yes", "up") and active.no_order_id:
+            # After a fill, immediately cancel any remaining quote on the
+            # FILLED/now-heavier side. Keep the opposite light-side quote alive
+            # because that is the order needed to repair imbalance. The previous
+            # logic cancelled the opposite side and live kept buying the heavy
+            # side — exactly the divergence Vinit observed.
+            if fill["side"] in ("no", "down") and active.no_order_id:
                 cancelled = await self.order_mgr.executor.cancel_order(active.no_order_id)
                 if cancelled:
                     active.no_order_id = None
                     active.no_price = None
+                    active.no_size = 0
                     log.debug("fill_reactive_reprice", cancelled="no",
-                              trigger_side="yes", imbalance=pos.share_imbalance())
+                              trigger_side="no", imbalance=pos.share_imbalance())
                 else:
                     log.error("fill_reactive_cancel_failed",
                               side="no", market=market.market_id[:8])
+                    self._running = False
+                    return
+            elif fill["side"] in ("yes", "up") and active.yes_order_id:
+                cancelled = await self.order_mgr.executor.cancel_order(active.yes_order_id)
+                if cancelled:
+                    active.yes_order_id = None
+                    active.yes_price = None
+                    active.yes_size = 0
+                    log.debug("fill_reactive_reprice", cancelled="yes",
+                              trigger_side="yes", imbalance=pos.share_imbalance())
+                else:
+                    log.error("fill_reactive_cancel_failed",
+                              side="yes", market=market.market_id[:8])
                     self._running = False
                     return
 
