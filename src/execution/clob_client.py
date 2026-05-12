@@ -402,12 +402,28 @@ class ClobClientWrapper:
             )
             return placed
 
+    def _cancel_fn(self):
+        """Return the installed SDK's single-order cancel function."""
+        fn = getattr(self._client, "cancel", None)
+        if callable(fn):
+            return fn
+        fn = getattr(self._client, "cancel_order", None)
+        if callable(fn):
+            return fn
+        return None
+
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a specific order."""
         if not self._initialized:
             return False
         try:
-            await self._run_client_call(self._client.cancel, order_id)
+            fn = self._cancel_fn()
+            if not fn:
+                raise AttributeError("CLOB client exposes neither cancel nor cancel_order")
+            try:
+                await self._run_client_call(fn, order_id=order_id)
+            except TypeError:
+                await self._run_client_call(fn, order_id)
             self.open_orders.pop(order_id, None)
             self._save_orders_state()
             return True
@@ -422,7 +438,10 @@ class ClobClientWrapper:
         if not order_ids:
             return True
         try:
-            await self._run_client_call(self._client.cancel_orders, order_ids)
+            fn = getattr(self._client, "cancel_orders", None)
+            if not callable(fn):
+                raise AttributeError("CLOB client missing cancel_orders")
+            await self._run_client_call(fn, order_ids)
             for order_id in order_ids:
                 self.open_orders.pop(order_id, None)
             self._save_orders_state()
@@ -430,7 +449,8 @@ class ClobClientWrapper:
             return True
         except Exception as e:
             log.error("cancel_orders_error", count=len(order_ids), error=str(e))
-            return False
+            results = [await self.cancel_order(order_id) for order_id in order_ids]
+            return all(results)
 
     async def cancel_all(self) -> bool:
         """Cancel all open orders."""
@@ -544,9 +564,15 @@ class ClobClientWrapper:
         self._last_fill_check_ts_by_market[market_id] = now
         
         try:
-            from py_clob_client.clob_types import TradeParams
+            if self._client_version == "v2":
+                from py_clob_client_v2 import TradeParams
+            else:
+                from py_clob_client.clob_types import TradeParams
             params = TradeParams(market=market_id)
-            resp = await self._run_client_call(self._client.get_trades, params=params)
+            try:
+                resp = await self._run_client_call(self._client.get_trades, params=params)
+            except TypeError:
+                resp = await self._run_client_call(self._client.get_trades, params)
             fills = resp if isinstance(resp, list) else resp.get("data", [])
             return fills
         except Exception as e:
@@ -569,6 +595,37 @@ class ClobClientWrapper:
             size = float(fill.get("size", 0))
             price = float(fill.get("price", 0))
             order_id = fill.get("order_id") or fill.get("orderID") or fill.get("maker_order_id", "")
+
+            # v2 trade objects can describe the whole trade and include our
+            # contribution under maker_orders. Use the matching maker order so
+            # we do not book someone else's size (e.g. 13 shares vs our 5 quote).
+            maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
+            if isinstance(maker_orders, list) and maker_orders:
+                matched = None
+                for mo in maker_orders:
+                    if not isinstance(mo, dict):
+                        continue
+                    mo_id = mo.get("order_id") or mo.get("orderID") or mo.get("id")
+                    if mo_id in self.open_orders:
+                        matched = mo
+                        order_id = mo_id
+                        break
+                if matched:
+                    size = float(matched.get("matched_amount") or matched.get("size") or matched.get("amount") or size)
+                    price = float(matched.get("price") or price)
+
+            # Hard safety cap: never book more filled size than the remaining
+            # open order context we placed locally.
+            if order_id in self.open_orders:
+                remaining_ctx = float(self.open_orders[order_id].get("size") or 0)
+                if remaining_ctx > 0 and size > remaining_ctx:
+                    log.warning(
+                        "fill_size_capped_to_open_order",
+                        order_id=str(order_id)[:8],
+                        raw_size=size,
+                        capped_size=remaining_ctx,
+                    )
+                    size = remaining_ctx
 
             # Determine side from token id first. Never default unknown fills to
             # Up/YES; that corrupts live inventory after restarts/reconcile gaps.
