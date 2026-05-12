@@ -282,7 +282,26 @@ class ClobClientWrapper:
 
         except Exception as e:
             log.error("batch_order_place_error", error=str(e), count=len(orders))
-            return {str(o.get("side", i)): None for i, o in enumerate(orders)}
+            # SDK compatibility fallback: py-clob-client variants have differed
+            # around PostOrdersArgs / builder fields. For live safety, degrade to
+            # sequential single-order placement instead of spinning failed batch
+            # attempts every quote cycle.
+            placed: dict[str, Optional[str]] = {}
+            for idx, spec in enumerate(orders):
+                side = str(spec.get("side", idx))
+                placed[side] = await self.place_buy_order(
+                    token_id=spec["token_id"],
+                    price=spec["price"],
+                    size=spec["size"],
+                    side=side,
+                    book_snapshot=spec.get("book_snapshot"),
+                )
+            log.info(
+                "batch_order_fallback_complete",
+                count=len(orders),
+                placed=sum(1 for oid in placed.values() if oid),
+            )
+            return placed
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a specific order."""
