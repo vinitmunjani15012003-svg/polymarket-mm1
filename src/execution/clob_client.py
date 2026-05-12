@@ -167,6 +167,60 @@ class ClobClientWrapper:
             log.error("clob_init_error", error=str(e))
             raise
 
+    async def sync_balance_allowance(self) -> bool:
+        """Sync CLOB balance/allowance for deposit-wallet live trading.
+
+        Official deposit wallet flow requires calling the CLOB balance allowance
+        update endpoint after funding/approvals and before trading. Older SDKs
+        may not expose this method, so this is compatibility-guarded.
+        """
+        if not self._initialized:
+            return False
+
+        update_fn = getattr(self._client, "update_balance_allowance", None)
+        if not callable(update_fn):
+            log.warning(
+                "balance_allowance_sync_unavailable",
+                reason="clob_client_missing_update_balance_allowance",
+                client_version=self._client_version,
+                client_type=type(self._client).__name__,
+            )
+            return False
+
+        try:
+            params = None
+            if self._client_version == "v2":
+                try:
+                    from py_clob_client_v2 import (
+                        AssetType, BalanceAllowanceParams, SignatureTypeV2,
+                    )
+                    params = BalanceAllowanceParams(
+                        asset_type=AssetType.COLLATERAL,
+                        signature_type=SignatureTypeV2.POLY_1271 if self._signature_type == 3 else self._signature_type,
+                    )
+                except Exception as e:
+                    log.warning("balance_allowance_params_v2_unavailable", error=str(e))
+            else:
+                try:
+                    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                except Exception as e:
+                    log.warning("balance_allowance_params_v1_unavailable", error=str(e))
+
+            if params is not None:
+                await self._run_client_call(update_fn, params)
+            else:
+                await self._run_client_call(update_fn)
+            log.info(
+                "balance_allowance_synced",
+                signature_type=self._signature_type,
+                funder=self._funder,
+            )
+            return True
+        except Exception as e:
+            log.error("balance_allowance_sync_error", error=str(e))
+            return False
+
     async def place_buy_order(self, token_id: str, price: float,
                                size: float, side: str = "up", book_snapshot=None) -> Optional[str]:
         """

@@ -203,6 +203,16 @@ async def run_bot(
         await executor.initialize()
         log.info("live_executor_initialized")
 
+        # Deposit wallet flow requires syncing CLOB balance/allowance before
+        # trading. Compatibility-guarded for older SDKs.
+        if config.credentials.signature_type == 3:
+            allowance_ok = await executor.sync_balance_allowance()
+            if not allowance_ok:
+                log.warning(
+                    "balance_allowance_sync_not_confirmed",
+                    msg="Deposit wallet balance/allowance sync was unavailable or failed; order placement may be rejected",
+                )
+
         # Reconcile exchange-side state before canceling stale orders. This keeps
         # restarts from blindly discarding order/fill context.
         await executor.reconcile_on_startup()
