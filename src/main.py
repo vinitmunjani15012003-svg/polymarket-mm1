@@ -327,7 +327,14 @@ async def run_bot(
             if exc is not None:
                 mark_failure(f"task {name} crashed: {type(exc).__name__}: {exc}")
             else:
-                mark_failure(f"task {name} exited before shutdown")
+                reason = None
+                if name.startswith("cycler_"):
+                    asset = name.split("_", 1)[1]
+                    for cycler in cyclers:
+                        if getattr(cycler, "asset", None) == asset:
+                            reason = getattr(cycler, "stop_reason", None)
+                            break
+                mark_failure(f"task {name} exited before shutdown" + (f": {reason}" if reason else ""))
 
         task.add_done_callback(_done)
         tasks.append(task)

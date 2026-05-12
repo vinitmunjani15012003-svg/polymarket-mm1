@@ -287,6 +287,7 @@ class MarketCycler:
             immediate_drift_threshold=tox_immediate_drift_threshold,
         )
         self.last_fair_value: Optional[float] = None
+        self.stop_reason: str | None = None
 
         self._running = False
         self._last_market_slug = None  # Track to detect new market
@@ -300,6 +301,7 @@ class MarketCycler:
     async def run(self):
         """Main loop: cycle through markets continuously."""
         self._running = True
+        self.stop_reason = None
         log.info("cycler_started", asset=self.asset)
 
         # Dry-run: if the previous process stopped before Gamma recorded resolution,
@@ -812,6 +814,7 @@ class MarketCycler:
                 # fail closed. Continuing can stack new quotes while stale ones
                 # remain live, which is unacceptable with real funds.
                 await self.order_mgr.cancel_all()
+                self.stop_reason = f"quote_cycle_error: {type(e).__name__}: {e}"
                 self._running = False
                 return
 
@@ -1344,6 +1347,7 @@ class MarketCycler:
                     log.debug("fill_reactive_reprice", cancelled="no",
                               trigger_side="no", imbalance=pos.share_imbalance())
                 else:
+                    self.stop_reason = "fill_reactive_cancel_failed:no"
                     log.error("fill_reactive_cancel_failed",
                               side="no", market=market.market_id[:8])
                     self._running = False
@@ -1357,6 +1361,7 @@ class MarketCycler:
                     log.debug("fill_reactive_reprice", cancelled="yes",
                               trigger_side="yes", imbalance=pos.share_imbalance())
                 else:
+                    self.stop_reason = "fill_reactive_cancel_failed:yes"
                     log.error("fill_reactive_cancel_failed",
                               side="yes", market=market.market_id[:8])
                     self._running = False
