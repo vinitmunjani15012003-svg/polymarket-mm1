@@ -14,6 +14,7 @@ Collateral: pUSD by default 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB
 """
 
 import asyncio
+import time
 from typing import Optional
 from src.monitoring.logger import get_logger
 from src.execution.rpc_utils import pick_working_polygon_rpc

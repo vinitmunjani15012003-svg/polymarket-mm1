@@ -8,6 +8,7 @@ Fair value = P(price goes UP from window start to window end).
 """
 
 import asyncio
+import traceback
 import time as _time
 from typing import Optional
 
@@ -805,6 +806,7 @@ class MarketCycler:
                 await self._quote_cycle(market)
             except Exception as e:
                 log.error("quote_cycle_error", error=str(e),
+                          traceback=traceback.format_exc(),
                           asset=self.asset)
                 # Live safety: any exception after/around order placement must
                 # fail closed. Continuing can stack new quotes while stale ones
