@@ -806,7 +806,12 @@ class MarketCycler:
             except Exception as e:
                 log.error("quote_cycle_error", error=str(e),
                           asset=self.asset)
-                await self.order_mgr.cancel_market_quotes(market.market_id)
+                # Live safety: any exception after/around order placement must
+                # fail closed. Continuing can stack new quotes while stale ones
+                # remain live, which is unacceptable with real funds.
+                await self.order_mgr.cancel_all()
+                self._running = False
+                return
 
             # Event-driven wakeup: quote quickly on Binance price ticks, but keep
             # a hard minimum interval to avoid cancel/repost churn and API spam.

@@ -636,14 +636,43 @@ class ClobClientWrapper:
                 for mo in maker_orders:
                     if not isinstance(mo, dict):
                         continue
-                    mo_id = mo.get("order_id") or mo.get("orderID") or mo.get("id")
+                    mo_id = (
+                        mo.get("order_id")
+                        or mo.get("orderID")
+                        or mo.get("orderId")
+                        or mo.get("id")
+                    )
                     if mo_id in self.open_orders:
                         matched = mo
                         order_id = mo_id
                         break
                 if matched:
-                    size = float(matched.get("matched_amount") or matched.get("size") or matched.get("amount") or size)
+                    size = float(
+                        matched.get("matched_amount")
+                        or matched.get("matchedAmount")
+                        or matched.get("size")
+                        or matched.get("amount")
+                        or size
+                    )
                     price = float(matched.get("price") or price)
+                else:
+                    log.warning(
+                        "skip_trade_without_matching_maker_order",
+                        market=market_id[:12],
+                        maker_orders=len(maker_orders),
+                    )
+                    continue
+
+            # Live safety: if we cannot tie the fill to an order we placed in
+            # this process, do not book it into inventory. Startup reconciliation
+            # is currently best-effort on this SDK, so guessing is dangerous.
+            if order_id not in self.open_orders:
+                log.warning(
+                    "skip_fill_without_open_order_context",
+                    market=market_id[:12],
+                    order_id=str(order_id)[:12],
+                )
+                continue
 
             # Hard safety cap: never book more filled size than the remaining
             # open order context we placed locally.
