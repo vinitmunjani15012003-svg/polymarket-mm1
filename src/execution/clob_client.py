@@ -342,11 +342,23 @@ class ClobClientWrapper:
             return result
 
         try:
-            try:
-                open_resp = await self._run_client_call(self._client.get_orders)
-            except TypeError:
-                open_resp = await self._run_client_call(self._client.get_orders, None)
-            open_orders = open_resp if isinstance(open_resp, list) else open_resp.get("data", []) if isinstance(open_resp, dict) else []
+            get_orders = getattr(self._client, "get_orders", None)
+            if callable(get_orders):
+                try:
+                    open_resp = await self._run_client_call(get_orders)
+                except TypeError:
+                    open_resp = await self._run_client_call(get_orders, None)
+                open_orders = open_resp if isinstance(open_resp, list) else open_resp.get("data", []) if isinstance(open_resp, dict) else []
+            else:
+                # SDK compatibility: some py-clob-client builds do not expose
+                # get_orders. Startup reconciliation is best-effort; do not
+                # block live startup when the SDK cannot list open orders.
+                open_orders = []
+                log.warning(
+                    "startup_reconciliation_orders_unavailable",
+                    reason="clob_client_missing_get_orders",
+                    client_type=type(self._client).__name__,
+                )
 
             refreshed = {}
             for order in open_orders:
@@ -371,11 +383,20 @@ class ClobClientWrapper:
                 self.open_orders.update(refreshed)
                 self._save_orders_state()
 
-            try:
-                trades_resp = await self._run_client_call(self._client.get_trades)
-                trades = trades_resp if isinstance(trades_resp, list) else trades_resp.get("data", []) if isinstance(trades_resp, dict) else []
-            except Exception:
+            get_trades = getattr(self._client, "get_trades", None)
+            if callable(get_trades):
+                try:
+                    trades_resp = await self._run_client_call(get_trades)
+                    trades = trades_resp if isinstance(trades_resp, list) else trades_resp.get("data", []) if isinstance(trades_resp, dict) else []
+                except Exception:
+                    trades = []
+            else:
                 trades = []
+                log.warning(
+                    "startup_reconciliation_trades_unavailable",
+                    reason="clob_client_missing_get_trades",
+                    client_type=type(self._client).__name__,
+                )
 
             result.update({
                 "open_orders": len(open_orders),
