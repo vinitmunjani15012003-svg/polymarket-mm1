@@ -61,7 +61,8 @@ class UpDownFairValue:
         from scipy.stats import norm
         import math
 
-        now_ts = now_ts or time.time()
+        import time as _time
+        now_ts = now_ts or _time.time()
         t_remaining = max(1, self.resolve_ts - now_ts)
         t_years = t_remaining / (365.25 * 86400)
 
@@ -94,11 +95,13 @@ class UpDownFairValue:
             log.info("start_price_set", price=price)
 
     def time_remaining_seconds(self, now_ts: float = None) -> float:
-        now_ts = now_ts or time.time()
+        import time as _time
+        now_ts = now_ts or _time.time()
         return max(0, self.resolve_ts - now_ts)
 
     def normalized_time(self, now_ts: float = None) -> float:
-        now_ts = now_ts or time.time()
+        import time as _time
+        now_ts = now_ts or _time.time()
         total = self.resolve_ts - self.event_start_ts
         if total <= 0:
             return 0.0
@@ -111,7 +114,8 @@ class UpDownFairValue:
 
     @property
     def is_stale(self) -> bool:
-        return (time.time() - self._last_update_ts) > 5.0
+        import time as _time
+        return (_time.time() - self._last_update_ts) > 5.0
 
 
 def compute_inventory_repair_sizes(imbalance: float,
