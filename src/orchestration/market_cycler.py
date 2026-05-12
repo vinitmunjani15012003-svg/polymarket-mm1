@@ -288,6 +288,7 @@ class MarketCycler:
         )
         self.last_fair_value: Optional[float] = None
         self.stop_reason: str | None = None
+        self._last_close_only_repair_mode: str | None = None
 
         self._running = False
         self._last_market_slug = None  # Track to detect new market
@@ -1096,8 +1097,28 @@ class MarketCycler:
 
         if up_size == 0 and down_size == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._last_close_only_repair_mode = None
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
             return
+
+        # Live safety: when entering close-only repair, cancel every known/open
+        # live quote before placing the light-side repair order. This prevents
+        # stale heavy-side orders from stacking into 80-vs-5 style inventory when
+        # CLOB order listing is unavailable and local ActiveQuotes is incomplete.
+        if repair_mode in ("repair_up", "repair_down"):
+            if self._last_close_only_repair_mode != repair_mode:
+                log.warning(
+                    "entering_close_only_repair_cancel_all",
+                    asset=self.asset,
+                    mode=repair_mode,
+                    imbalance=round(imbalance, 4),
+                    up_shares=round(pos.yes_shares, 4),
+                    down_shares=round(pos.no_shares, 4),
+                )
+                await self.order_mgr.cancel_all()
+                self._last_close_only_repair_mode = repair_mode
+        else:
+            self._last_close_only_repair_mode = None
 
         # 11.5 Fetch live orderbooks in one request to prevent crossing the book.
         books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
@@ -1257,6 +1278,23 @@ class MarketCycler:
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
+
+        if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
+
+        # Absolute post-generation invariant: if inventory is already imbalanced
+        # by at least one live-min order, do not quote the heavy side. This is a
+        # final backstop against quote-engine/capital transforms reintroducing
+        # the side we are trying to stop buying.
+        if abs(pos.share_imbalance()) >= min_order_size:
+            if pos.share_imbalance() > 0:
+                quotes.yes_buy_size = 0
+                repair_mode = "repair_down"
+            else:
+                quotes.no_buy_size = 0
+                repair_mode = "repair_up"
 
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
