@@ -898,11 +898,13 @@ class MarketCycler:
                 no_size = 0 if 0 < no_size < min_order_size else no_size
             return yes_size, no_size
 
-        # Get inventory position early for the DEAD_ZONE check. Attach the
-        # condition id for mid-market CTF merge calls; persisted inventory only
-        # stores market_id, but live merge needs a condition id.
+        # Get inventory position early for the DEAD_ZONE check. Attach live CTF
+        # identifiers for mid-market merge calls; persisted inventory only stores
+        # market_id, but live merge needs condition id and ERC1155 token ids.
         pos = self.inventory.get_or_create(market.market_id, self.asset)
         pos.condition_id = getattr(market, "condition_id", None) or market.market_id
+        pos.yes_token_id = str(getattr(market, "token_id_up", "") or "")
+        pos.no_token_id = str(getattr(market, "token_id_down", "") or "")
 
         if phase == "DEAD_ZONE" and pos.share_imbalance() == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)

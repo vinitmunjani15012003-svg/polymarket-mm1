@@ -568,6 +568,7 @@ class BalanceMonitor:
 
         self._w3 = None
         self._usdc = None
+        self._ctf = None
         self._address = None
         self._initialized = False
         self._last_check_ts = 0.0
@@ -615,6 +616,10 @@ class BalanceMonitor:
             self._usdc = self._w3.eth.contract(
                 address=self._w3.to_checksum_address(self._collateral_token),
                 abi=usdc_abi,
+            )
+            self._ctf = self._w3.eth.contract(
+                address=self._w3.to_checksum_address(CTF_CONTRACT),
+                abi=CTF_ABI,
             )
             self._initialized = True
             log.info("balance_monitor_initialized",
@@ -717,6 +722,43 @@ class BalanceMonitor:
                 eligible_markets += 1
 
                 condition_id = getattr(pos, "condition_id", None) or market_id
+
+                # Live-safe preflight: local inventory can drift when fills are
+                # delayed/skipped or state is restored. The CTF merge will
+                # revert if requested amount exceeds either actual ERC1155
+                # token balance, so cap merge size to on-chain YES/NO balances
+                # for the deposit/funder wallet before submitting to relayer.
+                yes_token_id = getattr(pos, "yes_token_id", "") or getattr(pos, "token_id_yes", "")
+                no_token_id = getattr(pos, "no_token_id", "") or getattr(pos, "token_id_no", "")
+                if self._ctf is not None and yes_token_id and no_token_id:
+                    try:
+                        yes_raw = int(self._ctf.functions.balanceOf(self._address, int(yes_token_id)).call())
+                        no_raw = int(self._ctf.functions.balanceOf(self._address, int(no_token_id)).call())
+                        onchain_pairs = min(yes_raw, no_raw) // 1_000_000
+                        if onchain_pairs < pairs:
+                            log.warning(
+                                "auto_merge_capped_to_onchain_balance",
+                                market=market_id[:12],
+                                local_pairs=pairs,
+                                onchain_pairs=int(onchain_pairs),
+                                yes_balance=f"{yes_raw / 1e6:.2f}",
+                                no_balance=f"{no_raw / 1e6:.2f}",
+                            )
+                            pairs = int(onchain_pairs)
+                        if pairs <= 0:
+                            log.warning(
+                                "auto_merge_skipped_no_onchain_pairs",
+                                market=market_id[:12],
+                                local_pairs=int(pos.matched_pairs()),
+                            )
+                            continue
+                    except Exception as e:
+                        log.warning(
+                            "auto_merge_onchain_preflight_failed",
+                            market=market_id[:12],
+                            error=str(e),
+                        )
+
                 usdc_recovery = pairs * 1.0  # 1 pair = $1 USDC
                 pair_profit = pos.matched_pair_profit()
                 amount = int(pairs * 1e6)
