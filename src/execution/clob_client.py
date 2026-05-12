@@ -631,6 +631,7 @@ class ClobClientWrapper:
             # contribution under maker_orders. Use the matching maker order so
             # we do not book someone else's size (e.g. 13 shares vs our 5 quote).
             maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
+            matched_maker_token_id = ""
             if isinstance(maker_orders, list) and maker_orders:
                 matched = None
                 for mo in maker_orders:
@@ -655,6 +656,14 @@ class ClobClientWrapper:
                         or size
                     )
                     price = float(matched.get("price") or price)
+                    matched_maker_token_id = str(
+                        matched.get("asset_id")
+                        or matched.get("token_id")
+                        or matched.get("assetId")
+                        or matched.get("tokenID")
+                        or matched.get("tokenId")
+                        or ""
+                    )
                 else:
                     log.warning(
                         "skip_trade_without_matching_maker_order",
@@ -687,20 +696,35 @@ class ClobClientWrapper:
                     )
                     size = remaining_ctx
 
-            # Determine side from token id first. Never default unknown fills to
-            # Up/YES; that corrupts live inventory after restarts/reconcile gaps.
+            # Determine side from the local maker order context FIRST.
+            # CLOB v2 trade-level asset_id/outcome can describe the taker or
+            # aggregate trade, not our maker leg. The current live bug recorded
+            # NO maker fills as YES because this code trusted trade-level token
+            # before the order we actually placed.
             order_ctx = self.open_orders.get(order_id, {})
             token_id = str(
-                fill.get("asset_id")
+                matched_maker_token_id
+                or order_ctx.get("token_id", "")
+                or fill.get("asset_id")
                 or fill.get("token_id")
                 or fill.get("assetId")
-                or order_ctx.get("token_id", "")
+                or ""
             )
             side = None
-            if token_id_to_side and token_id in token_id_to_side:
-                side = token_id_to_side[token_id]
-            elif order_ctx.get("token_side"):
+            if order_ctx.get("token_side"):
                 side = order_ctx["token_side"]
+                trade_token = str(fill.get("asset_id") or fill.get("token_id") or fill.get("assetId") or "")
+                if trade_token and token_id_to_side and trade_token in token_id_to_side and token_id_to_side[trade_token] != side:
+                    log.warning(
+                        "trade_token_side_disagrees_with_order_context",
+                        order_id=str(order_id)[:8],
+                        order_side=side,
+                        trade_token_side=token_id_to_side[trade_token],
+                        trade_token=trade_token[:16],
+                        order_token=str(order_ctx.get("token_id", ""))[:16],
+                    )
+            elif token_id_to_side and token_id in token_id_to_side:
+                side = token_id_to_side[token_id]
             else:
                 outcome = str(fill.get("outcome") or fill.get("side") or "").strip().lower()
                 if outcome in ("yes", "up"):
