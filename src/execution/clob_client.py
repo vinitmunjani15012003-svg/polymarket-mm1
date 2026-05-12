@@ -413,17 +413,48 @@ class ClobClientWrapper:
         return None
 
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel a specific order."""
+        """Cancel a specific order across py-clob-client SDK variants."""
         if not self._initialized:
             return False
         try:
+            # Prefer cancel_orders([id]) for v2 because some builds expose
+            # cancel_order but expect an object with an orderID attribute.
+            batch_fn = getattr(self._client, "cancel_orders", None)
+            if callable(batch_fn):
+                try:
+                    await self._run_client_call(batch_fn, [order_id])
+                    self.open_orders.pop(order_id, None)
+                    self._save_orders_state()
+                    return True
+                except Exception as batch_error:
+                    log.warning("cancel_order_batch_fallback", order_id=order_id[:8], error=str(batch_error))
+
             fn = self._cancel_fn()
             if not fn:
                 raise AttributeError("CLOB client exposes neither cancel nor cancel_order")
+
             try:
                 await self._run_client_call(fn, order_id=order_id)
             except TypeError:
-                await self._run_client_call(fn, order_id)
+                try:
+                    await self._run_client_call(fn, order_id)
+                except AttributeError as attr_error:
+                    if "orderID" not in str(attr_error):
+                        raise
+                    class CancelOrderArgs:
+                        def __init__(self, oid):
+                            self.orderID = oid
+                            self.order_id = oid
+                    await self._run_client_call(fn, CancelOrderArgs(order_id))
+            except AttributeError as attr_error:
+                if "orderID" not in str(attr_error):
+                    raise
+                class CancelOrderArgs:
+                    def __init__(self, oid):
+                        self.orderID = oid
+                        self.order_id = oid
+                await self._run_client_call(fn, CancelOrderArgs(order_id))
+
             self.open_orders.pop(order_id, None)
             self._save_orders_state()
             return True

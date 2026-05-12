@@ -8,7 +8,7 @@ Fair value = P(price goes UP from window start to window end).
 """
 
 import asyncio
-import time
+import time as _time
 from typing import Optional
 
 from src.config import AssetConfig, GlobalConfig
@@ -61,7 +61,6 @@ class UpDownFairValue:
         from scipy.stats import norm
         import math
 
-        import time as _time
         now_ts = now_ts or _time.time()
         t_remaining = max(1, self.resolve_ts - now_ts)
         t_years = t_remaining / (365.25 * 86400)
@@ -95,12 +94,10 @@ class UpDownFairValue:
             log.info("start_price_set", price=price)
 
     def time_remaining_seconds(self, now_ts: float = None) -> float:
-        import time as _time
         now_ts = now_ts or _time.time()
         return max(0, self.resolve_ts - now_ts)
 
     def normalized_time(self, now_ts: float = None) -> float:
-        import time as _time
         now_ts = now_ts or _time.time()
         total = self.resolve_ts - self.event_start_ts
         if total <= 0:
@@ -114,7 +111,6 @@ class UpDownFairValue:
 
     @property
     def is_stale(self) -> bool:
-        import time as _time
         return (_time.time() - self._last_update_ts) > 5.0
 
 
@@ -382,7 +378,7 @@ class MarketCycler:
                 await self._settle_market()
 
                 # 5. Wait for current window to expire, then look for next
-                wait_time = max(0, market.resolve_ts - time.time()) + 2
+                wait_time = max(0, market.resolve_ts - _time.time()) + 2
                 if wait_time > 0:
                     log.info("waiting_for_next_window",
                              asset=self.asset, wait_s=round(wait_time, 1))
@@ -504,7 +500,7 @@ class MarketCycler:
                             "no_avg_entry": pos_snapshot["no_avg_entry"],
                             "unmatched_up": pos_snapshot["unmatched_up"],
                             "unmatched_down": pos_snapshot["unmatched_down"],
-                            "created_ts": time.time(),
+                            "created_ts": _time.time(),
                         })
                     except Exception as ex:
                         log.debug("pending_resolution_persist_failed", slug=market.slug, error=str(ex))
@@ -704,7 +700,7 @@ class MarketCycler:
         if not start_price and binance_start_price:
             raw_spot = self.price_feed.get_price(self.ac.symbol)
             if raw_spot:
-                self.vol_estimator.update(raw_spot, time.time())
+                self.vol_estimator.update(raw_spot, _time.time())
                 sigma = self.vol_estimator.sigma_for_model()
                 calibrated = self._calibrate_strike_from_market(market, raw_spot, sigma)
                 if calibrated:
@@ -740,7 +736,7 @@ class MarketCycler:
 
         # 4. Last resort: Current spot
         if not start_price:
-            elapsed = time.time() - market.event_start_ts
+            elapsed = _time.time() - market.event_start_ts
             start_price = current_spot
             if elapsed < 30:
                 log.info("start_price_from_spot",
@@ -804,7 +800,7 @@ class MarketCycler:
             if self.risk_engine.halted:
                 self.risk_engine.check_stops(self.pnl.net_pnl)
 
-            cycle_start = time.time()
+            cycle_start = _time.time()
             try:
                 await self._quote_cycle(market)
             except Exception as e:
@@ -815,7 +811,7 @@ class MarketCycler:
             # Event-driven wakeup: quote quickly on Binance price ticks, but keep
             # a hard minimum interval to avoid cancel/repost churn and API spam.
             min_interval = max(0.05, float(getattr(self.gc, "min_quote_interval", 0.25)))
-            elapsed = time.time() - cycle_start
+            elapsed = _time.time() - cycle_start
             if elapsed < min_interval:
                 await asyncio.sleep(min_interval - elapsed)
 
@@ -834,9 +830,6 @@ class MarketCycler:
 
     async def _quote_cycle(self, market: MarketInfo):
         """Single quote cycle iteration."""
-        # Defensive local import: some live reload / packaging paths have shown
-        # a transient global-name failure for `time` during quote cycles.
-        import time as _time
         now = _time.time()
         remaining = market.time_remaining
 
