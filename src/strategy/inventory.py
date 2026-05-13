@@ -215,6 +215,39 @@ class InventoryPosition:
         no_risk = unmatched_no * self.no_avg_entry if unmatched_no > 0 else 0.0
         return yes_risk + no_risk
 
+    def max_profitable_repair_price(self, side: str, size: float,
+                                    min_edge: float = 0.01) -> float:
+        """Max repair bid that keeps newly matched FIFO pairs profitable.
+
+        If we already bought NO at 0.55, buying YES above 0.44 locks in a
+        negative pair. Repair mode exists to reduce inventory risk, but it
+        should not blindly manufacture guaranteed losses. Cap the light-side
+        repair bid against the actual unmatched opposite-side fill prices.
+        """
+        side = (side or "").lower()
+        remaining = max(0.0, float(size or 0))
+        if remaining <= 0:
+            return 0.0
+
+        opposite = self._no_fills if side in ("yes", "up") else self._yes_fills
+        if not opposite:
+            return 0.99
+
+        worst_opposite_price = 0.0
+        covered = 0.0
+        for fill in opposite:
+            qty = max(0.0, float(getattr(fill, "remaining", 0) or 0))
+            if qty <= 0:
+                continue
+            worst_opposite_price = max(worst_opposite_price, float(fill.price))
+            covered += min(qty, remaining - covered)
+            if covered >= remaining:
+                break
+
+        if covered <= 0:
+            return 0.99
+        return max(0.0, round(1.0 - worst_opposite_price - float(min_edge or 0), 4))
+
 
 class FillRateTracker:
     """Tracks per-side fill rates to detect asymmetry early.

@@ -856,3 +856,22 @@ def test_live_balance_sync_passes_signature_type_for_v1_sdk_params():
 
     assert asyncio.run(wrapper.sync_balance_allowance()) is True
     assert wrapper._client.params.signature_type == 3
+
+
+def test_repair_price_cap_uses_unmatched_opposite_fifo_cost():
+    from src.strategy.inventory import InventoryPosition
+
+    pos = InventoryPosition("M1", "BTC")
+    pos.add_fill("no", 0.55, 10)
+
+    assert pos.max_profitable_repair_price("yes", 10, min_edge=0.01) == 0.44
+
+
+def test_repair_price_cap_uses_worst_opposite_cost_across_requested_size():
+    from src.strategy.inventory import InventoryPosition
+
+    pos = InventoryPosition("M1", "BTC")
+    pos.add_fill("yes", 0.40, 5)
+    pos.add_fill("yes", 0.70, 5)
+
+    assert pos.max_profitable_repair_price("no", 10, min_edge=0.01) == 0.29

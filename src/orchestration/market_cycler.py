@@ -1342,6 +1342,37 @@ class MarketCycler:
                 quotes.no_buy_size = 0
                 repair_mode = "repair_up"
 
+        # Pair-cost guardrail for close-only repair. Existing unmatched fills are
+        # sunk, but buying the opposite side above 1 - existing_fill_price locks
+        # in a guaranteed negative merge. Cap repair bids to preserve at least a
+        # 1c edge on newly formed pairs; otherwise wait instead of paying stupid.
+        if repair_mode == "repair_up" and quotes.yes_buy_size > 0:
+            cap = pos.max_profitable_repair_price("yes", quotes.yes_buy_size, min_edge=0.01)
+            if cap < 0.01:
+                log.warning("repair_quote_blocked_negative_pair_edge",
+                            market=market.market_id[:8], side="yes",
+                            quoted=quotes.yes_buy_price, cap=round(cap, 4))
+                quotes.yes_buy_size = 0
+            elif quotes.yes_buy_price and quotes.yes_buy_price > cap:
+                log.warning("repair_quote_capped_for_pair_edge",
+                            market=market.market_id[:8], side="yes",
+                            quoted=quotes.yes_buy_price, cap=round(cap, 4))
+                quotes.yes_buy_price = round(cap, 2)
+        elif repair_mode == "repair_down" and quotes.no_buy_size > 0:
+            cap = pos.max_profitable_repair_price("no", quotes.no_buy_size, min_edge=0.01)
+            if cap < 0.01:
+                log.warning("repair_quote_blocked_negative_pair_edge",
+                            market=market.market_id[:8], side="no",
+                            quoted=quotes.no_buy_price, cap=round(cap, 4))
+                quotes.no_buy_size = 0
+            elif quotes.no_buy_price and quotes.no_buy_price > cap:
+                log.warning("repair_quote_capped_for_pair_edge",
+                            market=market.market_id[:8], side="no",
+                            quoted=quotes.no_buy_price, cap=round(cap, 4))
+                quotes.no_buy_price = round(cap, 2)
+        quotes.combined_cost = round(float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0), 4)
+        quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
+
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
