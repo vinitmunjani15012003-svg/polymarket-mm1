@@ -827,3 +827,32 @@ def test_pair_merge_pnl_does_not_count_market_settled():
 
     pnl.record_outcome_resolution(0.0, "MARKET1")
     assert pnl.markets_settled == 1
+
+
+def test_live_balance_sync_passes_signature_type_for_v1_sdk_params():
+    from src.execution.clob_client import ClobClientWrapper
+    import asyncio
+
+    class FakeClient:
+        def __init__(self):
+            self.params = None
+        def update_balance_allowance(self, params=None):
+            self.params = params
+            return {"ok": True}
+
+    wrapper = ClobClientWrapper(
+        host="https://clob.polymarket.com",
+        private_key="0xabc",
+        chain_id=137,
+        api_key="key",
+        api_secret="secret",
+        api_passphrase="pass",
+        signature_type=3,
+        funder="0xfunder",
+    )
+    wrapper._initialized = True
+    wrapper._client_version = "v1"
+    wrapper._client = FakeClient()
+
+    assert asyncio.run(wrapper.sync_balance_allowance()) is True
+    assert wrapper._client.params.signature_type == 3

@@ -543,6 +543,8 @@ class GaslessMerger:
             tx_id=tx_id,
             state=state,
         )
+        if tx_id:
+            await self._wait_for_relayer_finality(tx_id)
         return tx_id or response
 
     async def _execute_proxy_wallet_call(self, target: str, data: str, metadata: str = ""):
@@ -653,7 +655,52 @@ class GaslessMerger:
             tx_id=tx_id,
             state=response.get("state"),
         )
+        if tx_id:
+            await self._wait_for_relayer_finality(tx_id)
         return tx_id or response
+
+    async def _wait_for_relayer_finality(self, tx_id: str, max_polls: int = 30,
+                                         poll_seconds: float = 2.0) -> bool:
+        """Wait until the relayer tx is mined/confirmed before CLOB balance sync.
+
+        `/submit` often returns STATE_EXECUTED before the CLOB balance service can
+        see the merged collateral. Syncing immediately leaves the UI/API showing
+        “activate fund” until a manual refresh. Waiting for finality makes the
+        following update_balance_allowance call useful instead of decorative.
+        """
+        import requests
+
+        terminal_ok = {"STATE_MINED", "STATE_CONFIRMED"}
+        terminal_bad = {"STATE_FAILED", "STATE_INVALID"}
+
+        def _get_tx():
+            resp = requests.get(
+                f"{self._relayer_url}/transaction",
+                params={"id": tx_id},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        last_state = ""
+        for attempt in range(1, max_polls + 1):
+            try:
+                payload = await asyncio.get_event_loop().run_in_executor(None, _get_tx)
+                tx = payload[0] if isinstance(payload, list) and payload else payload
+                state = str((tx or {}).get("state") or "")
+                last_state = state or last_state
+                if state in terminal_ok:
+                    log.info("relayer_tx_finalized", tx_id=tx_id, state=state, attempts=attempt)
+                    return True
+                if state in terminal_bad:
+                    log.error("relayer_tx_failed", tx_id=tx_id, state=state, attempts=attempt)
+                    return False
+            except Exception as e:
+                log.warning("relayer_tx_poll_error", tx_id=tx_id, attempt=attempt, error=str(e))
+            await asyncio.sleep(poll_seconds)
+
+        log.warning("relayer_tx_finality_timeout", tx_id=tx_id, last_state=last_state)
+        return False
 
     def _relayer_auth_headers(self, body: str) -> dict:
         """Build relayer auth headers for raw `/submit` requests."""
@@ -920,12 +967,10 @@ class BalanceMonitor:
 
             eligible_markets = 0
             for market_id, pos in inventory_mgr.positions.items():
+                # Start with local inventory, then reconcile upward/downward
+                # against ERC1155 balances below. Local fill state can lag CLOB
+                # trade events; on-chain balances are the merge authority.
                 pairs = int(pos.matched_pairs())
-                if not force and pairs < self.min_merge_pairs:
-                    continue
-                if pairs <= 0:
-                    continue
-                eligible_markets += 1
 
                 condition_id = getattr(pos, "condition_id", None) or market_id
 
@@ -990,6 +1035,17 @@ class BalanceMonitor:
                                 no_balance=f"{no_raw / 1e6:.2f}",
                             )
                             pairs = int(onchain_pairs)
+                        elif onchain_pairs > pairs:
+                            log.warning(
+                                "auto_merge_expanded_to_onchain_balance",
+                                market=market_id[:12],
+                                local_pairs=pairs,
+                                onchain_pairs=int(onchain_pairs),
+                                yes_balance=f"{yes_raw / 1e6:.2f}",
+                                no_balance=f"{no_raw / 1e6:.2f}",
+                                msg="Local inventory is stale; merging all chain-confirmed matched pairs",
+                            )
+                            pairs = int(onchain_pairs)
                         if pairs <= 0:
                             log.warning(
                                 "auto_merge_skipped_no_onchain_pairs",
@@ -1005,6 +1061,12 @@ class BalanceMonitor:
                         )
                         if deposit_wallet_merge:
                             continue
+
+                if not force and pairs < self.min_merge_pairs:
+                    continue
+                if pairs <= 0:
+                    continue
+                eligible_markets += 1
 
                 usdc_recovery = pairs * 1.0  # 1 pair = $1 USDC
                 pair_profit = pos.matched_pair_profit()

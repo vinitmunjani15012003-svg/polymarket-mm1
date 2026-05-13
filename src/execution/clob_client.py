@@ -228,7 +228,10 @@ class ClobClientWrapper:
             else:
                 try:
                     from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                    params = BalanceAllowanceParams(
+                        asset_type=AssetType.COLLATERAL,
+                        signature_type=self._signature_type,
+                    )
                 except Exception as e:
                     log.warning("balance_allowance_params_v1_unavailable", error=str(e))
 
