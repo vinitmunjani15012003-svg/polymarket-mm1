@@ -6,7 +6,7 @@ from src.config import AssetConfig, BotConfig
 import time
 
 from src.execution.clob_client import ClobClientWrapper
-from src.execution.ctf_ops import BalanceMonitor
+from src.execution.ctf_ops import BalanceMonitor, infer_collateral_token_for_market
 from src.execution.dry_run import DryRunExecutor, SimulatedOrder
 from src.execution.order_manager import OrderManager
 from src.orchestration.market_cycler import (
@@ -778,3 +778,39 @@ def test_acknowledge_settlement_prevents_double_counting():
     inv.record_fill("M1", "yes", 5, 0.48)
     inv.record_fill("M1", "no",  5, 0.48)
     assert pos.matched_pair_profit() > 0
+
+
+def test_infer_collateral_token_matches_market_token_ids_by_derivation():
+    class Call:
+        def __init__(self, value):
+            self.value = value
+        def call(self):
+            return self.value
+
+    class Functions:
+        def getCollectionId(self, _parent, _condition, index_set):
+            return Call(f"collection-{index_set}")
+        def getPositionId(self, collateral, collection_id):
+            suffix = str(collection_id).split("-")[-1]
+            if collateral.lower() == "0x2791bca1f2de4661ed88a30c99a7a9449aa84174":
+                return Call(1000 + int(suffix))
+            return Call(2000 + int(suffix))
+
+    class CTF:
+        functions = Functions()
+
+    class W3:
+        @staticmethod
+        def to_checksum_address(addr):
+            return addr
+
+    inferred = infer_collateral_token_for_market(
+        W3(),
+        CTF(),
+        "0x" + "11" * 32,
+        yes_token_id="1001",
+        no_token_id="1002",
+        default_collateral="0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+    )
+
+    assert inferred.lower() == "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"

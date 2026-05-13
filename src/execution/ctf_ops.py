@@ -25,6 +25,8 @@ log = get_logger("ctf_ops")
 # Polygon contract addresses
 CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 DEFAULT_COLLATERAL_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+USDC_E_COLLATERAL_TOKEN = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
 
 # Minimal ABIs for the CTF operations we need
 CTF_ABI = [
@@ -80,6 +82,25 @@ CTF_ABI = [
         ],
         "outputs": [{"name": "", "type": "uint256"}],
     },
+    {
+        "name": "getCollectionId",
+        "type": "function",
+        "inputs": [
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSet", "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bytes32"}],
+    },
+    {
+        "name": "getPositionId",
+        "type": "function",
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "collectionId", "type": "bytes32"},
+        ],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
 ]
 
 # ERC20 approve ABI
@@ -108,6 +129,56 @@ ERC20_APPROVE_ABI = [
 BINARY_PARTITION = [1, 2]
 # Zero parent collection for top-level positions
 PARENT_COLLECTION_ID = b'\x00' * 32
+
+
+def infer_collateral_token_for_market(w3, ctf, condition_id: str,
+                                      yes_token_id: str = "",
+                                      no_token_id: str = "",
+                                      default_collateral: str = DEFAULT_COLLATERAL_TOKEN) -> str:
+    """
+    Infer the collateral token used to create a market's CTF position IDs.
+
+    Important: the ERC1155 token id encodes the collateral address. If we call
+    mergePositions with pUSD while the market's token ids were derived from
+    USDC.e, the relayer batch is valid but the CTF call reverts because the
+    wallet owns zero pUSD-derived positions. This is exactly the annoying kind
+    of bug that looks like a relayer problem while being a collateral mismatch.
+    """
+    expected = {str(yes_token_id or ""), str(no_token_id or "")}
+    expected.discard("")
+    if len(expected) < 2 or not w3 or not ctf or not condition_id:
+        return default_collateral or DEFAULT_COLLATERAL_TOKEN
+
+    try:
+        condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+        collection_ids = [
+            ctf.functions.getCollectionId(PARENT_COLLECTION_ID, condition_bytes, idx).call()
+            for idx in BINARY_PARTITION
+        ]
+        candidates = [
+            default_collateral or DEFAULT_COLLATERAL_TOKEN,
+            USDC_E_COLLATERAL_TOKEN,
+            CTF_COLLATERAL_ADAPTER,
+            DEFAULT_COLLATERAL_TOKEN,
+        ]
+        seen = set()
+        for collateral in candidates:
+            if not collateral or collateral.lower() in seen:
+                continue
+            seen.add(collateral.lower())
+            derived = {
+                str(ctf.functions.getPositionId(
+                    w3.to_checksum_address(collateral), collection_id
+                ).call())
+                for collection_id in collection_ids
+            }
+            if derived == expected:
+                return w3.to_checksum_address(collateral)
+    except Exception as e:
+        log.warning("collateral_inference_failed",
+                    condition=condition_id[:12], error=str(e))
+
+    return default_collateral or DEFAULT_COLLATERAL_TOKEN
 
 
 class GaslessMerger:
@@ -272,7 +343,8 @@ class GaslessMerger:
             return False
 
     async def merge_positions(self, condition_id: str, amount: int,
-                               is_neg_risk: bool = False) -> Optional[str]:
+                               is_neg_risk: bool = False,
+                               collateral_token: str = "") -> Optional[str]:
         """
         Merge matched pairs via gasless relayer.
         
@@ -282,6 +354,7 @@ class GaslessMerger:
             condition_id: Market condition ID (hex string).
             amount: Number of pairs in token units (1 share = 10^6).
             is_neg_risk: Whether this is a neg-risk market.
+            collateral_token: Optional collateral override for this market.
             
         Returns:
             Transaction hash if successful, None otherwise.
@@ -318,7 +391,9 @@ class GaslessMerger:
                 data = contract.encode_abi(
                     "mergePositions",
                     args=[
-                        self._w3.to_checksum_address(self._collateral_token),
+                        self._w3.to_checksum_address(
+                            collateral_token or self._collateral_token
+                        ),
                         parent,
                         condition_bytes,
                         [1, 2],  # Binary partition
@@ -860,6 +935,7 @@ class BalanceMonitor:
                 # for the deposit/funder wallet before submitting to relayer.
                 yes_token_id = getattr(pos, "yes_token_id", "") or getattr(pos, "token_id_yes", "")
                 no_token_id = getattr(pos, "no_token_id", "") or getattr(pos, "token_id_no", "")
+                collateral_token = self._collateral_token
                 deposit_wallet_merge = bool(
                     gasless_merger
                     and getattr(gasless_merger, "_signature_type", 0) == 3
@@ -876,6 +952,22 @@ class BalanceMonitor:
 
                 if self._ctf is not None and yes_token_id and no_token_id:
                     try:
+                        collateral_token = infer_collateral_token_for_market(
+                            self._w3,
+                            self._ctf,
+                            condition_id,
+                            yes_token_id,
+                            no_token_id,
+                            self._collateral_token,
+                        )
+                        if collateral_token.lower() != (self._collateral_token or "").lower():
+                            log.warning(
+                                "auto_merge_collateral_override",
+                                market=market_id[:12],
+                                condition=condition_id[:12],
+                                configured=self._collateral_token,
+                                inferred=collateral_token,
+                            )
                         yes_raw = int(self._ctf.functions.balanceOf(self._address, int(yes_token_id)).call())
                         no_raw = int(self._ctf.functions.balanceOf(self._address, int(no_token_id)).call())
                         onchain_pairs = min(yes_raw, no_raw) // 1_000_000
@@ -919,6 +1011,7 @@ class BalanceMonitor:
 
                 log.info("auto_merge_market",
                          market=market_id[:12],
+                         collateral=collateral_token,
                          pairs=pairs,
                          expected_usdc=f"${usdc_recovery:.2f}",
                          pair_profit=f"${pair_profit:.4f}")
@@ -927,7 +1020,7 @@ class BalanceMonitor:
                 tx = None
                 if gasless_merger and gasless_merger.is_available:
                     tx = await gasless_merger.merge_positions(
-                        condition_id, amount
+                        condition_id, amount, collateral_token=collateral_token
                     )
                     if tx:
                         log.info("auto_merge_gasless_ok",
@@ -936,7 +1029,7 @@ class BalanceMonitor:
 
                 if not tx and ctf_ops:
                     tx = await ctf_ops.merge_positions(
-                        condition_id, amount
+                        condition_id, amount, collateral_token=collateral_token
                     )
                     if tx:
                         log.info("auto_merge_onchain_ok",
@@ -1086,7 +1179,8 @@ class CTFOperations:
             return False
 
     async def merge_positions(self, condition_id: str,
-                               amount: int) -> Optional[str]:
+                               amount: int,
+                               collateral_token: str = "") -> Optional[str]:
         """
         Merge matched pairs: 1 Up + 1 Down → $1 USDC.
         
@@ -1096,6 +1190,7 @@ class CTFOperations:
         Args:
             condition_id: The market's condition ID (bytes32 hex).
             amount: Number of pairs to merge (in token units, typically 10^6).
+            collateral_token: Optional collateral override for this market.
             
         Returns:
             Transaction hash if successful, None otherwise.
@@ -1113,7 +1208,7 @@ class CTFOperations:
 
         try:
             tx = self._ctf.functions.mergePositions(
-                self._w3.to_checksum_address(self._collateral_token),
+                self._w3.to_checksum_address(collateral_token or self._collateral_token),
                 PARENT_COLLECTION_ID,
                 condition_bytes,
                 BINARY_PARTITION,

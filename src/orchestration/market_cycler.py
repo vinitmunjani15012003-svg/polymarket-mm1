@@ -21,6 +21,7 @@ from src.strategy.inventory import InventoryManager
 from src.execution.order_manager import OrderManager
 from src.execution.ctf_ops import (
     CTFOperations, GaslessMerger, BalanceMonitor,
+    infer_collateral_token_for_market,
 )
 from src.risk.regime_filter import RegimeFilter
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
@@ -424,17 +425,27 @@ class MarketCycler:
                 if condition_id:
                     amount = int(pairs * 1e6)  # Convert to USDC base units
                     tx = None
+                    collateral_token = getattr(self.gasless_merger, "_collateral_token", "")
+                    if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
+                        collateral_token = infer_collateral_token_for_market(
+                            self.balance_monitor._w3,
+                            self.balance_monitor._ctf,
+                            condition_id,
+                            getattr(market, "token_id_up", ""),
+                            getattr(market, "token_id_down", ""),
+                            collateral_token,
+                        )
 
                     # Prefer gasless merge
                     if self.gasless_merger and self.gasless_merger.is_available:
                         tx = await self.gasless_merger.merge_positions(
-                            condition_id, amount
+                            condition_id, amount, collateral_token=collateral_token
                         )
 
                     # Fallback to on-chain
                     if not tx and self.ctf:
                         tx = await self.ctf.merge_positions(
-                            condition_id, amount
+                            condition_id, amount, collateral_token=collateral_token
                         )
 
                     if tx:
