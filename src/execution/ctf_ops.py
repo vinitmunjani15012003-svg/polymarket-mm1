@@ -165,6 +165,15 @@ class GaslessMerger:
     ]
     # Neg Risk Adapter address on Polygon
     NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+    # Relayer proxy/deposit-wallet contract config on Polygon. These match the
+    # official relayer/deposit-wallet docs and current py-builder-relayer-client
+    # chain config. Proxy wallets (signature_type=1) must be executed through
+    # the proxy factory; sending those calls through the Safe path derives the
+    # wrong wallet and auto-merge never reaches the tokens.
+    PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
+    RELAY_HUB = "0xD216153c06E857cD7f72665E0aF1d7D82172F494"
+    DEPOSIT_WALLET_FACTORY = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07"
+    DEFAULT_PROXY_GAS_LIMIT = 500_000
 
     def __init__(self, private_key: str,
                  builder_api_key: str = "",
@@ -318,14 +327,20 @@ class GaslessMerger:
                 )
                 target = CTF_CONTRACT
 
-            # Deposit-wallet (POLY_1271) accounts hold positions in the
-            # configured funder/deposit wallet, not in the relayer SDK's
-            # derived Safe. The installed Python relayer client only supports
-            # Safe execution, so submit the current Relayer API WALLET request
-            # directly. This fixes `expected safe ... is not deployed` and, more
+            # Proxy/deposit-wallet accounts hold positions in the configured
+            # funder wallet, not in the relayer SDK's derived Safe. The older
+            # installed Python relayer client only supports Safe execution, so
+            # submit the official raw Relayer API request for those wallet
+            # modes. This fixes `expected safe ... is not deployed` and, more
             # importantly, executes mergePositions from the wallet that actually
             # owns the outcome tokens.
-            if self._signature_type == 3 and self._funder:
+            if self._signature_type == 1 and self._funder:
+                response = await self._execute_proxy_wallet_call(
+                    target=target,
+                    data=data,
+                    metadata="Merge Positions",
+                )
+            elif self._signature_type == 3 and self._funder:
                 response = await self._execute_deposit_wallet_call(
                     target=target,
                     data=data,
@@ -418,7 +433,7 @@ class GaslessMerger:
         payload = {
             "type": "WALLET",
             "from": from_address,
-            "to": "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07",
+            "to": self.DEPOSIT_WALLET_FACTORY,
             "nonce": nonce,
             "signature": signature,
             "depositWalletParams": {
@@ -431,18 +446,7 @@ class GaslessMerger:
             payload["metadata"] = metadata
 
         body = json.dumps(payload, separators=(",", ":"))
-        headers = {"Content-Type": "application/json"}
-        if self._relayer_api_key and self._relayer_api_key_address:
-            headers.update({
-                "RELAYER_API_KEY": self._relayer_api_key,
-                "RELAYER_API_KEY_ADDRESS": self._relayer_api_key_address,
-            })
-        elif getattr(self._client, "builder_config", None) is not None:
-            builder_headers = self._client.builder_config.generate_builder_headers(
-                "POST", "/submit", body
-            )
-            if builder_headers is not None:
-                headers.update(builder_headers.to_dict())
+        headers = self._relayer_auth_headers(body)
 
         def _post():
             resp = requests.post(
@@ -465,6 +469,132 @@ class GaslessMerger:
             state=state,
         )
         return tx_id or response
+
+    async def _execute_proxy_wallet_call(self, target: str, data: str, metadata: str = ""):
+        """Submit one gasless call through Polymarket's PROXY relayer flow."""
+        import requests
+        from eth_abi import encode
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+        from eth_utils import keccak, to_bytes
+        from hexbytes import HexBytes
+
+        signer = Account.from_key(self._private_key)
+        from_address = signer.address
+        proxy_wallet = self._w3.to_checksum_address(self._funder)
+        proxy_factory = self._w3.to_checksum_address(self.PROXY_FACTORY)
+        relay_hub = self._w3.to_checksum_address(self.RELAY_HUB)
+
+        def _get_json(path: str, params: dict | None = None):
+            resp = requests.get(f"{self._relayer_url}{path}", params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+
+        relay_payload = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _get_json("/relay-payload", {"address": from_address, "type": "PROXY"}),
+        )
+        nonce = str(relay_payload.get("nonce"))
+        relay = relay_payload.get("address")
+        if not nonce or nonce == "None" or not relay:
+            raise RuntimeError(f"invalid proxy relay payload: {relay_payload}")
+        relay = self._w3.to_checksum_address(relay)
+
+        target = self._w3.to_checksum_address(target)
+        call_data = to_bytes(hexstr=data if data.startswith("0x") else "0x" + data)
+        selector = keccak(b"proxy((uint8,address,uint256,bytes)[])")[:4]
+        encoded_args = encode(
+            ["(uint8,address,uint256,bytes)[]"],
+            [[(1, target, 0, call_data)]],  # CallType.Call = 1
+        )
+        proxy_data = "0x" + (selector + encoded_args).hex()
+
+        gas_limit = str(self.DEFAULT_PROXY_GAS_LIMIT)
+        gas_price = "0"
+        relayer_fee = "0"
+
+        # Current relayer client signs keccak256("rlx:" || fields...) as an
+        # EIP-191 defunct message. Keep this wire-compatible with the official
+        # Python builder-relayer implementation while avoiding a hard dependency
+        # on a newer client version at runtime.
+        message = (
+            b"rlx:"
+            + HexBytes(from_address)
+            + HexBytes(proxy_factory)
+            + to_bytes(hexstr=proxy_data)
+            + int(relayer_fee).to_bytes(32, "big")
+            + int(gas_price).to_bytes(32, "big")
+            + int(gas_limit).to_bytes(32, "big")
+            + int(nonce).to_bytes(32, "big")
+            + HexBytes(relay_hub)
+            + HexBytes(relay)
+        )
+        struct_hash = "0x" + keccak(message).hex()
+        signature = Account.sign_message(
+            encode_defunct(HexBytes(struct_hash)),
+            self._private_key,
+        ).signature.hex()
+        if not signature.startswith("0x"):
+            signature = "0x" + signature
+
+        payload = {
+            "type": "PROXY",
+            "from": from_address,
+            "to": proxy_factory,
+            "proxyWallet": proxy_wallet,
+            "data": proxy_data,
+            "nonce": nonce,
+            "signature": signature,
+            "signatureParams": {
+                "gasPrice": gas_price,
+                "gasLimit": gas_limit,
+                "relayerFee": relayer_fee,
+                "relayHub": relay_hub,
+                "relay": relay,
+            },
+        }
+        if metadata:
+            payload["metadata"] = metadata
+
+        body = json.dumps(payload, separators=(",", ":"))
+        headers = self._relayer_auth_headers(body)
+
+        def _post():
+            resp = requests.post(
+                f"{self._relayer_url}/submit",
+                headers=headers,
+                data=body,
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"proxy relayer submit failed {resp.status_code}: {resp.text[:300]}")
+            return resp.json()
+
+        response = await asyncio.get_event_loop().run_in_executor(None, _post)
+        tx_id = response.get("transactionID") or response.get("transactionId")
+        log.info(
+            "proxy_relayer_submitted",
+            proxy_wallet=proxy_wallet,
+            tx_id=tx_id,
+            state=response.get("state"),
+        )
+        return tx_id or response
+
+    def _relayer_auth_headers(self, body: str) -> dict:
+        """Build relayer auth headers for raw `/submit` requests."""
+        headers = {"Content-Type": "application/json"}
+        if self._relayer_api_key and self._relayer_api_key_address:
+            headers.update({
+                "RELAYER_API_KEY": self._relayer_api_key,
+                "RELAYER_API_KEY_ADDRESS": self._relayer_api_key_address,
+            })
+        elif getattr(self._client, "builder_config", None) is not None:
+            builder_headers = self._client.builder_config.generate_builder_headers(
+                "POST", "/submit", body
+            )
+            if builder_headers is not None:
+                headers.update(builder_headers.to_dict())
+        return headers
 
     async def redeem_positions(self, condition_id: str) -> Optional[str]:
         """Redeem winning tokens via gasless Builder relayer."""
