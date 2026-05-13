@@ -897,6 +897,119 @@ class MarketCycler:
             except asyncio.TimeoutError:
                 pass
 
+    async def _handle_standardized_fills(self, market: MarketInfo,
+                                         fills: list[dict], fv: float,
+                                         pos) -> bool:
+        """Record fills and immediately remove the newly-heavy side.
+
+        Dry-run creates fills only when the quote loop asks for them. Live CLOB
+        fills happen asynchronously, so both pre-quote and post-quote paths must
+        share the same accounting/cancel behavior. Returning False means live
+        safety failed and the caller should stop this market loop.
+        """
+        for fill in fills:
+            self.inventory.record_fill(
+                market.market_id, fill["side"],
+                fill["size"], fill["price"], self.asset
+            )
+            self.pnl.record_fill(
+                size=fill["size"],
+                price=fill["price"],
+                side=fill["side"],
+                asset=self.asset,
+                market_id=market.market_id,
+            )
+            self.edge_tracker.record_fill(fill["side"], fill["price"], fv)
+
+            active = self.order_mgr.get_active(market.market_id)
+            # After a fill, cancel the FILLED/now-heavier side immediately.
+            # Keeping that side live is exactly how live diverged from dry-run:
+            # the exchange filled us, local inventory lagged, and the next quote
+            # cycle placed/kept more wrong-side exposure.
+            if fill["side"] in ("no", "down") and active.no_order_id:
+                cancelled = await self.order_mgr.executor.cancel_order(active.no_order_id)
+                if cancelled:
+                    active.no_order_id = None
+                    active.no_price = None
+                    active.no_size = 0
+                    log.debug("fill_reactive_reprice", cancelled="no",
+                              trigger_side="no", imbalance=pos.share_imbalance())
+                else:
+                    self.stop_reason = "fill_reactive_cancel_failed:no"
+                    log.error("fill_reactive_cancel_failed",
+                              side="no", market=market.market_id[:8])
+                    self._running = False
+                    return False
+            elif fill["side"] in ("yes", "up") and active.yes_order_id:
+                cancelled = await self.order_mgr.executor.cancel_order(active.yes_order_id)
+                if cancelled:
+                    active.yes_order_id = None
+                    active.yes_price = None
+                    active.yes_size = 0
+                    log.debug("fill_reactive_reprice", cancelled="yes",
+                              trigger_side="yes", imbalance=pos.share_imbalance())
+                else:
+                    self.stop_reason = "fill_reactive_cancel_failed:yes"
+                    log.error("fill_reactive_cancel_failed",
+                              side="yes", market=market.market_id[:8])
+                    self._running = False
+                    return False
+        return True
+
+    async def _sync_live_fills_before_quote(self, market: MarketInfo,
+                                            fv: float, pos) -> bool:
+        """Pull live CLOB fills before computing quotes.
+
+        This is the key live-vs-dry correction. Live fills can occur between
+        quote cycles; if we quote before ingesting them, sizing/repair mode is
+        computed from stale inventory and the bot can stack the wrong side.
+        """
+        if not hasattr(self.order_mgr.executor, 'get_fills'):
+            return True
+
+        try:
+            raw_fills = await self.order_mgr.executor.get_fills(
+                market.market_id, force=True
+            )
+            fills = self.order_mgr.executor.process_fills(
+                raw_fills,
+                self.inventory,
+                market.market_id,
+                token_id_to_side={
+                    str(market.token_id_up): "yes",
+                    str(market.token_id_down): "no",
+                },
+            )
+            if fills:
+                log.warning(
+                    "pre_quote_live_fills_synced",
+                    market=market.market_id[:8],
+                    fills=len(fills),
+                    imbalance_before=round(pos.share_imbalance(), 4),
+                )
+                return await self._handle_standardized_fills(market, fills, fv, pos)
+            return True
+        except TypeError:
+            # Compatibility with tests/older wrappers that do not accept force.
+            try:
+                raw_fills = await self.order_mgr.executor.get_fills(market.market_id)
+                fills = self.order_mgr.executor.process_fills(
+                    raw_fills,
+                    self.inventory,
+                    market.market_id,
+                    token_id_to_side={
+                        str(market.token_id_up): "yes",
+                        str(market.token_id_down): "no",
+                    },
+                )
+                return await self._handle_standardized_fills(market, fills, fv, pos)
+            except Exception as e:
+                log.error("pre_quote_live_fill_sync_error", error=str(e))
+                return False
+        except Exception as e:
+            log.error("pre_quote_live_fill_sync_error", error=str(e))
+            return False
+
     async def _quote_cycle(self, market: MarketInfo):
         """Single quote cycle iteration."""
         now = _time.time()
@@ -962,6 +1075,9 @@ class MarketCycler:
         pos.condition_id = getattr(market, "condition_id", None) or market.market_id
         pos.yes_token_id = str(getattr(market, "token_id_up", "") or "")
         pos.no_token_id = str(getattr(market, "token_id_down", "") or "")
+
+        if not await self._sync_live_fills_before_quote(market, fv, pos):
+            return
 
         if phase == "DEAD_ZONE" and pos.share_imbalance() == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
@@ -1460,16 +1576,17 @@ class MarketCycler:
             repair_mode=repair_mode,
         )
 
-        # 15. Process fills (handle both dry-run and live CLOB modes)
+        # 15. Process fills after order updates. Dry-run fills only exist here;
+        # live fills were already synced before quote generation, but this cheap
+        # post-check can still catch an immediate exchange fill without changing
+        # the shared accounting path.
         fills = []
         if hasattr(self.order_mgr.executor, 'check_fills'):
-            # Dry-run (book-based)
             fills = self.order_mgr.executor.check_fills(
                 yes_book_snapshot=book_up,
                 no_book_snapshot=book_down,
             )
         elif hasattr(self.order_mgr.executor, 'get_fills'):
-            # Live CLOB API
             try:
                 raw_fills = await self.order_mgr.executor.get_fills(market.market_id)
                 fills = self.order_mgr.executor.process_fills(
@@ -1484,63 +1601,8 @@ class MarketCycler:
             except Exception as e:
                 log.error("live_fill_check_error", error=str(e))
 
-        for fill in fills:
-            # Record in inventory
-            self.inventory.record_fill(
-                market.market_id, fill["side"],
-                fill["size"], fill["price"], self.asset
-            )
-            # Record in P&L tracker (with rebate calculation)
-            self.pnl.record_fill(
-                size=fill["size"],
-                price=fill["price"],
-                side=fill["side"],
-                asset=self.asset,
-                market_id=market.market_id,
-            )
-            self.edge_tracker.record_fill(
-                fill["side"], fill["price"], fv
-            )
-
-            # 15.1 FILL-REACTIVE REPRICING
-            # After a fill creates imbalance, immediately cancel the OPPOSITE
-            # side's stale quote so the next cycle places a fresh, competitive
-            # bid. Without this, the stale opposite-side quote sits at an
-            # unattractive price and never fills, causing one-sided inventory.
-            active = self.order_mgr.get_active(market.market_id)
-            # After a fill, immediately cancel any remaining quote on the
-            # FILLED/now-heavier side. Keep the opposite light-side quote alive
-            # because that is the order needed to repair imbalance. The previous
-            # logic cancelled the opposite side and live kept buying the heavy
-            # side — exactly the divergence Vinit observed.
-            if fill["side"] in ("no", "down") and active.no_order_id:
-                cancelled = await self.order_mgr.executor.cancel_order(active.no_order_id)
-                if cancelled:
-                    active.no_order_id = None
-                    active.no_price = None
-                    active.no_size = 0
-                    log.debug("fill_reactive_reprice", cancelled="no",
-                              trigger_side="no", imbalance=pos.share_imbalance())
-                else:
-                    self.stop_reason = "fill_reactive_cancel_failed:no"
-                    log.error("fill_reactive_cancel_failed",
-                              side="no", market=market.market_id[:8])
-                    self._running = False
-                    return
-            elif fill["side"] in ("yes", "up") and active.yes_order_id:
-                cancelled = await self.order_mgr.executor.cancel_order(active.yes_order_id)
-                if cancelled:
-                    active.yes_order_id = None
-                    active.yes_price = None
-                    active.yes_size = 0
-                    log.debug("fill_reactive_reprice", cancelled="yes",
-                              trigger_side="yes", imbalance=pos.share_imbalance())
-                else:
-                    self.stop_reason = "fill_reactive_cancel_failed:yes"
-                    log.error("fill_reactive_cancel_failed",
-                              side="yes", market=market.market_id[:8])
-                    self._running = False
-                    return
+        if fills and not await self._handle_standardized_fills(market, fills, fv, pos):
+            return
 
         # 15.5. Auto-merge check: dollar-based threshold OR low balance OR near expiry
         force_merge = False

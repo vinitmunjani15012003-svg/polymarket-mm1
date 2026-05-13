@@ -10,9 +10,11 @@ from src.execution.ctf_ops import BalanceMonitor, infer_collateral_token_for_mar
 from src.execution.dry_run import DryRunExecutor, SimulatedOrder
 from src.execution.order_manager import OrderManager
 from src.orchestration.market_cycler import (
+    MarketCycler,
     apply_dust_price_guardrails,
     compute_inventory_repair_sizes,
 )
+from src.monitoring.pnl_tracker import PnLTracker
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
 from src.strategy.inventory import InventoryManager, InventoryState
 from src.strategy.quote_engine import QuoteEngine
@@ -677,6 +679,64 @@ def test_dry_run_partial_fill_keeps_order_live():
     assert len(second_fills) == 1
     assert second_fills[0]["size"] == remaining
     assert "DRY-1" not in executor.open_orders
+
+
+def test_live_prequote_fill_sync_updates_inventory_before_quotes():
+    import asyncio
+
+    class FakeLiveExecutor:
+        def __init__(self):
+            self.cancelled = []
+            self.force_flags = []
+
+        async def get_fills(self, market_id, force=False):
+            self.force_flags.append(force)
+            return [{"id": "F1"}]
+
+        def process_fills(self, fills, inventory_mgr, market_id, token_id_to_side=None):
+            return [{
+                "order_id": "NO-1",
+                "token_id": "NO_TOKEN",
+                "side": "no",
+                "price": 0.43,
+                "size": 5,
+                "fill_time": time.time(),
+                "simulated": False,
+            }]
+
+        async def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+            return True
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.inventory = InventoryManager()
+    cycler.pnl = PnLTracker()
+    cycler.edge_tracker = FillEdgeTracker(window=10)
+    cycler._running = True
+    cycler.stop_reason = ""
+    executor = FakeLiveExecutor()
+    cycler.order_mgr = OrderManager(executor)
+
+    market = SimpleNamespace(
+        market_id="M1",
+        token_id_up="YES_TOKEN",
+        token_id_down="NO_TOKEN",
+    )
+    active = cycler.order_mgr.get_active("M1")
+    active.no_order_id = "NO-1"
+    active.no_price = 0.43
+    active.no_size = 5
+    pos = cycler.inventory.get_or_create("M1", "BTC")
+
+    ok = asyncio.run(cycler._sync_live_fills_before_quote(market, 0.40, pos))
+
+    assert ok is True
+    assert executor.force_flags == [True]
+    assert pos.no_shares == 5
+    assert pos.share_imbalance() == -5
+    assert active.no_order_id is None
+    assert executor.cancelled == ["NO-1"]
 
 
 # ---------------------------------------------------------------------------

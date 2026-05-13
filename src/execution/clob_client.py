@@ -609,18 +609,20 @@ class ClobClientWrapper:
             log.error("startup_reconciliation_error", error=str(e))
             return result
 
-    async def get_fills(self, market_id: str) -> list[dict]:
+    async def get_fills(self, market_id: str, force: bool = False) -> list[dict]:
         """Fetch recent fills for a market using TradeParams.
         
-        Throttled to max once per 2 seconds to avoid API spam.
+        Live quote decisions must not run on stale inventory. Keep this throttle
+        below the live quote interval so each cycle can see fills before placing
+        new orders; ``force`` is available for explicit pre-quote syncs.
         """
         if not self._initialized:
             return []
         
-        # Throttle: max 1 request per 2 seconds per market
+        # Throttle: max ~4 requests/sec per market unless explicitly forced.
         now = time.time()
         last_check = self._last_fill_check_ts_by_market.get(market_id, 0.0)
-        if now - last_check < 2.0:
+        if not force and now - last_check < 0.25:
             return []
         self._last_fill_check_ts_by_market[market_id] = now
         
