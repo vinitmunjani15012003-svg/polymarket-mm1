@@ -134,6 +134,27 @@ ERC20_APPROVE_ABI = [
     },
 ]
 
+ERC1155_APPROVAL_ABI = [
+    {
+        "name": "setApprovalForAll",
+        "type": "function",
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"},
+        ],
+        "outputs": [],
+    },
+    {
+        "name": "isApprovedForAll",
+        "type": "function",
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "operator", "type": "address"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+]
+
 # Standard binary partition: [1, 2] = [Up, Down]
 BINARY_PARTITION = [1, 2]
 # Zero parent collection for top-level positions
@@ -567,6 +588,13 @@ class GaslessMerger:
         "Activate Funds" prompt is an actual ERC20 approval requirement. For
         deposit wallets, that approval must be submitted as a relayer WALLET
         batch from the deposit wallet, not signed by the owner EOA directly.
+
+        Polymarket's activation flow covers both asset classes: collateral
+        allowance for BUY orders and CTF ERC1155 operator approval for outcome
+        tokens. Approving only ERC20 can still leave the account in an
+        "activation required" state in the app/API, because CLOB balance checks
+        track the full trading-approval tuple, not merely the returned USDC.e
+        balance from a merge. Annoying, but at least deterministic.
         """
         if not self._initialized:
             log.warning("deposit_wallet_approval_skipped", reason="gasless_not_initialized")
@@ -586,16 +614,30 @@ class GaslessMerger:
                 address=self._w3.to_checksum_address(collateral_token),
                 abi=ERC20_APPROVE_ABI,
             )
+            ctf = self._w3.eth.contract(
+                address=self._w3.to_checksum_address(CTF_CONTRACT),
+                abi=ERC1155_APPROVAL_ABI,
+            )
             calls = []
             for spender in dict.fromkeys([s for s in spenders if s]):
-                data = token.encode_abi(
+                spender_addr = self._w3.to_checksum_address(spender)
+                erc20_data = token.encode_abi(
                     "approve",
-                    args=[self._w3.to_checksum_address(spender), MAX_UINT256],
+                    args=[spender_addr, MAX_UINT256],
                 )
                 calls.append({
                     "target": self._w3.to_checksum_address(collateral_token),
                     "value": "0",
-                    "data": data,
+                    "data": erc20_data,
+                })
+                erc1155_data = ctf.encode_abi(
+                    "setApprovalForAll",
+                    args=[spender_addr, True],
+                )
+                calls.append({
+                    "target": self._w3.to_checksum_address(CTF_CONTRACT),
+                    "value": "0",
+                    "data": erc1155_data,
                 })
             if not calls:
                 return True
@@ -607,7 +649,8 @@ class GaslessMerger:
             log.info(
                 "deposit_wallet_trading_approvals_submitted" if ok else "deposit_wallet_trading_approvals_failed",
                 collateral=collateral_token,
-                spenders=len(calls),
+                spenders=len(spenders),
+                calls=len(calls),
                 tx=str(tx)[:16] if tx else "",
             )
             return ok
