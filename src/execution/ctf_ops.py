@@ -860,7 +860,8 @@ class BalanceMonitor:
                                gasless_merger=None,
                                ctf_ops=None,
                                pnl_tracker=None,
-                               force: bool = False) -> dict:
+                               force: bool = False,
+                               balance_sync=None) -> dict:
         """
         Check balance and auto-merge if running low.
         
@@ -1042,9 +1043,10 @@ class BalanceMonitor:
 
                     # Record profit in P&L tracker
                     if pnl_tracker:
-                        pnl_tracker.record_settlement(
-                            pair_profit, market_id
-                        )
+                        if hasattr(pnl_tracker, "record_pair_merge"):
+                            pnl_tracker.record_pair_merge(pair_profit, market_id)
+                        else:
+                            pnl_tracker.record_settlement(pair_profit, market_id)
                         pnl_tracker.record_capital_recovery(usdc_recovery)
                     pos.acknowledge_settlement()
 
@@ -1083,6 +1085,25 @@ class BalanceMonitor:
                 inventory_mgr.save_state()
 
             if total_pairs > 0:
+                if callable(balance_sync):
+                    sync_ok = False
+                    for attempt in range(1, 6):
+                        try:
+                            sync_ok = bool(await balance_sync())
+                        except Exception as e:
+                            log.warning("post_merge_balance_sync_error",
+                                        attempt=attempt, error=str(e))
+                            sync_ok = False
+                        if sync_ok:
+                            break
+                        await asyncio.sleep(min(2 * attempt, 8))
+                    if sync_ok:
+                        log.info("post_merge_balance_allowance_synced",
+                                 attempts=attempt)
+                    else:
+                        log.warning("post_merge_balance_allowance_sync_failed",
+                                    attempts=attempt)
+
                 log.info("auto_merge_complete",
                          total_pairs=total_pairs,
                          usdc_recovered=f"${total_usdc:.2f}",
@@ -1439,7 +1460,7 @@ class SimulatedBalanceMonitor:
     async def initialize(self) -> bool:
         return True
         
-    async def check_and_merge(self, inventory_mgr, gasless_merger=None, ctf_ops=None, pnl_tracker=None, force: bool = False) -> dict:
+    async def check_and_merge(self, inventory_mgr, gasless_merger=None, ctf_ops=None, pnl_tracker=None, force: bool = False, balance_sync=None) -> dict:
         result = { "checked": False, "balance": 0.0, "merged": False, "pairs_merged": 0, "usdc_recovered": 0.0 }
         if not pnl_tracker: return result
         
@@ -1479,7 +1500,10 @@ class SimulatedBalanceMonitor:
             total_usdc += usdc_recovery
             
             if pnl_tracker and pair_profit > 0:
-                pnl_tracker.record_settlement(pair_profit, market_id)
+                if hasattr(pnl_tracker, "record_pair_merge"):
+                    pnl_tracker.record_pair_merge(pair_profit, market_id)
+                else:
+                    pnl_tracker.record_settlement(pair_profit, market_id)
             if pnl_tracker:
                 pnl_tracker.record_capital_recovery(usdc_recovery)
             pos.acknowledge_settlement()

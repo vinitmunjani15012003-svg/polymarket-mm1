@@ -449,6 +449,13 @@ class MarketCycler:
                         )
 
                     if tx:
+                        sync_balance = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
+                        if callable(sync_balance):
+                            sync_ok = await sync_balance()
+                            if sync_ok:
+                                log.info("post_settle_merge_balance_allowance_synced", asset=self.asset)
+                            else:
+                                log.warning("post_settle_merge_balance_allowance_sync_failed", asset=self.asset)
                         pair_profit = pos.matched_pair_profit()
                         self.pnl.record_settlement(pair_profit, market.market_id)
                         self.pnl.record_capital_recovery(pairs * 1.0)
@@ -1211,6 +1218,7 @@ class MarketCycler:
                         ctf_ops=self.ctf,
                         pnl_tracker=self.pnl,
                         force=True,
+                        balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
                     )
                     if merge_result.get("merged"):
                         recovered = float(merge_result.get("usdc_recovered", 0) or 0)
@@ -1445,13 +1453,16 @@ class MarketCycler:
 
         # 15.5. Auto-merge check: dollar-based threshold OR low balance OR near expiry
         force_merge = False
+        merge_reason = "routine"
         if remaining <= 30 and not getattr(self, '_has_done_30s_merge', False):
             force_merge = True
+            merge_reason = "near_expiry"
             self._has_done_30s_merge = True
 
         # Dollar-based mid-market merge trigger
         if not force_merge and self.inventory.should_merge(market.market_id):
             force_merge = True
+            merge_reason = "dollar_threshold"
             log.info("dollar_threshold_merge_triggered",
                      asset=self.asset,
                      locked=f"${pos.locked_capital():.2f}",
@@ -1463,12 +1474,14 @@ class MarketCycler:
                 gasless_merger=self.gasless_merger,
                 ctf_ops=self.ctf,
                 pnl_tracker=self.pnl,
-                force=force_merge
+                force=force_merge,
+                balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
             )
             if merge_result.get("merged"):
-                msg = "auto_merge_end_of_market" if force_merge else "auto_merge_during_trading"
+                msg = "auto_merge_end_of_market" if merge_reason == "near_expiry" else "auto_merge_during_trading"
                 log.info(msg,
                          asset=self.asset,
+                         reason=merge_reason,
                          pairs=merge_result["pairs_merged"],
                          usdc=f"${merge_result['usdc_recovered']:.2f}")
                 # Update capital arbiter on recovery

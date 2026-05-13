@@ -814,3 +814,16 @@ def test_infer_collateral_token_matches_market_token_ids_by_derivation():
     )
 
     assert inferred.lower() == "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+
+
+def test_pair_merge_pnl_does_not_count_market_settled():
+    from src.monitoring.pnl_tracker import PnLTracker
+
+    pnl = PnLTracker()
+    pnl.record_pair_merge(-0.65, "MARKET1")
+
+    assert pnl.settlement_pnl == -0.65
+    assert pnl.markets_settled == 0
+
+    pnl.record_outcome_resolution(0.0, "MARKET1")
+    assert pnl.markets_settled == 1

@@ -207,6 +207,19 @@ class PnLTracker:
             income = edge * matched_pairs
             self.spread_income += income
 
+    def record_pair_merge(self, pnl: float, market_id: str = ""):
+        """Record matched-pair/merge P&L without counting the market settled.
+
+        A mid-market merge only converts matched YES+NO inventory back to
+        collateral. The market is still active, so target-window accounting must
+        not advance here.
+        """
+        self.settlement_pnl += pnl
+        log.info("pnl_pair_merge",
+                 market=market_id[:8] if market_id else "",
+                 pnl=round(pnl, 4),
+                 total=round(self.settlement_pnl, 4))
+
     def record_settlement(self, pnl: float, market_id: str = ""):
         self.settlement_pnl += pnl
         if market_id:
