@@ -27,6 +27,15 @@ CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 DEFAULT_COLLATERAL_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 USDC_E_COLLATERAL_TOKEN = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
+# Official Polymarket trading contracts that may require collateral allowance.
+# Older py-clob-client builds still use the first pair; current docs list the
+# V2 pair. Approving both avoids the UI's "Activate Funds" prompt after merged
+# USDC.e returns to a deposit wallet.
+CLOB_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+NEG_RISK_CLOB_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+CTF_EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
+NEG_RISK_CTF_EXCHANGE_V2 = "0xe2222d279d744050d28e00520010520000310F59"
+MAX_UINT256 = 2**256 - 1
 
 # Minimal ABIs for the CTF operations we need
 CTF_ABI = [
@@ -547,6 +556,169 @@ class GaslessMerger:
             await self._wait_for_relayer_finality(tx_id)
         return tx_id or response
 
+    async def ensure_deposit_wallet_trading_approvals(
+        self,
+        collateral_token: str = USDC_E_COLLATERAL_TOKEN,
+        spenders: list[str] | None = None,
+    ) -> bool:
+        """Approve Polymarket trading contracts from the deposit wallet.
+
+        `update_balance_allowance` only refreshes CLOB's indexed view. The UI's
+        "Activate Funds" prompt is an actual ERC20 approval requirement. For
+        deposit wallets, that approval must be submitted as a relayer WALLET
+        batch from the deposit wallet, not signed by the owner EOA directly.
+        """
+        if not self._initialized:
+            log.warning("deposit_wallet_approval_skipped", reason="gasless_not_initialized")
+            return False
+        if self._signature_type != 3 or not self._funder:
+            return True
+
+        spenders = spenders or [
+            CLOB_EXCHANGE,
+            NEG_RISK_CLOB_EXCHANGE,
+            CTF_EXCHANGE_V2,
+            NEG_RISK_CTF_EXCHANGE_V2,
+        ]
+
+        try:
+            token = self._w3.eth.contract(
+                address=self._w3.to_checksum_address(collateral_token),
+                abi=ERC20_APPROVE_ABI,
+            )
+            calls = []
+            for spender in dict.fromkeys([s for s in spenders if s]):
+                data = token.encode_abi(
+                    "approve",
+                    args=[self._w3.to_checksum_address(spender), MAX_UINT256],
+                )
+                calls.append({
+                    "target": self._w3.to_checksum_address(collateral_token),
+                    "value": "0",
+                    "data": data,
+                })
+            if not calls:
+                return True
+            tx = await self._execute_deposit_wallet_batch(
+                calls,
+                metadata="Activate Trading Funds",
+            )
+            ok = bool(tx)
+            log.info(
+                "deposit_wallet_trading_approvals_submitted" if ok else "deposit_wallet_trading_approvals_failed",
+                collateral=collateral_token,
+                spenders=len(calls),
+                tx=str(tx)[:16] if tx else "",
+            )
+            return ok
+        except Exception as e:
+            log.error("deposit_wallet_trading_approval_error", error=str(e))
+            return False
+
+    async def _execute_deposit_wallet_batch(self, calls: list[dict], metadata: str = ""):
+        """Submit an arbitrary deposit-wallet batch through the relayer."""
+        import requests
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+
+        signer = Account.from_key(self._private_key)
+        from_address = signer.address
+        wallet = self._w3.to_checksum_address(self._funder)
+        deadline = str(int(time.time()) + 300)
+
+        def _get_json(path: str, params: dict | None = None):
+            resp = requests.get(f"{self._relayer_url}{path}", params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+
+        nonce_payload = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _get_json("/nonce", {"address": from_address, "type": "WALLET"}),
+        )
+        nonce = str(nonce_payload.get("nonce"))
+        if not nonce or nonce == "None":
+            raise RuntimeError(f"invalid deposit wallet nonce payload: {nonce_payload}")
+
+        normalized_calls = [
+            {
+                "target": self._w3.to_checksum_address(call["target"]),
+                "value": str(call.get("value", "0")),
+                "data": call["data"],
+            }
+            for call in calls
+        ]
+        domain = {
+            "name": "DepositWallet",
+            "version": "1",
+            "chainId": self._chain_id,
+            "verifyingContract": wallet,
+        }
+        types = {
+            "Call": [
+                {"name": "target", "type": "address"},
+                {"name": "value", "type": "uint256"},
+                {"name": "data", "type": "bytes"},
+            ],
+            "Batch": [
+                {"name": "wallet", "type": "address"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"},
+                {"name": "calls", "type": "Call[]"},
+            ],
+        }
+        message = {
+            "wallet": wallet,
+            "nonce": int(nonce),
+            "deadline": int(deadline),
+            "calls": normalized_calls,
+        }
+        signable = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
+        signature = Account.sign_message(signable, self._private_key).signature.hex()
+        if not signature.startswith("0x"):
+            signature = "0x" + signature
+
+        payload = {
+            "type": "WALLET",
+            "from": from_address,
+            "to": self.DEPOSIT_WALLET_FACTORY,
+            "nonce": nonce,
+            "signature": signature,
+            "depositWalletParams": {
+                "depositWallet": wallet,
+                "deadline": deadline,
+                "calls": normalized_calls,
+            },
+        }
+        if metadata:
+            payload["metadata"] = metadata
+
+        body = json.dumps(payload, separators=(",", ":"))
+        headers = self._relayer_auth_headers(body)
+
+        def _post():
+            resp = requests.post(
+                f"{self._relayer_url}/submit",
+                headers=headers,
+                data=body,
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"deposit wallet relayer batch failed {resp.status_code}: {resp.text[:300]}")
+            return resp.json()
+
+        response = await asyncio.get_event_loop().run_in_executor(None, _post)
+        tx_id = response.get("transactionID") or response.get("transactionId")
+        log.info(
+            "deposit_wallet_batch_submitted",
+            wallet=wallet,
+            tx_id=tx_id,
+            state=response.get("state"),
+            calls=len(normalized_calls),
+        )
+        if tx_id:
+            await self._wait_for_relayer_finality(tx_id)
+        return tx_id or response
+
     async def _execute_proxy_wallet_call(self, target: str, data: str, metadata: str = ""):
         """Submit one gasless call through Polymarket's PROXY relayer flow."""
         import requests
@@ -964,6 +1136,7 @@ class BalanceMonitor:
         try:
             total_pairs = 0
             total_usdc = 0.0
+            merged_collaterals: set[str] = set()
 
             eligible_markets = 0
             for market_id, pos in inventory_mgr.positions.items():
@@ -1125,6 +1298,7 @@ class BalanceMonitor:
                     pos.yes_total_cost = max(0, pos.yes_total_cost)
                     pos.no_total_cost = max(0, pos.no_total_cost)
 
+                    merged_collaterals.add(collateral_token)
                     self._total_merged_usdc += usdc_recovery
                     self._total_merges += 1
 
@@ -1147,6 +1321,12 @@ class BalanceMonitor:
                 inventory_mgr.save_state()
 
             if total_pairs > 0:
+                if gasless_merger and getattr(gasless_merger, "_signature_type", 0) == 3:
+                    for merged_collateral in sorted(merged_collaterals or {self._collateral_token}):
+                        await gasless_merger.ensure_deposit_wallet_trading_approvals(
+                            collateral_token=merged_collateral,
+                        )
+
                 if callable(balance_sync):
                     sync_ok = False
                     for attempt in range(1, 6):

@@ -875,3 +875,44 @@ def test_repair_price_cap_uses_worst_opposite_cost_across_requested_size():
     pos.add_fill("yes", 0.70, 5)
 
     assert pos.max_profitable_repair_price("no", 10, min_edge=0.01) == 0.29
+
+
+def test_deposit_wallet_activation_builds_erc20_approval_batch():
+    from src.execution.ctf_ops import GaslessMerger, USDC_E_COLLATERAL_TOKEN, CLOB_EXCHANGE
+    from web3 import Web3
+    import asyncio
+
+    captured = {}
+
+    async def fake_batch(calls, metadata=""):
+        captured["calls"] = calls
+        captured["metadata"] = metadata
+        return "tx-approval"
+
+    merger = GaslessMerger(
+        private_key="0x" + "11" * 32,
+        funder="0x" + "22" * 20,
+        signature_type=3,
+        builder_api_key="k",
+        builder_secret="s",
+        builder_passphrase="p",
+    )
+    merger._w3 = Web3()
+    merger._initialized = True
+    merger._execute_deposit_wallet_batch = fake_batch
+
+    assert asyncio.run(merger.ensure_deposit_wallet_trading_approvals()) is True
+    assert captured["metadata"] == "Activate Trading Funds"
+    assert len(captured["calls"]) >= 4
+    assert all(call["target"].lower() == USDC_E_COLLATERAL_TOKEN.lower() for call in captured["calls"])
+    approval = merger._w3.eth.contract(address=USDC_E_COLLATERAL_TOKEN, abi=[{
+        "name": "approve",
+        "type": "function",
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+    }])
+    decoded = approval.decode_function_input(captured["calls"][0]["data"])[1]
+    assert decoded["spender"].lower() == CLOB_EXCHANGE.lower()

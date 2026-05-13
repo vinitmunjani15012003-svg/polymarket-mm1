@@ -240,6 +240,12 @@ async def run_bot(
         if gasless_ok:
             log.info("gasless_merger_ready",
                      msg="Will use gasless relayer for merge operations")
+            if config.credentials.signature_type == 3:
+                approval_ok = await gasless_merger.ensure_deposit_wallet_trading_approvals()
+                if approval_ok:
+                    await executor.sync_balance_allowance()
+                else:
+                    log.warning("startup_deposit_wallet_activation_not_confirmed")
         else:
             log.warning("gasless_merger_unavailable",
                         msg="Will fall back to on-chain merge (requires POL for gas)")

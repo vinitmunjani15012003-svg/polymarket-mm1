@@ -449,6 +449,10 @@ class MarketCycler:
                         )
 
                     if tx:
+                        if self.gasless_merger and getattr(self.gasless_merger, "_signature_type", 0) == 3:
+                            await self.gasless_merger.ensure_deposit_wallet_trading_approvals(
+                                collateral_token=collateral_token,
+                            )
                         sync_balance = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
                         if callable(sync_balance):
                             sync_ok = await sync_balance()
