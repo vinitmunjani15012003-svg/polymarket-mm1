@@ -877,6 +877,45 @@ def test_repair_price_cap_uses_worst_opposite_cost_across_requested_size():
     assert pos.max_profitable_repair_price("no", 10, min_edge=0.01) == 0.29
 
 
+def test_repair_price_cap_relaxes_for_wrong_way_no_tail():
+    from src.strategy.inventory import InventoryPosition
+    from src.orchestration.market_cycler import repair_price_cap
+
+    pos = InventoryPosition("M1", "BTC")
+    pos.add_fill("no", 0.55, 10)
+
+    cap, reason = repair_price_cap(pos, "yes", 10, fair_value=0.72, min_edge=0.01)
+
+    assert reason == "adverse_no_tail"
+    assert cap == 0.70
+
+
+def test_repair_price_cap_keeps_pair_edge_when_tail_is_not_wrong_way():
+    from src.strategy.inventory import InventoryPosition
+    from src.orchestration.market_cycler import repair_price_cap
+
+    pos = InventoryPosition("M1", "BTC")
+    pos.add_fill("no", 0.55, 10)
+
+    cap, reason = repair_price_cap(pos, "yes", 10, fair_value=0.42, min_edge=0.01)
+
+    assert reason == "pair_edge"
+    assert cap == 0.44
+
+
+def test_repair_price_cap_relaxes_for_wrong_way_yes_tail():
+    from src.strategy.inventory import InventoryPosition
+    from src.orchestration.market_cycler import repair_price_cap
+
+    pos = InventoryPosition("M1", "BTC")
+    pos.add_fill("yes", 0.58, 10)
+
+    cap, reason = repair_price_cap(pos, "no", 10, fair_value=0.28, min_edge=0.01)
+
+    assert reason == "adverse_yes_tail"
+    assert cap == 0.70
+
+
 def test_deposit_wallet_activation_builds_full_trading_approval_batch():
     from src.execution.ctf_ops import GaslessMerger, USDC_E_COLLATERAL_TOKEN, CLOB_EXCHANGE, CTF_CONTRACT
     from web3 import Web3

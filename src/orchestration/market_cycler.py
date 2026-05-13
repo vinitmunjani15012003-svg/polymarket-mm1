@@ -203,6 +203,41 @@ def apply_dust_price_guardrails(quotes, mode: str,
     return quotes
 
 
+def repair_price_cap(pos, side: str, size: float, fair_value: float,
+                     min_edge: float = 0.01,
+                     adverse_buffer: float = 0.02) -> tuple[float, str]:
+    """Return the maximum sane repair bid and why it was chosen.
+
+    The old repair cap only allowed guaranteed-profitable pairs:
+    ``new_side_price <= 1 - existing_side_price - edge``. That is correct in a
+    calm market, but disastrous during a directional spike. If BTC rips up and
+    we are heavy NO, refusing to buy YES above the profitable-pair cap leaves a
+    naked wrong-way NO tail that can expire worthless and erase many previous
+    good pairs.
+
+    In wrong-way inventory, the rational cap is not the profitable-pair cap; it
+    is the expected value of the hedge side. Buying YES below FV when we are
+    heavy NO reduces expected loss even if the resulting pair has negative
+    realized edge. Same symmetric logic for heavy YES while FV collapses.
+    """
+    side = (side or "").lower()
+    fv = max(0.01, min(0.99, float(fair_value or 0.5)))
+    profitable_cap = float(pos.max_profitable_repair_price(side, size, min_edge=min_edge))
+
+    # Buying YES repairs heavy NO. If FV is above 50%, NO is the wrong-way tail;
+    # cap repair by YES expected value instead of insisting on guaranteed edge.
+    if side in ("yes", "up") and pos.share_imbalance() < 0 and fv > 0.50:
+        risk_cap = max(0.0, fv - float(adverse_buffer or 0))
+        return max(profitable_cap, risk_cap), "adverse_no_tail"
+
+    # Buying NO repairs heavy YES. If FV is below 50%, YES is the wrong-way tail.
+    if side in ("no", "down") and pos.share_imbalance() > 0 and fv < 0.50:
+        risk_cap = max(0.0, (1.0 - fv) - float(adverse_buffer or 0))
+        return max(profitable_cap, risk_cap), "adverse_yes_tail"
+
+    return profitable_cap, "pair_edge"
+
+
 class MarketCycler:
     """
     Runs the quote loop for a single asset's 15-minute markets.
@@ -1187,6 +1222,22 @@ class MarketCycler:
             best_ask_no=best_ask_no,
         )
 
+        # Directional spike guard: do not run normal two-sided rebate quoting
+        # when the binary is already strongly directional. In these states the
+        # cheap/out-of-favor side gets filled first and becomes exactly the
+        # wrong-way tail Vinit saw during BTC spikes. If we already have a tail,
+        # close-only repair can still run; flat/normal quoting must stand down.
+        if repair_mode == "normal" and (fv >= 0.65 or fv <= 0.35):
+            log.warning(
+                "normal_quote_blocked_directional_extreme",
+                asset=self.asset,
+                fair_value=round(fv, 4),
+                yes_size=quotes.yes_buy_size,
+                no_size=quotes.no_buy_size,
+            )
+            quotes.yes_buy_size = 0
+            quotes.no_buy_size = 0
+
         # 12.5 Capital guardrail (prevents negative capital in dry-run and
         # keeps live sizing within available funds).
         # Conservative: assume both sides could fill immediately.
@@ -1347,32 +1398,37 @@ class MarketCycler:
                 repair_mode = "repair_up"
 
         # Pair-cost guardrail for close-only repair. Existing unmatched fills are
-        # sunk, but buying the opposite side above 1 - existing_fill_price locks
-        # in a guaranteed negative merge. Cap repair bids to preserve at least a
-        # 1c edge on newly formed pairs; otherwise wait instead of paying stupid.
+        # sunk. In calm markets, cap repair bids to preserve at least a 1c edge
+        # on newly formed pairs. In directional wrong-way inventory, relax that
+        # cap up to the hedge side's expected value so the bot can reduce loss
+        # instead of holding a naked tail to expiry.
         if repair_mode == "repair_up" and quotes.yes_buy_size > 0:
-            cap = pos.max_profitable_repair_price("yes", quotes.yes_buy_size, min_edge=0.01)
+            cap, cap_reason = repair_price_cap(pos, "yes", quotes.yes_buy_size, fv, min_edge=0.01)
             if cap < 0.01:
                 log.warning("repair_quote_blocked_negative_pair_edge",
                             market=market.market_id[:8], side="yes",
-                            quoted=quotes.yes_buy_price, cap=round(cap, 4))
+                            quoted=quotes.yes_buy_price, cap=round(cap, 4),
+                            cap_reason=cap_reason)
                 quotes.yes_buy_size = 0
             elif quotes.yes_buy_price and quotes.yes_buy_price > cap:
                 log.warning("repair_quote_capped_for_pair_edge",
                             market=market.market_id[:8], side="yes",
-                            quoted=quotes.yes_buy_price, cap=round(cap, 4))
+                            quoted=quotes.yes_buy_price, cap=round(cap, 4),
+                            cap_reason=cap_reason)
                 quotes.yes_buy_price = round(cap, 2)
         elif repair_mode == "repair_down" and quotes.no_buy_size > 0:
-            cap = pos.max_profitable_repair_price("no", quotes.no_buy_size, min_edge=0.01)
+            cap, cap_reason = repair_price_cap(pos, "no", quotes.no_buy_size, fv, min_edge=0.01)
             if cap < 0.01:
                 log.warning("repair_quote_blocked_negative_pair_edge",
                             market=market.market_id[:8], side="no",
-                            quoted=quotes.no_buy_price, cap=round(cap, 4))
+                            quoted=quotes.no_buy_price, cap=round(cap, 4),
+                            cap_reason=cap_reason)
                 quotes.no_buy_size = 0
             elif quotes.no_buy_price and quotes.no_buy_price > cap:
                 log.warning("repair_quote_capped_for_pair_edge",
                             market=market.market_id[:8], side="no",
-                            quoted=quotes.no_buy_price, cap=round(cap, 4))
+                            quoted=quotes.no_buy_price, cap=round(cap, 4),
+                            cap_reason=cap_reason)
                 quotes.no_buy_price = round(cap, 2)
         quotes.combined_cost = round(float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0), 4)
         quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
