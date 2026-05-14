@@ -459,21 +459,22 @@ def test_repair_quote_reprices_when_dangerously_stale():
     assert executor.place_batches[0][0]["price"] == 0.50
 
 
-def test_dust_normalization_quotes_down_tail_to_ten_each():
+def test_sub_minimum_down_tail_quotes_light_side_only():
     # Current inventory: DOWN=3, UP=0 -> imbalance=-3.
-    # Quote DOWN 7 and UP 10 so, if both fill, totals become 10/10.
+    # Do not top up the already-heavy DOWN side; overshoot with the minimum
+    # valid UP repair order instead. Queue priority beats cute dust arithmetic.
     up_size, down_size, mode = compute_inventory_repair_sizes(
         imbalance=-3,
         min_order_size=5,
         max_order_size=5,
     )
 
-    assert mode == "dust_down"
-    assert up_size == 10
-    assert down_size == 7
+    assert mode == "repair_up"
+    assert up_size == 5
+    assert down_size == 0
 
 
-def test_dust_normalization_quotes_up_tail_to_ten_each():
+def test_sub_minimum_up_tail_quotes_light_side_only():
     # Current inventory: UP=3, DOWN=0 -> imbalance=+3.
     up_size, down_size, mode = compute_inventory_repair_sizes(
         imbalance=3,
@@ -481,9 +482,9 @@ def test_dust_normalization_quotes_up_tail_to_ten_each():
         max_order_size=5,
     )
 
-    assert mode == "dust_up"
-    assert up_size == 7
-    assert down_size == 10
+    assert mode == "repair_down"
+    assert up_size == 0
+    assert down_size == 5
 
 
 def test_normal_repair_remains_close_only_for_live_sized_tail():

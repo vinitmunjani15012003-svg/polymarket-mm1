@@ -127,14 +127,13 @@ def compute_inventory_repair_sizes(imbalance: float,
                                    max_order_size: int) -> tuple[int, int, str]:
     """Return (up_size, down_size, mode) for guarded repair quoting.
 
-    Normal repair quotes only the light side. But a sub-minimum tail cannot be
-    repaired directly on Polymarket because live orders must be at least
-    min_order_size shares. For those dust tails, quote a small paired plan:
-    top up the heavy/dust side to a 5-share multiple and quote the opposite side
-    to the same resulting target.
+    Repair quotes only the light side. A sub-minimum tail cannot be repaired
+    exactly on Polymarket because live orders must be at least min_order_size
+    shares, so quote the light side at the minimum valid order size. That may
+    overshoot by a few shares, but it never tops up the already-heavy side.
 
-    Example: Down 3 / Up 0 => imbalance=-3. Quote Down 7 and Up 10, so if both
-    fill the book becomes Down 10 / Up 10 instead of carrying unrecoverable dust.
+    Example: Down 3 / Up 0 => imbalance=-3. Quote Up 5 only; do not quote more
+    Down just to make the arithmetic pretty. Pretty arithmetic leaks money.
     """
     min_order_size = max(1, int(min_order_size or 1))
     max_order_size = max(min_order_size, int(max_order_size or min_order_size))
