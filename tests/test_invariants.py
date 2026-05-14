@@ -976,6 +976,23 @@ def test_negative_matched_pair_edge_halts_market_making():
     assert has_negative_matched_pair_edge(pos) is True
 
 
+def test_inventory_persists_fifo_pair_edge_state():
+    from src.strategy.inventory import InventoryPosition
+
+    pos = InventoryPosition("M1", "BTC")
+    pos.add_fill("no", 0.56, 10)
+    pos.add_fill("yes", 0.41, 5)
+
+    restored = InventoryPosition.from_dict(pos.to_dict())
+
+    assert restored.matched_pairs() == 5
+    assert restored.matched_pair_profit() == pytest.approx(0.15)
+    assert restored.avg_matched_pair_cost() == 0.97
+    # The remaining 5 NO @ 0.56 must survive restart; otherwise repair cap
+    # falls back to 0.99 and the live bot can buy guaranteed-loss YES repairs.
+    assert restored.max_profitable_repair_price("yes", 5, min_edge=0.02) == 0.42
+
+
 def test_repair_price_cap_keeps_pair_edge_when_tail_is_not_wrong_way():
     from src.strategy.inventory import InventoryPosition
     from src.orchestration.market_cycler import repair_price_cap

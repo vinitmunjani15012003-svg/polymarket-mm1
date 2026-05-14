@@ -1418,6 +1418,11 @@ class MarketCycler:
                 bm_merge_at = float(getattr(self.balance_monitor, "merge_balance", 0) or 0)
                 bm_min_pairs = int(getattr(self.balance_monitor, "min_merge_pairs", 1) or 1)
                 matched_pairs = int(pos.matched_pairs())
+                if bm_balance > 0:
+                    # In live mode the wallet balance is the hard spend limit;
+                    # current_capital is local accounting and can be optimistic
+                    # after restart or missed reconciliation.
+                    avail = min(avail, bm_balance)
                 balance_pressure = (bm_balance <= bm_merge_at) or (avail <= 0) or (avail < planned)
                 if balance_pressure and matched_pairs >= bm_min_pairs:
                     log.info(
@@ -1559,10 +1564,8 @@ class MarketCycler:
                 repair_mode = "repair_up"
 
         # Pair-cost guardrail for close-only repair. Existing unmatched fills are
-        # sunk. In calm markets, cap repair bids to preserve at least a 1c edge
-        # on newly formed pairs. In directional wrong-way inventory, relax that
-        # cap up to the hedge side's expected value so the bot can reduce loss
-        # instead of holding a naked tail to expiry.
+        # sunk, but the bot must not manufacture guaranteed-loss pairs. Cap
+        # repair bids to preserve MIN_LIVE_PAIR_EDGE on newly formed FIFO pairs.
         if repair_mode == "repair_up" and quotes.yes_buy_size > 0:
             cap, cap_reason = repair_price_cap(pos, "yes", quotes.yes_buy_size, fv, min_edge=MIN_LIVE_PAIR_EDGE)
             if cap < 0.01:
@@ -1773,6 +1776,10 @@ class MarketCycler:
             "down_avg": 0,
             "share_imbalance": 0,
             "dollar_delta": 0,
+            "matched_pairs": 0,
+            "avg_pair_cost": 0,
+            "matched_pair_pnl": 0,
+            "negative_pair_edge": False,
             "inv_state": "WAITING",
             "net_trading_pnl": self.pnl.net_trading_pnl,
             "est_rebates": self.pnl.est_rebates,
@@ -1847,6 +1854,10 @@ class MarketCycler:
             "down_avg": real_pos.no_avg_entry,
             "share_imbalance": real_pos.share_imbalance(),
             "dollar_delta": real_pos.dollar_delta(fv) if fv else 0,
+            "matched_pairs": real_pos.matched_pairs(),
+            "avg_pair_cost": real_pos.avg_matched_pair_cost(),
+            "matched_pair_pnl": real_pos.matched_pair_profit(),
+            "negative_pair_edge": has_negative_matched_pair_edge(real_pos),
             "inv_state": real_state.value,
             # P&L with rebates
             "net_trading_pnl": self.pnl.net_trading_pnl,

@@ -70,6 +70,11 @@ class InventoryPosition:
             "no_total_cost": self.no_total_cost,
             "yes_fill_count": self.yes_fill_count,
             "no_fill_count": self.no_fill_count,
+            "yes_fills": [fill.__dict__ for fill in self._yes_fills],
+            "no_fills": [fill.__dict__ for fill in self._no_fills],
+            "realized_pair_pnl": self._realized_pair_pnl,
+            "realized_pairs": self._realized_pairs,
+            "settled_pair_pnl": self._settled_pair_pnl,
             "condition_id": getattr(self, "condition_id", ""),
             "yes_token_id": getattr(self, "yes_token_id", ""),
             "no_token_id": getattr(self, "no_token_id", ""),
@@ -87,6 +92,11 @@ class InventoryPosition:
             yes_fill_count=data.get("yes_fill_count", 0),
             no_fill_count=data.get("no_fill_count", 0)
         )
+        pos._yes_fills = [FillEntry(**f) for f in data.get("yes_fills", []) if isinstance(f, dict)]
+        pos._no_fills = [FillEntry(**f) for f in data.get("no_fills", []) if isinstance(f, dict)]
+        pos._realized_pair_pnl = float(data.get("realized_pair_pnl", 0.0) or 0.0)
+        pos._realized_pairs = float(data.get("realized_pairs", 0.0) or 0.0)
+        pos._settled_pair_pnl = float(data.get("settled_pair_pnl", 0.0) or 0.0)
         pos.condition_id = data.get("condition_id", "")
         pos.yes_token_id = str(data.get("yes_token_id", "") or "")
         pos.no_token_id = str(data.get("no_token_id", "") or "")
@@ -197,6 +207,12 @@ class InventoryPosition:
             NEW: sum of per-pair (1.0 - (yes_fill_price + no_fill_price))
         """
         return self._realized_pair_pnl - self._settled_pair_pnl
+
+    def avg_matched_pair_cost(self) -> float:
+        """Average FIFO cost of matched pairs, or 0 if none are matched."""
+        if self._realized_pairs <= 0:
+            return 0.0
+        return round(1.0 - (self._realized_pair_pnl / self._realized_pairs), 4)
 
     def acknowledge_settlement(self):
         """Mark current realized pair P&L as settled.

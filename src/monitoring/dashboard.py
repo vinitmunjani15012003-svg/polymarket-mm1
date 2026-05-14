@@ -121,13 +121,18 @@ class Dashboard:
 
         # Share imbalance (the metric that drives rebalancing)
         imb = s.get("share_imbalance", 0) or 0
-        pairs = min(up_shares, down_shares)
+        pairs = s.get("matched_pairs", min(up_shares, down_shares)) or 0
+        pair_pnl = s.get("matched_pair_pnl", pairs * edge) or 0
+        avg_pair_cost = s.get("avg_pair_cost", 0) or 0
         ic = "green" if abs(imb) < 30 else ("yellow" if abs(imb) < 75 else "red")
         imb_label = f"+{imb:.0f} Up" if imb > 0 else (f"{imb:.0f} Down" if imb < 0 else "Balanced")
         table.add_row("Share Imbalance", f"[{ic}]{imb_label}[/]",
                        "Inv State", s.get("inv_state", "NORMAL"))
-        table.add_row("Matched Pairs", f"[green]{pairs:.0f}[/]",
-                       "Pair Profit", f"[green]${pairs * edge:.4f}[/]")
+        pair_color = "green" if pair_pnl >= 0 and avg_pair_cost < 1.0 else "red"
+        table.add_row("Matched Pairs", f"[{pair_color}]{pairs:.0f}[/]",
+                       "Avg Pair Cost", f"[{pair_color}]${avg_pair_cost:.4f}[/]")
+        table.add_row("Matched Pair P&L", f"[{pair_color}]${pair_pnl:.4f}[/]",
+                       "Pair Edge Alert", "[red bold]NEGATIVE[/]" if s.get("negative_pair_edge") else "OK")
 
         # P&L Section
         tc = "green" if net_trade >= 0 else "red"
