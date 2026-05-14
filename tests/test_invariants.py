@@ -17,6 +17,7 @@ from src.orchestration.market_cycler import (
     has_negative_matched_pair_edge,
 )
 from src.monitoring.pnl_tracker import PnLTracker
+from src.risk.risk_engine import pre_trade_checks
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
 from src.strategy.inventory import InventoryManager, InventoryState
 from src.strategy.quote_engine import MAX_COMBINED_COST, QuoteEngine
@@ -527,6 +528,20 @@ def test_quote_invariant_combined_cost_below_one():
     assert quotes.yes_buy_price is not None
     assert quotes.no_buy_price is not None
     assert quotes.combined_cost <= MAX_COMBINED_COST
+
+
+def test_pre_trade_rejects_thin_two_sided_edge():
+    quotes = SimpleNamespace(
+        yes_buy_price=0.50,
+        no_buy_price=0.49,
+        yes_buy_size=5,
+        no_buy_size=5,
+    )
+
+    passed, reasons = pre_trade_checks(0.5, quotes, "NORMAL", True, "ACTIVE")
+
+    assert passed is False
+    assert "insufficient_edge_combined_cost_gt_max" in reasons
 
 
 def test_quote_direction_guard_prevents_flat_inventory_price_inversion():
