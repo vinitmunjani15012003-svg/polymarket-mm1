@@ -640,6 +640,8 @@ class ClobClientWrapper:
             return fills
         except Exception as e:
             log.error("get_fills_error", error=str(e))
+            if force:
+                raise
             return []
 
     def process_fills(self, fills: list[dict], inventory_mgr,

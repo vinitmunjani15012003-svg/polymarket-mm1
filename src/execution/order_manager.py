@@ -61,6 +61,7 @@ class OrderManager:
         # the order we need filled and leaves one-sided inventory into expiry.
         self.repair_reprice_threshold = max(0.05, reprice_threshold)
         self.repair_min_update_interval = max(10.0, min_update_interval)
+        self.last_order_error: Optional[str] = None
         # Active quotes per market
         self.active: dict[str, ActiveQuotes] = {}
 
@@ -84,6 +85,7 @@ class OrderManager:
         """
         active = self.get_active(market_id)
         updated = False
+        self.last_order_error = None
 
         # Allow per-side book snapshots (preferred). Fall back to shared
         # book_snapshot for legacy callers.
@@ -96,9 +98,11 @@ class OrderManager:
         # open orders, and batch/fill paths can leave extras outside ActiveQuotes.
         # Before each quote update, cancel any locally-known extra order on this
         # market's tokens so live behavior stays one-order-per-side like dry-run.
-        await self._cancel_stray_live_orders(
+        if not await self._cancel_stray_live_orders(
             market_id, token_id_yes, token_id_no, active
-        )
+        ):
+            self.last_order_error = "stray_live_order_cancel_failed"
+            return False
 
         # In repair modes, only the LIGHT side may be quoted. Enforce this at the
         # order manager too so upstream sizing bugs cannot keep buying the heavy
@@ -171,6 +175,7 @@ class OrderManager:
                 log.error("quote_cancel_failed_halt_reprice",
                           market=market_id[:8],
                           order_ids=[oid[:8] for oid in cancel_ids])
+                self.last_order_error = "quote_cancel_failed_halt_reprice"
                 return False
             if cancel_yes:
                 active.yes_order_id = None
@@ -248,11 +253,11 @@ class OrderManager:
         return updated
 
     async def _cancel_stray_live_orders(self, market_id: str, token_id_yes: str,
-                                        token_id_no: str, active: ActiveQuotes):
+                                        token_id_no: str, active: ActiveQuotes) -> bool:
         """Cancel locally-known live orders for this market not in ActiveQuotes."""
         open_orders = getattr(self.executor, "open_orders", None)
         if not isinstance(open_orders, dict):
-            return
+            return True
 
         tracked = {oid for oid in (active.yes_order_id, active.no_order_id) if oid}
         token_ids = {str(token_id_yes), str(token_id_no)}
@@ -264,7 +269,7 @@ class OrderManager:
                 stray_ids.append(oid)
 
         if not stray_ids:
-            return
+            return True
 
         log.warning(
             "stray_live_orders_cancelled_before_quote",
@@ -272,11 +277,19 @@ class OrderManager:
             count=len(stray_ids),
             order_ids=[oid[:8] for oid in stray_ids[:8]],
         )
+        ok = True
         if hasattr(self.executor, "cancel_orders"):
-            await self.executor.cancel_orders(stray_ids)
+            ok = bool(await self.executor.cancel_orders(stray_ids))
         else:
             for oid in stray_ids:
-                await self.executor.cancel_order(oid)
+                ok = bool(await self.executor.cancel_order(oid)) and ok
+        if not ok:
+            log.error(
+                "stray_live_order_cancel_failed",
+                market=market_id[:8],
+                order_ids=[oid[:8] for oid in stray_ids[:8]],
+            )
+        return ok
 
     async def cancel_side_quotes(self, market_id: str, side: str, token_id: str):
         """Cancel all known quotes for one side/token of a market."""
@@ -346,10 +359,15 @@ class OrderManager:
         else:
             log.error("cancel_market_quotes_failed", market=market_id[:8])
 
-    async def cancel_all(self):
+    async def cancel_all(self) -> bool:
         """Cancel all orders across all markets."""
-        await self.executor.cancel_all()
-        self.active.clear()
+        ok = bool(await self.executor.cancel_all())
+        if ok:
+            self.active.clear()
+        else:
+            log.error("cancel_all_failed_active_preserved")
+            self.last_order_error = "cancel_all_failed"
+        return ok
 
     async def _place_buy(self, token_id: str, price: float,
                           size: float, side: str,

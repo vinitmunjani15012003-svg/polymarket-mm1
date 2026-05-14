@@ -367,7 +367,7 @@ async def run_bot(
     def portfolio_pnl_getter() -> float:
         total = 0.0
         for c in cyclers:
-            total += c.pnl.net_pnl
+            total += c.pnl.economic_pnl
             if c.current_market and c.last_fair_value is not None:
                 pos = c.inventory.positions.get(c.current_market.market_id)
                 if pos:

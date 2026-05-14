@@ -1364,6 +1364,7 @@ class BalanceMonitor:
                 inventory_mgr.save_state()
 
             if total_pairs > 0:
+                self._last_balance = balance + total_usdc
                 if gasless_merger and getattr(gasless_merger, "_signature_type", 0) == 3:
                     for merged_collateral in sorted(merged_collaterals or {self._collateral_token}):
                         await gasless_merger.ensure_deposit_wallet_trading_approvals(
@@ -1784,7 +1785,7 @@ class SimulatedBalanceMonitor:
             total_pairs += pairs
             total_usdc += usdc_recovery
             
-            if pnl_tracker and pair_profit > 0:
+            if pnl_tracker:
                 if hasattr(pnl_tracker, "record_pair_merge"):
                     pnl_tracker.record_pair_merge(pair_profit, market_id)
                 else:
@@ -1812,6 +1813,7 @@ class SimulatedBalanceMonitor:
         result["usdc_recovered"] = total_usdc
         
         if total_pairs > 0:
+            self._last_balance += total_usdc
             self._merge_message = f"Merged {total_pairs} pairs | +${total_usdc:.2f} [{latency_sec}s lat]"
             log.info("simulated_auto_merge", pairs=total_pairs, usdc=total_usdc, latency=latency_sec)
             

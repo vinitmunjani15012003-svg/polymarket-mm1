@@ -6,7 +6,7 @@ from src.config import AssetConfig, BotConfig
 import time
 
 from src.execution.clob_client import ClobClientWrapper
-from src.execution.ctf_ops import BalanceMonitor, infer_collateral_token_for_market
+from src.execution.ctf_ops import BalanceMonitor, SimulatedBalanceMonitor, infer_collateral_token_for_market
 from src.execution.dry_run import DryRunExecutor, SimulatedOrder
 from src.execution.order_manager import OrderManager
 from src.orchestration.market_cycler import (
@@ -26,6 +26,7 @@ from src.strategy.quote_engine import MAX_COMBINED_COST, QuoteEngine
 class DummyExecutor:
     def __init__(self):
         self.calls = []
+        self.cancel_all_ok = True
 
     async def place_buy_order(self, token_id, price, size, side="yes", book_snapshot=None):
         self.calls.append((token_id, price, size, side))
@@ -35,7 +36,7 @@ class DummyExecutor:
         return True
 
     async def cancel_all(self):
-        return True
+        return self.cancel_all_ok
 
 
 class DummyBatchExecutor(DummyExecutor):
@@ -318,6 +319,54 @@ def test_order_manager_does_not_clear_or_replace_when_cancel_batch_fails():
     assert active.yes_order_id == "OLD-YES"
     assert active.yes_price == 0.40
     assert active.yes_size == 5
+    assert om.last_order_error == "quote_cancel_failed_halt_reprice"
+
+
+def test_order_manager_fails_closed_when_stray_cancel_fails():
+    executor = DummyBatchExecutor()
+    executor.cancel_ok = False
+    executor.open_orders = {
+        "STRAY-YES": {"token_id": "YES1", "price": 0.44, "size": 5},
+    }
+    om = OrderManager(executor)
+    quotes = SimpleNamespace(
+        yes_buy_price=0.45,
+        no_buy_price=None,
+        yes_buy_size=5,
+        no_buy_size=0,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+        )
+    )
+
+    assert updated is False
+    assert executor.cancel_batches == [["STRAY-YES"]]
+    assert executor.place_batches == []
+    assert om.last_order_error == "stray_live_order_cancel_failed"
+
+
+def test_order_manager_cancel_all_preserves_active_on_failure():
+    executor = DummyExecutor()
+    executor.cancel_all_ok = False
+    om = OrderManager(executor)
+    active = om.get_active("MARKET1")
+    active.yes_order_id = "OLD-YES"
+
+    import asyncio
+
+    ok = asyncio.run(om.cancel_all())
+
+    assert ok is False
+    assert om.get_active("MARKET1").yes_order_id == "OLD-YES"
+    assert om.last_order_error == "cancel_all_failed"
 
 
 def test_order_manager_throttles_non_urgent_bid_improvements():
@@ -653,6 +702,25 @@ def test_outcome_pnl_is_reported_separately_from_merge_pnl():
     assert snap.outcome_pnl == 3.0
     assert snap.net_pnl_with_rebates == 10.5
     assert snap.economic_pnl == 13.5
+
+
+def test_simulated_auto_merge_records_negative_pair_pnl():
+    import asyncio
+
+    inv = InventoryManager()
+    inv.record_fill("MARKET1", "yes", 5, 0.57)
+    inv.record_fill("MARKET1", "no", 5, 0.46)
+    pnl = PnLTracker()
+    pnl.current_capital = 0.0
+    monitor = SimulatedBalanceMonitor(min_merge_pairs=1)
+
+    result = asyncio.run(
+        monitor.check_and_merge(inv, pnl_tracker=pnl, force=True)
+    )
+
+    assert result["merged"] is True
+    assert pnl.net_trading_pnl == pytest.approx(-0.15)
+    assert pnl.current_capital == pytest.approx(5.0)
 
 
 def test_toxicity_monitor_respects_conservative_thresholds():

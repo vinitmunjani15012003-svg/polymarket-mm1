@@ -950,6 +950,11 @@ class MarketCycler:
                 market_id=market.market_id,
             )
             self.edge_tracker.record_fill(fill["side"], fill["price"], fv)
+            toxicity_monitor = getattr(self, "toxicity_monitor", None)
+            if toxicity_monitor:
+                toxicity_monitor.record_fill(
+                    fill["side"], fill["price"], fill["size"], fv
+                )
 
             active = self.order_mgr.get_active(market.market_id)
             # After a fill, cancel the FILLED/now-heavier side immediately.
@@ -1326,7 +1331,10 @@ class MarketCycler:
                     up_shares=round(pos.yes_shares, 4),
                     down_shares=round(pos.no_shares, 4),
                 )
-                await self.order_mgr.cancel_all()
+                if not await self.order_mgr.cancel_all():
+                    self.stop_reason = "repair_entry_cancel_all_failed"
+                    self._running = False
+                    return
                 self._last_close_only_repair_mode = repair_mode
 
             # Every repair cycle, explicitly cancel the heavy-side token. This is
@@ -1658,6 +1666,10 @@ class MarketCycler:
             no_book_snapshot=book_down,
             repair_mode=repair_mode,
         )
+        if getattr(self.order_mgr, "last_order_error", None):
+            self.stop_reason = f"order_update_failed:{self.order_mgr.last_order_error}"
+            self._running = False
+            return
 
         # 15. Process fills after order updates. Dry-run fills only exist here;
         # live fills were already synced before quote generation, but this cheap
@@ -1683,6 +1695,9 @@ class MarketCycler:
                 )
             except Exception as e:
                 log.error("live_fill_check_error", error=str(e))
+                self.stop_reason = "live_fill_check_error"
+                self._running = False
+                return
 
         if fills and not await self._handle_standardized_fills(market, fills, fv, pos):
             return
@@ -1781,8 +1796,10 @@ class MarketCycler:
             "negative_pair_edge": False,
             "inv_state": "WAITING",
             "net_trading_pnl": self.pnl.net_trading_pnl,
+            "outcome_pnl": self.pnl.outcome_pnl,
             "est_rebates": self.pnl.est_rebates,
             "net_pnl": self.pnl.net_pnl,
+            "economic_pnl": self.pnl.economic_pnl,
             "rebates_per_hour": self.pnl.rebates_per_hour(),
             "total_volume": self.pnl.total_volume,
             "total_shares": self.pnl.total_shares,
@@ -1858,10 +1875,12 @@ class MarketCycler:
             "matched_pair_pnl": real_pos.matched_pair_profit(),
             "negative_pair_edge": has_negative_matched_pair_edge(real_pos),
             "inv_state": real_state.value,
-            # P&L with rebates
+            # P&L with rebates and outcomes
             "net_trading_pnl": self.pnl.net_trading_pnl,
+            "outcome_pnl": self.pnl.outcome_pnl,
             "est_rebates": self.pnl.est_rebates,
             "net_pnl": self.pnl.net_pnl,
+            "economic_pnl": self.pnl.economic_pnl,
             "rebates_per_hour": self.pnl.rebates_per_hour(),
             "total_volume": self.pnl.total_volume,
             "total_shares": self.pnl.total_shares,

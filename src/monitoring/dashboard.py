@@ -86,8 +86,9 @@ class Dashboard:
 
         # P&L / rebates
         net_trade = s.get("net_trading_pnl", 0) or 0
+        outcome_pnl = s.get("outcome_pnl", 0) or 0
         est_rebates = s.get("est_rebates", 0) or 0
-        net_total = s.get("net_pnl", 0) or 0
+        net_total = s.get("economic_pnl", s.get("net_pnl", 0)) or 0
         rebates_hr = s.get("rebates_per_hour", 0) or 0
         total_volume = s.get("total_volume", 0) or 0
         total_shares = s.get("total_shares", 0) or 0
@@ -144,10 +145,14 @@ class Dashboard:
         table.add_row("Est. Rebates", f"[{rc}]${est_rebates:.4f}[/]",
                        "Rebates/Hour", f"[{rc}]${rebates_hr:.4f}[/]")
 
-        # Net total
-        nc = "green" if net_total >= 0 else "red"
-        table.add_row("[bold]Net P&L (w/ Rebates)[/]", f"[bold {nc}]${net_total:.4f}[/]",
+        oc = "green" if outcome_pnl >= 0 else "red"
+        table.add_row("Outcome P&L", f"[{oc}]${outcome_pnl:.4f}[/]",
                        "Total Fills", str(s.get("total_fills", 0)))
+
+        # Economic total includes matched-pair/merge, outcome, and rebates.
+        nc = "green" if net_total >= 0 else "red"
+        table.add_row("[bold]Economic P&L[/]", f"[bold {nc}]${net_total:.4f}[/]",
+                       "", "")
 
         table.add_row("Total Volume", f"${total_volume:.2f}",
                        "Total Shares", f"{total_shares:.0f}")
@@ -217,7 +222,7 @@ class Dashboard:
             down_size = s.get("down_size", 0) or 0
             fills = s.get("total_fills", 0) or 0
             rebates = s.get("est_rebates", 0) or 0
-            net = s.get("net_pnl", 0) or 0
+            net = s.get("economic_pnl", s.get("net_pnl", 0)) or 0
 
             rc = "green" if rebates > 0 else "dim"
             nc = "green" if net >= 0 else "red"
