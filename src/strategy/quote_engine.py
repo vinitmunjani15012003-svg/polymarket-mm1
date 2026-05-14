@@ -24,6 +24,7 @@ log = get_logger("quote_engine")
 
 # Polymarket tick size for crypto binary markets
 TICK_SIZE = 0.01
+MAX_COMBINED_COST = 0.98
 
 
 @dataclass
@@ -249,15 +250,17 @@ class QuoteEngine:
         yes_buy = max(0.01, yes_buy)
         no_buy = max(0.01, no_buy)
 
-        # 8. CRITICAL: combined cost must be < $1.00
+        # 8. CRITICAL: combined cost must be safely < $1.00
+        # Live fills/rounding made 0.99 too thin; one tick of slop became
+        # pair-cost >= 1. Use a 2c edge target for normal two-sided quotes.
         #    Symmetric enforcement: drop the HEAVY side (not always YES)
         yes_buy = round(yes_buy, 2)
         no_buy = round(no_buy, 2)
 
         combined = yes_buy + no_buy
 
-        if combined >= 1.0:
-            overshoot = combined - 0.99
+        if combined > MAX_COMBINED_COST:
+            overshoot = combined - MAX_COMBINED_COST
             cents_to_drop = max(1, round(overshoot * 100))
             if imb_ratio > 0:
                 # YES is heavy → drop YES price (preserve NO for fill attraction)

@@ -32,6 +32,12 @@ from src.monitoring.logger import get_logger
 
 log = get_logger("market_cycler")
 
+# Live repair must leave a real buffer. One cent was too thin after tick
+# rounding, CLOB/API price normalization, and partial fill sequencing; live
+# pairs repeatedly landed at/above 1.00. Two cents is still tight, but stops the
+# bot from recycling capital into guaranteed-loss pairs.
+MIN_LIVE_PAIR_EDGE = 0.02
+
 
 class UpDownFairValue:
     """
@@ -248,6 +254,19 @@ def aggressive_repair_price(current_price: float | None,
     if target <= price:
         return round(price, 2)
     return round(target, 2)
+
+
+def has_negative_matched_pair_edge(pos, tolerance: float = 0.005) -> bool:
+    """True when FIFO-matched pairs have locked in negative edge.
+
+    This is a circuit breaker, not a quoting input. A pair-matching maker whose
+    matched pairs are already negative is no longer market-making; it is paying
+    to recycle volume. Stop the market instead of compounding.
+    """
+    try:
+        return float(pos.matched_pairs() or 0) > 0 and float(pos.matched_pair_profit()) < -float(tolerance)
+    except Exception:
+        return False
 
 
 class MarketCycler:
@@ -1091,6 +1110,20 @@ class MarketCycler:
         if not await self._sync_live_fills_before_quote(market, fv, pos):
             return
 
+        if has_negative_matched_pair_edge(pos):
+            log.critical(
+                "negative_pair_edge_halt",
+                asset=self.asset,
+                market=market.market_id[:8],
+                matched_pairs=round(pos.matched_pairs(), 4),
+                pair_pnl=round(pos.matched_pair_profit(), 4),
+                msg="Matched pair cost exceeded 1; stopping this market instead of compounding loss",
+            )
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self.stop_reason = "negative_pair_edge_halt"
+            self._running = False
+            return
+
         if phase == "DEAD_ZONE" and pos.share_imbalance() == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, phase, remaining)
@@ -1531,7 +1564,7 @@ class MarketCycler:
         # cap up to the hedge side's expected value so the bot can reduce loss
         # instead of holding a naked tail to expiry.
         if repair_mode == "repair_up" and quotes.yes_buy_size > 0:
-            cap, cap_reason = repair_price_cap(pos, "yes", quotes.yes_buy_size, fv, min_edge=0.01)
+            cap, cap_reason = repair_price_cap(pos, "yes", quotes.yes_buy_size, fv, min_edge=MIN_LIVE_PAIR_EDGE)
             if cap < 0.01:
                 log.warning("repair_quote_blocked_negative_pair_edge",
                             market=market.market_id[:8], side="yes",
@@ -1563,7 +1596,7 @@ class MarketCycler:
                                     cap_reason=cap_reason)
                     quotes.yes_buy_price = new_price
         elif repair_mode == "repair_down" and quotes.no_buy_size > 0:
-            cap, cap_reason = repair_price_cap(pos, "no", quotes.no_buy_size, fv, min_edge=0.01)
+            cap, cap_reason = repair_price_cap(pos, "no", quotes.no_buy_size, fv, min_edge=MIN_LIVE_PAIR_EDGE)
             if cap < 0.01:
                 log.warning("repair_quote_blocked_negative_pair_edge",
                             market=market.market_id[:8], side="no",
@@ -1650,6 +1683,19 @@ class MarketCycler:
                 log.error("live_fill_check_error", error=str(e))
 
         if fills and not await self._handle_standardized_fills(market, fills, fv, pos):
+            return
+        if fills and has_negative_matched_pair_edge(pos):
+            log.critical(
+                "negative_pair_edge_halt",
+                asset=self.asset,
+                market=market.market_id[:8],
+                matched_pairs=round(pos.matched_pairs(), 4),
+                pair_pnl=round(pos.matched_pair_profit(), 4),
+                msg="Matched pair cost exceeded 1 after fill; stopping this market",
+            )
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self.stop_reason = "negative_pair_edge_halt"
+            self._running = False
             return
 
         # 15.5. Auto-merge check: dollar-based threshold OR low balance OR near expiry

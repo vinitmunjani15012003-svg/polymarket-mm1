@@ -14,11 +14,12 @@ from src.orchestration.market_cycler import (
     aggressive_repair_price,
     apply_dust_price_guardrails,
     compute_inventory_repair_sizes,
+    has_negative_matched_pair_edge,
 )
 from src.monitoring.pnl_tracker import PnLTracker
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
 from src.strategy.inventory import InventoryManager, InventoryState
-from src.strategy.quote_engine import QuoteEngine
+from src.strategy.quote_engine import MAX_COMBINED_COST, QuoteEngine
 
 
 class DummyExecutor:
@@ -525,7 +526,7 @@ def test_quote_invariant_combined_cost_below_one():
     )
     assert quotes.yes_buy_price is not None
     assert quotes.no_buy_price is not None
-    assert quotes.yes_buy_price + quotes.no_buy_price < 1.0
+    assert quotes.combined_cost <= MAX_COMBINED_COST
 
 
 def test_quote_direction_guard_prevents_flat_inventory_price_inversion():
@@ -546,7 +547,7 @@ def test_quote_direction_guard_prevents_flat_inventory_price_inversion():
     )
 
     assert quotes.yes_buy_price <= quotes.no_buy_price
-    assert quotes.combined_cost < 1.0
+    assert quotes.combined_cost <= MAX_COMBINED_COST
 
 
 def test_quote_direction_guard_allows_inventory_repair_inversion():
@@ -567,7 +568,7 @@ def test_quote_direction_guard_allows_inventory_repair_inversion():
     )
 
     assert quotes.yes_buy_price > quotes.no_buy_price
-    assert quotes.combined_cost < 1.0
+    assert quotes.combined_cost <= MAX_COMBINED_COST
 
 
 def test_emergency_inventory_behavior():
@@ -949,6 +950,30 @@ def test_repair_price_cap_does_not_relax_for_wrong_way_no_tail():
 
     assert reason == "pair_edge"
     assert cap == 0.44
+
+
+def test_live_repair_edge_buffer_is_two_cents():
+    from src.strategy.inventory import InventoryPosition
+    from src.orchestration.market_cycler import MIN_LIVE_PAIR_EDGE, repair_price_cap
+
+    pos = InventoryPosition("M1", "BTC")
+    pos.add_fill("no", 0.56, 10)
+
+    cap, reason = repair_price_cap(pos, "yes", 10, fair_value=0.72, min_edge=MIN_LIVE_PAIR_EDGE)
+
+    assert reason == "pair_edge"
+    assert cap == 0.42
+
+
+def test_negative_matched_pair_edge_halts_market_making():
+    from src.strategy.inventory import InventoryPosition
+
+    pos = InventoryPosition("M1", "BTC")
+    pos.add_fill("yes", 0.57, 5)
+    pos.add_fill("no", 0.46, 5)
+
+    assert pos.matched_pair_profit() < 0
+    assert has_negative_matched_pair_edge(pos) is True
 
 
 def test_repair_price_cap_keeps_pair_edge_when_tail_is_not_wrong_way():
