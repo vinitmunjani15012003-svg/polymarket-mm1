@@ -938,7 +938,7 @@ def test_repair_price_cap_uses_worst_opposite_cost_across_requested_size():
     assert pos.max_profitable_repair_price("no", 10, min_edge=0.01) == 0.29
 
 
-def test_repair_price_cap_relaxes_for_wrong_way_no_tail():
+def test_repair_price_cap_does_not_relax_for_wrong_way_no_tail():
     from src.strategy.inventory import InventoryPosition
     from src.orchestration.market_cycler import repair_price_cap
 
@@ -947,8 +947,8 @@ def test_repair_price_cap_relaxes_for_wrong_way_no_tail():
 
     cap, reason = repair_price_cap(pos, "yes", 10, fair_value=0.72, min_edge=0.01)
 
-    assert reason == "adverse_no_tail"
-    assert cap == 0.70
+    assert reason == "pair_edge"
+    assert cap == 0.44
 
 
 def test_repair_price_cap_keeps_pair_edge_when_tail_is_not_wrong_way():
@@ -964,7 +964,7 @@ def test_repair_price_cap_keeps_pair_edge_when_tail_is_not_wrong_way():
     assert cap == 0.44
 
 
-def test_repair_price_cap_relaxes_for_wrong_way_yes_tail():
+def test_repair_price_cap_does_not_relax_for_wrong_way_yes_tail():
     from src.strategy.inventory import InventoryPosition
     from src.orchestration.market_cycler import repair_price_cap
 
@@ -973,8 +973,8 @@ def test_repair_price_cap_relaxes_for_wrong_way_yes_tail():
 
     cap, reason = repair_price_cap(pos, "no", 10, fair_value=0.28, min_edge=0.01)
 
-    assert reason == "adverse_yes_tail"
-    assert cap == 0.70
+    assert reason == "pair_edge"
+    assert cap == 0.41
 
 
 def test_aggressive_repair_price_joins_best_post_only_price_under_cap():

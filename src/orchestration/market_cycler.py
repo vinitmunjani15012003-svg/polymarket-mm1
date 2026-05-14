@@ -206,35 +206,17 @@ def apply_dust_price_guardrails(quotes, mode: str,
 def repair_price_cap(pos, side: str, size: float, fair_value: float,
                      min_edge: float = 0.01,
                      adverse_buffer: float = 0.02) -> tuple[float, str]:
-    """Return the maximum sane repair bid and why it was chosen.
+    """Return the max repair bid that preserves positive pair edge.
 
-    The old repair cap only allowed guaranteed-profitable pairs:
-    ``new_side_price <= 1 - existing_side_price - edge``. That is correct in a
-    calm market, but disastrous during a directional spike. If BTC rips up and
-    we are heavy NO, refusing to buy YES above the profitable-pair cap leaves a
-    naked wrong-way NO tail that can expire worthless and erase many previous
-    good pairs.
-
-    In wrong-way inventory, the rational cap is not the profitable-pair cap; it
-    is the expected value of the hedge side. Buying YES below FV when we are
-    heavy NO reduces expected loss even if the resulting pair has negative
-    realized edge. Same symmetric logic for heavy YES while FV collapses.
+    Repair mode must not manufacture guaranteed-loss pairs. Earlier live
+    hardening allowed a wrong-way tail to be hedged up to expected value; that
+    reduced naked inventory but created the exact failure Vinit observed: pair
+    average cost > 1. For this strategy, if the missing side cannot be bought
+    under ``1 - opposite_fill_price - min_edge``, we wait/cancel instead of
+    buying a locked-in loser.
     """
     side = (side or "").lower()
-    fv = max(0.01, min(0.99, float(fair_value or 0.5)))
     profitable_cap = float(pos.max_profitable_repair_price(side, size, min_edge=min_edge))
-
-    # Buying YES repairs heavy NO. If FV is above 50%, NO is the wrong-way tail;
-    # cap repair by YES expected value instead of insisting on guaranteed edge.
-    if side in ("yes", "up") and pos.share_imbalance() < 0 and fv > 0.50:
-        risk_cap = max(0.0, fv - float(adverse_buffer or 0))
-        return max(profitable_cap, risk_cap), "adverse_no_tail"
-
-    # Buying NO repairs heavy YES. If FV is below 50%, YES is the wrong-way tail.
-    if side in ("no", "down") and pos.share_imbalance() > 0 and fv < 0.50:
-        risk_cap = max(0.0, (1.0 - fv) - float(adverse_buffer or 0))
-        return max(profitable_cap, risk_cap), "adverse_yes_tail"
-
     return profitable_cap, "pair_edge"
 
 
