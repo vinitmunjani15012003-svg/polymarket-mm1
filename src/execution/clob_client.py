@@ -704,17 +704,19 @@ class ClobClientWrapper:
                     )
                     continue
 
-            # Live safety: if we cannot tie the fill to an order we placed in
-            # this process, do not book it into inventory. Startup reconciliation
-            # is currently best-effort on this SDK, so guessing is dangerous.
+            # Prefer local maker order context, but do not ignore a current
+            # market fill solely because the SDK omitted/renamed the order id or
+            # local state lost context after a cancel/reprice. That stale-local
+            # behavior is worse: the bot thinks it is flat and resumes two-sided
+            # quoting after a real one-sided live fill. If the token id maps to
+            # the current market below, book the fill with a warning.
             order_ctx = self._order_context(order_id)
             if not order_ctx:
                 log.warning(
-                    "skip_fill_without_order_context",
+                    "fill_without_order_context_token_fallback",
                     market=market_id[:12],
                     order_id=str(order_id)[:12],
                 )
-                continue
 
             # Hard safety cap: never book more filled size than the remaining
             # open order context we placed locally.
