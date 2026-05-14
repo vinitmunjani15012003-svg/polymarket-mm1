@@ -11,6 +11,7 @@ from src.execution.dry_run import DryRunExecutor, SimulatedOrder
 from src.execution.order_manager import OrderManager
 from src.orchestration.market_cycler import (
     MarketCycler,
+    aggressive_repair_price,
     apply_dust_price_guardrails,
     compute_inventory_repair_sizes,
 )
@@ -974,6 +975,27 @@ def test_repair_price_cap_relaxes_for_wrong_way_yes_tail():
 
     assert reason == "adverse_yes_tail"
     assert cap == 0.70
+
+
+def test_aggressive_repair_price_joins_best_post_only_price_under_cap():
+    # If we can complete a profitable repair up to 0.54 and the ask is 0.53,
+    # quote 0.52, not the stale model price 0.47. Waiting 5c below market is
+    # how live carried a naked tail into expiry. Very expensive politeness.
+    assert aggressive_repair_price(
+        current_price=0.47,
+        cap=0.54,
+        best_ask=0.53,
+        best_bid=0.48,
+    ) == 0.52
+
+
+def test_aggressive_repair_price_never_exceeds_cap():
+    assert aggressive_repair_price(
+        current_price=0.47,
+        cap=0.49,
+        best_ask=0.53,
+        best_bid=0.48,
+    ) == 0.49
 
 
 def test_deposit_wallet_activation_builds_full_trading_approval_batch():

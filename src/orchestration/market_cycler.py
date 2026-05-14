@@ -238,6 +238,36 @@ def repair_price_cap(pos, side: str, size: float, fair_value: float,
     return profitable_cap, "pair_edge"
 
 
+def aggressive_repair_price(current_price: float | None,
+                            cap: float,
+                            best_ask: Optional[float] = None,
+                            best_bid: Optional[float] = None) -> float | None:
+    """Move repair bids as high as safely possible without crossing.
+
+    Repair mode is not normal rebate farming. If we can complete a pair with
+    combined cost < 1, sitting 5c below the market is just choosing to keep the
+    naked tail. For post-only orders, the most aggressive safe bid is one tick
+    below best ask, capped by the pair/risk cap.
+    """
+    if cap < 0.01:
+        return None
+
+    price = float(current_price or 0.01)
+    target = float(cap)
+
+    if best_ask is not None and float(best_ask or 0) > 0:
+        target = min(target, float(best_ask) - 0.01)
+    if best_bid is not None and float(best_bid or 0) > 0:
+        # At least join the best bid when cap allows. This preserves queue
+        # competitiveness if the book is wide or best_ask is unavailable.
+        target = max(target, min(float(best_bid), float(cap)))
+
+    target = max(0.01, min(0.99, target))
+    if target <= price:
+        return round(price, 2)
+    return round(target, 2)
+
+
 class MarketCycler:
     """
     Runs the quote loop for a single asset's 15-minute markets.
@@ -1526,12 +1556,30 @@ class MarketCycler:
                             quoted=quotes.yes_buy_price, cap=round(cap, 4),
                             cap_reason=cap_reason)
                 quotes.yes_buy_size = 0
-            elif quotes.yes_buy_price and quotes.yes_buy_price > cap:
-                log.warning("repair_quote_capped_for_pair_edge",
-                            market=market.market_id[:8], side="yes",
-                            quoted=quotes.yes_buy_price, cap=round(cap, 4),
-                            cap_reason=cap_reason)
-                quotes.yes_buy_price = round(cap, 2)
+            else:
+                old_price = quotes.yes_buy_price
+                new_price = aggressive_repair_price(
+                    quotes.yes_buy_price,
+                    cap,
+                    best_ask=best_ask_yes,
+                    best_bid=best_bid_yes,
+                )
+                if new_price is None:
+                    quotes.yes_buy_size = 0
+                elif old_price and old_price > cap:
+                    log.warning("repair_quote_capped_for_pair_edge",
+                                market=market.market_id[:8], side="yes",
+                                quoted=old_price, cap=round(cap, 4),
+                                cap_reason=cap_reason)
+                    quotes.yes_buy_price = new_price
+                else:
+                    if new_price > float(old_price or 0):
+                        log.warning("repair_quote_aggressed_to_cap",
+                                    market=market.market_id[:8], side="yes",
+                                    old=old_price, new=new_price,
+                                    cap=round(cap, 4), best_ask=best_ask_yes,
+                                    cap_reason=cap_reason)
+                    quotes.yes_buy_price = new_price
         elif repair_mode == "repair_down" and quotes.no_buy_size > 0:
             cap, cap_reason = repair_price_cap(pos, "no", quotes.no_buy_size, fv, min_edge=0.01)
             if cap < 0.01:
@@ -1540,12 +1588,30 @@ class MarketCycler:
                             quoted=quotes.no_buy_price, cap=round(cap, 4),
                             cap_reason=cap_reason)
                 quotes.no_buy_size = 0
-            elif quotes.no_buy_price and quotes.no_buy_price > cap:
-                log.warning("repair_quote_capped_for_pair_edge",
-                            market=market.market_id[:8], side="no",
-                            quoted=quotes.no_buy_price, cap=round(cap, 4),
-                            cap_reason=cap_reason)
-                quotes.no_buy_price = round(cap, 2)
+            else:
+                old_price = quotes.no_buy_price
+                new_price = aggressive_repair_price(
+                    quotes.no_buy_price,
+                    cap,
+                    best_ask=best_ask_no,
+                    best_bid=best_bid_no,
+                )
+                if new_price is None:
+                    quotes.no_buy_size = 0
+                elif old_price and old_price > cap:
+                    log.warning("repair_quote_capped_for_pair_edge",
+                                market=market.market_id[:8], side="no",
+                                quoted=old_price, cap=round(cap, 4),
+                                cap_reason=cap_reason)
+                    quotes.no_buy_price = new_price
+                else:
+                    if new_price > float(old_price or 0):
+                        log.warning("repair_quote_aggressed_to_cap",
+                                    market=market.market_id[:8], side="no",
+                                    old=old_price, new=new_price,
+                                    cap=round(cap, 4), best_ask=best_ask_no,
+                                    cap_reason=cap_reason)
+                    quotes.no_buy_price = new_price
         quotes.combined_cost = round(float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0), 4)
         quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
 
