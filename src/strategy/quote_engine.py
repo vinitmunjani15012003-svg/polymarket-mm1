@@ -165,9 +165,11 @@ class QuoteEngine:
         # 4. Compute buy prices with ASYMMETRIC spread
         #    Light side (needs fills) gets tighter spread
         #    Heavy side (too much inventory) gets wider spread
-        if abs(imb_ratio) > 0.15:
-            # Scale: at imb_ratio=1.0, light gets 40% tighter, heavy 40% wider
-            tighten = min(0.4, abs(imb_ratio) * 0.4)
+        if abs(imb_ratio) > 0.10:
+            # Scale: at imb_ratio=1.0, light gets 60% tighter, heavy 60% wider
+            # More aggressive than before (was 40%) to attract light-side fills
+            # faster and prevent wrong-side pile-ups.
+            tighten = min(0.6, abs(imb_ratio) * 0.6)
             light_spread = half_spread * (1.0 - tighten)
             heavy_spread = half_spread * (1.0 + tighten)
         else:
@@ -269,10 +271,10 @@ class QuoteEngine:
                 # NO is heavy → drop NO price (preserve YES for fill attraction)
                 no_buy -= cents_to_drop * 0.01
             else:
-                # Balanced → split the drop evenly
-                yes_buy -= 0.01
-                if yes_buy + no_buy >= 1.0:
-                    no_buy -= 0.01
+                # Balanced → split the drop proportionally
+                half_drop = max(1, cents_to_drop // 2)
+                yes_buy -= half_drop * 0.01
+                no_buy -= (cents_to_drop - half_drop) * 0.01
 
         yes_buy = max(0.01, yes_buy)
         no_buy = max(0.01, no_buy)

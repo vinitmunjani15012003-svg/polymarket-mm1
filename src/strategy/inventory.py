@@ -337,7 +337,8 @@ class InventoryManager:
     Features:
       - Continuous exponential size decay (no blunt tier jumps)
       - Time-aware dynamic thresholds
-      - Fill-rate asymmetry detection for predictive skew
+      - Fill-rate asymmetry detection for predictive skew (reinforcement only)
+      - Imbalance velocity tracking for runaway pile-up detection
       - Dollar-based auto-merge trigger
       - Capital arbiter integration for cross-asset coordination
     """
@@ -363,6 +364,10 @@ class InventoryManager:
         self.state_manager = None
         self.capital_arbiter = None  # Optional cross-asset coordinator
         self.fill_tracker = FillRateTracker(window_seconds=120)
+        # Imbalance velocity: track last N imbalance observations to detect
+        # runaway pile-ups. If imbalance is growing monotonically in the same
+        # direction, escalate to emergency sizing before hitting threshold.
+        self._imbalance_history: deque = deque(maxlen=8)
 
     def set_state_manager(self, state_manager):
         self.state_manager = state_manager
@@ -461,8 +466,9 @@ class InventoryManager:
         
         Replaces the old blunt 4-tier system with smooth scaling:
         - Heavy side decays exponentially as imbalance grows
-        - Light side gets a proportional boost
-        - Fill-rate asymmetry provides predictive skew
+        - Light side gets a modest boost (capped at 1.3x to prevent ping-pong)
+        - Fill-rate asymmetry can REINFORCE but NEVER FLIP inventory signal
+        - Imbalance velocity escalation for runaway pile-ups
         - Time-aware: taper new positions as expiry approaches
         
         Uses share_imbalance (Up - Down) not dollar delta.
@@ -476,8 +482,11 @@ class InventoryManager:
         imbalance = pos.share_imbalance()  # positive = too many Up
         abs_imbalance = abs(imbalance)
 
+        # Track imbalance velocity for runaway detection
+        self._imbalance_history.append(imbalance)
+
         # Use dynamic thresholds
-        _, _, emerg = self._dynamic_thresholds(t_normalized)
+        soft, hard, emerg = self._dynamic_thresholds(t_normalized)
 
         # Hard emergency behavior: stop heavy side entirely, keep light side at
         # base_size (no boosts). This is relied on by invariants/tests.
@@ -488,35 +497,68 @@ class InventoryManager:
                 return base_size, 0
             return 0, 0
 
+        # Runaway imbalance detection: if imbalance has been growing in the
+        # same direction for 4+ consecutive observations, escalate to
+        # emergency-level sizing immediately. This catches pile-ups before
+        # they reach the emergency threshold.
+        runaway = self._detect_runaway_imbalance()
+        if runaway and abs_imbalance >= soft * 0.5:
+            log.warning("runaway_imbalance_detected",
+                        market=market_id[:8],
+                        imbalance=round(imbalance, 2),
+                        velocity_observations=len(self._imbalance_history),
+                        msg="Escalating to emergency sizing")
+            if imbalance > 0:
+                return 0, base_size
+            else:
+                return base_size, 0
+
         # --- Continuous exponential decay ---
         # k controls how aggressively we cut the heavy side
         # At emergency threshold → ~5% of base size
         k = 3.0 / max(1.0, emerg)
         heavy_factor = math.exp(-k * abs_imbalance)
 
-        # Light side gets a boost proportional to imbalance (up to 2x)
-        light_boost = min(2.0, 1.0 + abs_imbalance / max(1.0, self.soft_limit) * 0.5)
+        # Light side gets a MODEST boost (capped at 1.3x, not 2x).
+        # Aggressive light-side boosts cause ping-pong: the light side fills
+        # faster than expected, creating a new imbalance in the other direction.
+        light_boost = min(1.3, 1.0 + abs_imbalance / max(1.0, soft) * 0.3)
 
-        # --- Fill-rate asymmetry: predictive adjustment ---
-        # Blend fill asymmetry with inventory imbalance (more aggressive in last 5 min)
+        # --- Fill-rate asymmetry: REINFORCEMENT ONLY ---
+        # Fill asymmetry can AMPLIFY the inventory signal (cut heavy side
+        # faster when it's filling faster too), but NEVER FLIP IT.
+        # The old code blended fill_asym with inv_signal and could produce
+        # a combined_signal that pointed the opposite direction from
+        # inventory, causing the bot to boost the already-heavy side.
         fill_asym = self.fill_tracker.asymmetry_factor()
         if t_normalized < 0.33:
-            # Last ~5 minutes: fill asymmetry is 2x more aggressive
-            fill_weight = 0.4
+            fill_weight = 0.3
         else:
-            fill_weight = 0.2
+            fill_weight = 0.15
 
-        # Combine: positive combined_signal means too many Up / too many Up fills
+        # Inventory signal is always the PRIMARY direction.
         inv_signal = imbalance / max(1.0, self.max_imbalance)
-        combined_signal = inv_signal * (1 - fill_weight) + fill_asym * fill_weight
 
-        if combined_signal > 0:
-            # Too many Up (or Up filling faster) → reduce Up, boost Down
+        # Only apply fill asymmetry if it agrees with inventory direction.
+        # If inventory says "too many Up" (positive) and fills say "Up filling
+        # faster" (positive), amplify the heavy-side cut.
+        # If they disagree, ignore fill asymmetry entirely.
+        if inv_signal != 0 and fill_asym != 0:
+            same_direction = (inv_signal > 0) == (fill_asym > 0)
+            if same_direction:
+                # Reinforce: cut heavy side even faster
+                amplifier = 1.0 + abs(fill_asym) * fill_weight
+                heavy_factor *= max(0.1, 1.0 / amplifier)
+            # If opposite direction: ignore fill asymmetry (don't amplify)
+
+        # Use inventory direction only (never let fills flip sizing)
+        if imbalance > 0:
+            # Too many Up → reduce Up, boost Down
             yes_size = max(0, int(base_size * heavy_factor))
-            no_size = min(base_size * 2, int(base_size * light_boost))
-        elif combined_signal < 0:
-            # Too many Down (or Down filling faster) → reduce Down, boost Up
-            yes_size = min(base_size * 2, int(base_size * light_boost))
+            no_size = min(int(base_size * 1.3), int(base_size * light_boost))
+        elif imbalance < 0:
+            # Too many Down → reduce Down, boost Up
+            yes_size = min(int(base_size * 1.3), int(base_size * light_boost))
             no_size = max(0, int(base_size * heavy_factor))
         else:
             yes_size, no_size = base_size, base_size
@@ -526,10 +568,10 @@ class InventoryManager:
         # Exception: light side keeps size for pair completion
         if t_normalized < 0.5:
             taper = max(0.3, t_normalized / 0.5)
-            if combined_signal > 0:
+            if imbalance > 0:
                 # Up is heavy → only taper Up (heavy) side further
                 yes_size = max(0, int(yes_size * taper))
-            elif combined_signal < 0:
+            elif imbalance < 0:
                 # Down is heavy → only taper Down (heavy) side further
                 no_size = max(0, int(no_size * taper))
             else:
@@ -538,6 +580,32 @@ class InventoryManager:
                 no_size = max(0, int(no_size * taper))
 
         return yes_size, no_size
+
+    def _detect_runaway_imbalance(self) -> bool:
+        """Detect if imbalance is monotonically growing in the same direction.
+
+        Returns True if the last 4+ observations show imbalance growing
+        consistently (each observation is further from zero than the previous).
+        This catches pile-ups BEFORE they reach emergency threshold.
+        """
+        history = list(self._imbalance_history)
+        if len(history) < 4:
+            return False
+
+        # Check last 4 observations
+        recent = history[-4:]
+
+        # All same sign?
+        if not (all(x > 0 for x in recent) or all(x < 0 for x in recent)):
+            return False
+
+        # Each observation has larger absolute value than the previous?
+        abs_values = [abs(x) for x in recent]
+        for i in range(1, len(abs_values)):
+            if abs_values[i] <= abs_values[i - 1]:
+                return False
+
+        return True
 
     def check_capital_limit(self, market_id: str, current_mid: float,
                             asset: str = "") -> dict:

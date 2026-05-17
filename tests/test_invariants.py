@@ -1125,7 +1125,10 @@ def test_aggressive_repair_price_never_exceeds_cap():
 
 
 def test_deposit_wallet_activation_builds_full_trading_approval_batch():
-    from src.execution.ctf_ops import GaslessMerger, USDC_E_COLLATERAL_TOKEN, CLOB_EXCHANGE, CTF_CONTRACT
+    from src.execution.ctf_ops import (
+        GaslessMerger, USDC_E_COLLATERAL_TOKEN, CLOB_EXCHANGE,
+        CTF_CONTRACT, NEG_RISK_ADAPTER,
+    )
     from web3 import Web3
     import asyncio
 
@@ -1150,7 +1153,17 @@ def test_deposit_wallet_activation_builds_full_trading_approval_batch():
 
     assert asyncio.run(merger.ensure_deposit_wallet_trading_approvals()) is True
     assert captured["metadata"] == "Activate Trading Funds"
-    assert len(captured["calls"]) >= 8
+    # 5 spenders × 2 calls each (ERC20 approve + ERC1155 setApprovalForAll) = 10
+    assert len(captured["calls"]) >= 10
+    # Verify the NEG_RISK_ADAPTER is among the approved ERC20 targets.
+    # The CLOB balance API checks allowance for this contract; without it,
+    # the "Activate Funds" popup persists.
+    erc20_targets = [c["target"].lower() for c in captured["calls"]
+                     if c["target"].lower() == USDC_E_COLLATERAL_TOKEN.lower()]
+    ctf_targets = [c["target"].lower() for c in captured["calls"]
+                   if c["target"].lower() == CTF_CONTRACT.lower()]
+    assert len(erc20_targets) == 5  # one ERC20 approve per spender
+    assert len(ctf_targets) == 5    # one ERC1155 setApprovalForAll per spender
     assert captured["calls"][0]["target"].lower() == USDC_E_COLLATERAL_TOKEN.lower()
     assert captured["calls"][1]["target"].lower() == CTF_CONTRACT.lower()
     approval = merger._w3.eth.contract(address=USDC_E_COLLATERAL_TOKEN, abi=[{

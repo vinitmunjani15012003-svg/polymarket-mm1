@@ -195,6 +195,18 @@ class ClobClientWrapper:
     async def sync_balance_allowance(self) -> bool:
         """Sync CLOB balance/allowance for deposit-wallet live trading.
 
+        After a merge, USDC.e is returned to the wallet on-chain but the CLOB
+        doesn't automatically recognize it as available trading balance. This
+        method calls update_balance_allowance to refresh the CLOB's indexed view
+        of the deposit wallet's on-chain state, then verifies via
+        get_balance_allowance that all tracked contract allowances are non-zero.
+
+        The CLOB tracks allowances for CTF_EXCHANGE_V2, NEG_RISK_ADAPTER, and
+        NEG_RISK_CTF_EXCHANGE_V2. If ANY of these allowances is 0, the
+        "Activate Funds" popup persists and the merged USDC.e is not credited
+        as available cash balance. Returns False if verification fails, so the
+        caller can retry after the approvals have had time to propagate.
+
         Official deposit wallet flow requires calling the CLOB balance allowance
         update endpoint after funding/approvals and before trading. Older SDKs
         may not expose this method, so this is compatibility-guarded.
@@ -213,6 +225,7 @@ class ClobClientWrapper:
             return False
 
         try:
+            # Build COLLATERAL params — this is the critical one for cash balance
             params = None
             if self._client_version == "v2":
                 try:
@@ -235,16 +248,52 @@ class ClobClientWrapper:
                 except Exception as e:
                     log.warning("balance_allowance_params_v1_unavailable", error=str(e))
 
+            # Call update to refresh CLOB's indexed view
             if params is not None:
                 await self._run_client_call(update_fn, params)
             else:
                 await self._run_client_call(update_fn)
+
+            # Verify the sync worked by checking allowances are non-zero.
+            # The CLOB tracks 3 spender contracts; if any has allowance=0,
+            # the "Activate Funds" popup persists.
+            verified = True
+            get_fn = getattr(self._client, "get_balance_allowance", None)
+            if callable(get_fn):
+                try:
+                    result = await self._run_client_call(get_fn, params) if params else await self._run_client_call(get_fn)
+                    if isinstance(result, dict):
+                        allowances = result.get("allowances", {})
+                        balance = result.get("balance", "0")
+                        zero_allowances = [
+                            addr for addr, val in allowances.items()
+                            if str(val) == "0"
+                        ]
+                        if zero_allowances:
+                            log.warning(
+                                "balance_allowance_zero_detected",
+                                zero_count=len(zero_allowances),
+                                zero_spenders=[a[:10] for a in zero_allowances],
+                                balance=balance,
+                                msg="Some spender allowances are still 0; approval tx may not be indexed yet",
+                            )
+                            verified = False
+                        else:
+                            log.info(
+                                "balance_allowance_verified",
+                                balance=balance,
+                                spenders=len(allowances),
+                            )
+                except Exception as e:
+                    log.warning("balance_allowance_verify_error", error=str(e))
+
             log.info(
                 "balance_allowance_synced",
                 signature_type=self._signature_type,
                 funder=self._funder,
+                verified=verified,
             )
-            return True
+            return verified
         except Exception as e:
             log.error("balance_allowance_sync_error", error=str(e))
             return False

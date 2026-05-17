@@ -7,7 +7,7 @@ logs/
 *.log
 
 # Local runtime artifacts
-data/
+data/fetch_keys.py
 runs/
 
 # Environment variables
@@ -16,6 +16,9 @@ runs/
 
 # Secrets / Live credentials (NEVER commit these)
 config/live.yaml
+config/live_20_smoke.yaml
+config/live_50.yaml
+config/micro_live.yaml
 secrets.txt
 
 # IDE

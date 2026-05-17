@@ -35,6 +35,9 @@ CLOB_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_CLOB_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 CTF_EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
 NEG_RISK_CTF_EXCHANGE_V2 = "0xe2222d279d744050d28e00520010520000310F59"
+# Neg Risk Adapter: the CLOB balance API checks allowance for this contract.
+# Without approval, the "Activate Funds" popup persists even after merge.
+NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 MAX_UINT256 = 2**256 - 1
 
 # Minimal ABIs for the CTF operations we need
@@ -286,8 +289,13 @@ class GaslessMerger:
                  relayer_api_key: str = "",
                  relayer_api_key_address: str = "",
                  funder: str = "",
-                 signature_type: int = 0):
+                 signature_type: int = 0,
+                 owner_private_key: str = ""):
         self._private_key = private_key
+        # For deposit wallets, the relayer requires the wallet OWNER's
+        # signature for EIP-712 batches. If the trading key (used for
+        # CLOB API auth) is different from the owner, set owner_private_key.
+        self._owner_key = owner_private_key or private_key
         self._builder_api_key = builder_api_key
         self._builder_secret = builder_secret
         self._builder_passphrase = builder_passphrase
@@ -482,7 +490,7 @@ class GaslessMerger:
         from eth_account import Account
         from eth_account.messages import encode_typed_data
 
-        signer = Account.from_key(self._private_key)
+        signer = Account.from_key(self._owner_key)
         from_address = signer.address
         wallet = self._w3.to_checksum_address(self._funder)
         deadline = str(int(time.time()) + 300)
@@ -531,7 +539,7 @@ class GaslessMerger:
             "calls": calls,
         }
         signable = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
-        signature = Account.sign_message(signable, self._private_key).signature.hex()
+        signature = Account.sign_message(signable, self._owner_key).signature.hex()
         if not signature.startswith("0x"):
             signature = "0x" + signature
 
@@ -607,6 +615,7 @@ class GaslessMerger:
             NEG_RISK_CLOB_EXCHANGE,
             CTF_EXCHANGE_V2,
             NEG_RISK_CTF_EXCHANGE_V2,
+            NEG_RISK_ADAPTER,
         ]
 
         try:
@@ -664,7 +673,7 @@ class GaslessMerger:
         from eth_account import Account
         from eth_account.messages import encode_typed_data
 
-        signer = Account.from_key(self._private_key)
+        signer = Account.from_key(self._owner_key)
         from_address = signer.address
         wallet = self._w3.to_checksum_address(self._funder)
         deadline = str(int(time.time()) + 300)
@@ -716,7 +725,7 @@ class GaslessMerger:
             "calls": normalized_calls,
         }
         signable = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
-        signature = Account.sign_message(signable, self._private_key).signature.hex()
+        signature = Account.sign_message(signable, self._owner_key).signature.hex()
         if not signature.startswith("0x"):
             signature = "0x" + signature
 
@@ -1372,6 +1381,11 @@ class BalanceMonitor:
                         )
 
                 if callable(balance_sync):
+                    # Wait for the CLOB indexer to catch up with the on-chain
+                    # state after merge. Without this delay, update_balance_allowance
+                    # often returns before the indexer has seen the new USDC.e balance,
+                    # leaving a "redeem merge balance" popup instead of auto-crediting.
+                    await asyncio.sleep(3)
                     sync_ok = False
                     for attempt in range(1, 6):
                         try:

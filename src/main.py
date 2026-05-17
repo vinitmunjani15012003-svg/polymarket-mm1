@@ -235,6 +235,7 @@ async def run_bot(
             relayer_api_key_address=config.credentials.relayer_api_key_address,
             funder=config.credentials.funder,
             signature_type=config.credentials.signature_type,
+            owner_private_key=config.credentials.owner_private_key,
         )
         gasless_ok = await gasless_merger.initialize()
         if gasless_ok:
