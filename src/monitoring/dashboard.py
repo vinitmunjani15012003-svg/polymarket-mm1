@@ -231,7 +231,7 @@ class Dashboard:
                 f"[bold]{asset}[/]",
                 phase_str,
                 f"{remaining:.0f}s",
-                f"${spot:,.0f}" if spot > 100 else f"${spot:.2f}",
+                f"${spot:,.2f}" if spot > 100 else f"${spot:.4f}",
                 f"{fv:.3f}",
                 f"${up_buy:.2f}x{int(up_size)}",
                 f"${down_buy:.2f}x{int(down_size)}",

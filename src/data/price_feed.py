@@ -52,6 +52,8 @@ class PriceFeed:
         self._ws = None
         self._running = False
         self._reconnect_delay = 1
+        self._last_message_ts: float = 0.0
+        self._message_timeout: float = 15.0
         # Throttle: only record one price sample per second for vol calculation
         self._last_history_ts: Dict[str, float] = {}
 
@@ -134,16 +136,27 @@ class PriceFeed:
             self._reconnect_delay = 1  # Reset on successful connect
             log.info("ws_connected", symbols=self.symbols)
 
+            self._last_message_ts = time.time()
+
             while self._running:
                 try:
                     # Application-level watchdog: bookTicker updates 10+ times a second.
-                    # If we receive nothing for 5 seconds, the feed has silently stalled.
-                    message = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    # If we receive nothing for the configured timeout, the feed has silently stalled.
+                    message = await asyncio.wait_for(
+                        ws.recv(), timeout=self._message_timeout
+                    )
                     data = json.loads(message)
                     self._process_trade(data)
+                    self._last_message_ts = time.time()
                 except asyncio.TimeoutError:
-                    log.warning("ws_stall_detected", timeout=5.0, msg="No messages received. Forcing reconnect.")
-                    break  # Break out to trigger reconnect in start() loop
+                    age = time.time() - self._last_message_ts
+                    log.warning(
+                        "ws_stall_detected",
+                        timeout=self._message_timeout,
+                        age=age,
+                        msg="No messages received. Forcing reconnect.",
+                    )
+                    raise ConnectionError(f"No Binance messages for {age:.1f}s")
                 except websockets.ConnectionClosed:
                     break
                 except (json.JSONDecodeError, KeyError) as e:
