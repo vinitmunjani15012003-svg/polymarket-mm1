@@ -353,6 +353,36 @@ def test_order_manager_fails_closed_when_stray_cancel_fails():
     assert om.last_order_error == "stray_live_order_cancel_failed"
 
 
+def test_order_manager_cancel_side_quotes_handles_dry_run_orders():
+    executor = DummyBatchExecutor()
+    executor.open_orders = {
+        "DRY-YES": SimulatedOrder(
+            order_id="DRY-YES",
+            token_id="YES1",
+            side="yes",
+            price=0.45,
+            size=5,
+            placed_at=time.time(),
+        ),
+        "DRY-NO": SimulatedOrder(
+            order_id="DRY-NO",
+            token_id="NO1",
+            side="no",
+            price=0.44,
+            size=5,
+            placed_at=time.time(),
+        ),
+    }
+    om = OrderManager(executor)
+
+    import asyncio
+
+    ok = asyncio.run(om.cancel_side_quotes("MARKET1", "yes", "YES1"))
+
+    assert ok is True
+    assert executor.cancel_batches == [["DRY-YES"]]
+
+
 def test_order_manager_cancel_all_preserves_active_on_failure():
     executor = DummyExecutor()
     executor.cancel_all_ok = False
@@ -1122,6 +1152,17 @@ def test_aggressive_repair_price_never_exceeds_cap():
         best_ask=0.53,
         best_bid=0.48,
     ) == 0.49
+
+
+def test_aggressive_repair_price_lowers_stale_quote_above_pair_cap():
+    # Regression for the 4-window dry-run halt: repair cap was logged at 0.24,
+    # but a stale YES repair quote stayed at 0.34 and filled a negative pair.
+    assert aggressive_repair_price(
+        current_price=0.34,
+        cap=0.24,
+        best_ask=0.36,
+        best_bid=0.33,
+    ) == 0.24
 
 
 def test_deposit_wallet_activation_builds_full_trading_approval_batch():

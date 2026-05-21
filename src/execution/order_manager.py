@@ -29,6 +29,15 @@ class ActiveQuotes:
     last_update: float = 0.0
 
 
+def _order_token_id(info) -> str:
+    """Return an order token id from live dicts or dry-run order objects."""
+    if info is None:
+        return ""
+    if isinstance(info, dict):
+        return str(info.get("token_id") or info.get("asset_id") or "")
+    return str(getattr(info, "token_id", "") or getattr(info, "asset_id", "") or "")
+
+
 class OrderManager:
     """
     Manages order lifecycle for a single market.
@@ -265,7 +274,7 @@ class OrderManager:
         for oid, info in list(open_orders.items()):
             if oid in tracked:
                 continue
-            if str((info or {}).get("token_id")) in token_ids:
+            if _order_token_id(info) in token_ids:
                 stray_ids.append(oid)
 
         if not stray_ids:
@@ -304,7 +313,7 @@ class OrderManager:
         open_orders = getattr(self.executor, "open_orders", None)
         if isinstance(open_orders, dict):
             for oid, info in list(open_orders.items()):
-                if str((info or {}).get("token_id")) == str(token_id) and oid not in cancel_ids:
+                if _order_token_id(info) == str(token_id) and oid not in cancel_ids:
                     cancel_ids.append(oid)
 
         if not cancel_ids:

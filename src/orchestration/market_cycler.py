@@ -250,6 +250,13 @@ def aggressive_repair_price(current_price: float | None,
         target = max(target, min(float(best_bid), float(cap)))
 
     target = max(0.01, min(0.99, target))
+
+    # This function is also the final pair-edge safety clamp for repair mode.
+    # If the current quote is above the profitable cap, keeping it resting can
+    # fill a guaranteed-loss pair before the next loop. Lower it immediately.
+    if price > float(cap):
+        return round(target, 2)
+
     if target <= price:
         return round(price, 2)
     return round(target, 2)
