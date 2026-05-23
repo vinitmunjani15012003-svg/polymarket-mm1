@@ -40,9 +40,17 @@ class OrderBookReader:
     Public endpoint — no authentication needed.
     """
 
-    def __init__(self, host: str = "https://clob.polymarket.com"):
+    def __init__(
+        self,
+        host: str = "https://clob.polymarket.com",
+        *,
+        redundant_ws=None,
+        rest_fallback: bool = True,
+    ):
         self.host = host
         self._client = httpx.AsyncClient(timeout=5.0)
+        self.redundant_ws = redundant_ws
+        self.rest_fallback = rest_fallback
 
     async def get_book(self, token_id: str) -> Optional[BookSnapshot]:
         """
@@ -70,6 +78,21 @@ class OrderBookReader:
         """Fetch multiple order books in one CLOB /books request."""
         if not token_ids:
             return {}
+
+        if self.redundant_ws is not None:
+            try:
+                await self.redundant_ws.subscribe(token_ids)
+                await self.redundant_ws.ensure_started()
+                ws_books = {token_id: self.redundant_ws.get(token_id) for token_id in token_ids}
+                if all(book is not None for book in ws_books.values()):
+                    return ws_books
+                if not self.rest_fallback:
+                    return ws_books
+            except Exception as e:
+                log.warning("redundant_ws_books_unavailable", error=str(e))
+                if not self.rest_fallback:
+                    return {token_id: None for token_id in token_ids}
+
         try:
             resp = await self._client.post(
                 f"{self.host}/books",
@@ -166,5 +189,10 @@ class OrderBookReader:
         )
 
     async def close(self):
-        """Close the HTTP client."""
+        """Close the HTTP client and optional websocket cache."""
         await self._client.aclose()
+        if self.redundant_ws is not None:
+            try:
+                await self.redundant_ws.close()
+            except Exception:
+                pass

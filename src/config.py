@@ -116,6 +116,20 @@ class BalanceMonitorConfig:
 
 
 @dataclass
+class PolymarketWSConfig:
+    """Redundant Polymarket market-data websocket settings."""
+    enabled: bool = True
+    connections: int = 5
+    stale_ms: int = 1000
+    jump_reject_cents: float = 15.0
+    drop_first_book: bool = True
+    stagger_ms: int = 200
+    reconnect_stale_seconds: float = 5.0
+    max_reconnects_per_minute: int = 10
+    rest_fallback: bool = True
+
+
+@dataclass
 class DryRunConfig:
     """Dry-run simulation parameters."""
     fill_probability: float = 0.60
@@ -134,6 +148,7 @@ class BotConfig:
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     toxicity: ToxicityConfig = field(default_factory=ToxicityConfig)
     balance_monitor: BalanceMonitorConfig = field(default_factory=BalanceMonitorConfig)
+    polymarket_ws: PolymarketWSConfig = field(default_factory=PolymarketWSConfig)
     dry_run: DryRunConfig = field(default_factory=DryRunConfig)
 
     def validate(self):
@@ -319,6 +334,20 @@ def load_config(config_path: str = "config/default.yaml",
         merge_balance=bm.get("merge_balance", 10.0),
         min_merge_pairs=bm.get("min_merge_pairs", 5),
         check_interval=bm.get("check_interval", 30.0),
+    )
+
+    # Redundant Polymarket market-data websocket
+    pws = raw.get("polymarket_ws", {})
+    config.polymarket_ws = PolymarketWSConfig(
+        enabled=pws.get("enabled", True),
+        connections=int(pws.get("connections", 5)),
+        stale_ms=int(pws.get("stale_ms", 1000)),
+        jump_reject_cents=float(pws.get("jump_reject_cents", 15.0)),
+        drop_first_book=bool(pws.get("drop_first_book", True)),
+        stagger_ms=int(pws.get("stagger_ms", 200)),
+        reconnect_stale_seconds=float(pws.get("reconnect_stale_seconds", 5.0)),
+        max_reconnects_per_minute=int(pws.get("max_reconnects_per_minute", 10)),
+        rest_fallback=bool(pws.get("rest_fallback", True)),
     )
 
     # Dry run

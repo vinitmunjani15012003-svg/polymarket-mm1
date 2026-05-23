@@ -128,6 +128,18 @@ toxicity:
   immediate_drift_threshold: 0.02
   halt_cooldown: 90
 
+# --- Redundant Polymarket Market Websockets ---
+polymarket_ws:
+  enabled: true
+  connections: 5
+  stale_ms: 1000
+  jump_reject_cents: 15
+  drop_first_book: true
+  stagger_ms: 200
+  reconnect_stale_seconds: 5
+  max_reconnects_per_minute: 10
+  rest_fallback: true
+
 # --- Dry Run ---
 dry_run:
   fill_probability: 0.60

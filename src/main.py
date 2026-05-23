@@ -24,6 +24,7 @@ from src.monitoring.pnl_tracker import PnLTracker
 from src.data.price_feed import PriceFeed
 from src.data.market_discovery import MarketDiscovery
 from src.data.orderbook import OrderBookReader
+from src.data.redundant_poly_ws import RedundantPolymarketWS
 from src.strategy.inventory import InventoryManager
 from src.strategy.capital_arbiter import CapitalArbiter
 from src.execution.order_manager import OrderManager
@@ -141,8 +142,24 @@ async def run_bot(
     # Market discovery (REAL for both modes)
     discovery = MarketDiscovery(assets=list(active_assets.keys()))
 
-    # Order book reader (REAL for both modes)
-    book_reader = OrderBookReader(host=config.credentials.host)
+    # Order book reader (REAL for both modes). Use redundant Polymarket
+    # market-data websockets when enabled, with REST fallback for cold/stale books.
+    redundant_ws = None
+    if config.polymarket_ws.enabled:
+        redundant_ws = RedundantPolymarketWS(
+            connection_count=config.polymarket_ws.connections,
+            stale_seconds=config.polymarket_ws.stale_ms / 1000.0,
+            jump_reject=config.polymarket_ws.jump_reject_cents / 100.0,
+            drop_first_book=config.polymarket_ws.drop_first_book,
+            stagger_seconds=config.polymarket_ws.stagger_ms / 1000.0,
+            reconnect_stale_seconds=config.polymarket_ws.reconnect_stale_seconds,
+            max_reconnects_per_minute=config.polymarket_ws.max_reconnects_per_minute,
+        )
+    book_reader = OrderBookReader(
+        host=config.credentials.host,
+        redundant_ws=redundant_ws,
+        rest_fallback=config.polymarket_ws.rest_fallback,
+    )
 
     # (PnLTracker moved to per-asset loop)
 
