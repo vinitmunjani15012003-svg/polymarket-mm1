@@ -13,8 +13,11 @@ from src.orchestration.market_cycler import (
     MarketCycler,
     aggressive_repair_price,
     apply_dust_price_guardrails,
+    apply_fv_favored_entry_mode,
+    compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     has_negative_matched_pair_edge,
+    repair_min_edge_for_remaining,
 )
 from src.monitoring.pnl_tracker import PnLTracker
 from src.risk.risk_engine import pre_trade_checks
@@ -664,6 +667,146 @@ def test_quote_direction_guard_allows_inventory_repair_inversion():
 
     assert quotes.yes_buy_price > quotes.no_buy_price
     assert quotes.combined_cost <= MAX_COMBINED_COST
+
+
+def test_fv_favored_entry_mode_quotes_yes_first_when_fv_is_high_and_flat():
+    qe = QuoteEngine()
+    quotes = qe.generate_quotes(
+        fair_value=0.60,
+        t_normalized=0.9,
+        sigma=0.8,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+    )
+
+    side = apply_fv_favored_entry_mode(quotes, 0.60, share_imbalance=0.0, min_order_size=5)
+
+    assert side == "yes"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
+def test_fv_favored_entry_mode_quotes_no_first_when_fv_is_low_and_flat():
+    qe = QuoteEngine()
+    quotes = qe.generate_quotes(
+        fair_value=0.40,
+        t_normalized=0.9,
+        sigma=0.8,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+    )
+
+    side = apply_fv_favored_entry_mode(quotes, 0.40, share_imbalance=0.0, min_order_size=5)
+
+    assert side == "no"
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 5
+
+
+def test_fv_favored_entry_mode_blocks_when_complementary_repair_is_not_executable():
+    qe = QuoteEngine()
+    quotes = qe.generate_quotes(
+        fair_value=0.60,
+        t_normalized=0.9,
+        sigma=0.8,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+    )
+
+    side = apply_fv_favored_entry_mode(
+        quotes,
+        0.60,
+        share_imbalance=0.0,
+        min_order_size=5,
+        best_ask_no=0.80,
+    )
+
+    assert side == "blocked"
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 0
+
+
+def test_repair_min_edge_relaxes_only_near_expiry_for_repair():
+    assert repair_min_edge_for_remaining(700, "repair_up") == 0.02
+    assert repair_min_edge_for_remaining(240, "repair_down") == 0.005
+    assert repair_min_edge_for_remaining(90, "repair_up") == 0.0
+    assert repair_min_edge_for_remaining(30, "normal") == 0.02
+
+
+def test_fv_aware_dust_repair_ladders_larger_up_dust_to_exact_min_tail():
+    up_size, down_size, mode = compute_fv_aware_dust_repair_sizes(
+        imbalance=4,
+        fair_value=0.60,
+        min_order_size=5,
+        max_order_size=10,
+    )
+
+    assert (up_size, down_size, mode) == (0, 9, "repair_down")
+
+
+def test_fv_aware_dust_repair_ladders_larger_down_dust_to_exact_min_tail():
+    up_size, down_size, mode = compute_fv_aware_dust_repair_sizes(
+        imbalance=-3,
+        fair_value=0.60,
+        min_order_size=5,
+        max_order_size=10,
+    )
+
+    assert (up_size, down_size, mode) == (8, 0, "repair_up")
+
+
+def test_fv_aware_dust_repair_holds_near_even_tail_to_avoid_oscillation():
+    up_size, down_size, mode = compute_fv_aware_dust_repair_sizes(
+        imbalance=-2,
+        fair_value=0.51,
+        min_order_size=5,
+        max_order_size=10,
+    )
+
+    assert (up_size, down_size, mode) == (0, 0, "dust_hold_down")
+
+
+def test_close_only_subminimum_repair_mode_is_not_left_normal():
+    up_size, down_size, mode = compute_inventory_repair_sizes(
+        imbalance=3,
+        min_order_size=5,
+        max_order_size=10,
+    )
+
+    assert (up_size, down_size, mode) == (0, 5, "repair_down")
+
+    up_size, down_size, mode = compute_inventory_repair_sizes(
+        imbalance=-3,
+        min_order_size=5,
+        max_order_size=10,
+    )
+
+    assert (up_size, down_size, mode) == (5, 0, "repair_up")
+
+
+def test_fv_favored_entry_mode_does_not_override_inventory_repair():
+    qe = QuoteEngine()
+    quotes = qe.generate_quotes(
+        fair_value=0.60,
+        t_normalized=0.9,
+        sigma=0.8,
+        share_imbalance=10.0,
+        max_imbalance=1000.0,
+        yes_size=0,
+        no_size=10,
+    )
+
+    side = apply_fv_favored_entry_mode(quotes, 0.60, share_imbalance=10.0, min_order_size=5)
+
+    assert side is None
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 10
 
 
 def test_emergency_inventory_behavior():

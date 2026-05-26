@@ -41,6 +41,7 @@ assets:
     gamma_near_expiry: 0.80
     min_spread: 0.01    # 0.5 ticks ($0.005) per side to get 0.99 combined cost
     max_spread: 0.05           # 5 ticks max near expiry
+    min_order_size: 5          # Polymarket minimum; repair dust with 5-share clips
     max_order_size: 10         # Reduced from 30 to build inventory slower
     max_dollar_delta: 150
     soft_limit: 75
@@ -56,6 +57,7 @@ assets:
     gamma_near_expiry: 0.80
     min_spread: 0.01
     max_spread: 0.05
+    min_order_size: 5
     max_order_size: 10         # Match BTC: smaller orders, build inventory slower
     max_dollar_delta: 150
     soft_limit: 75
@@ -71,6 +73,7 @@ assets:
     gamma_near_expiry: 0.80
     min_spread: 0.01
     max_spread: 0.05
+    min_order_size: 5
     max_order_size: 10         # Match BTC: smaller orders, build inventory slower
     max_dollar_delta: 150
     soft_limit: 75
@@ -86,6 +89,7 @@ assets:
     gamma_near_expiry: 0.80
     min_spread: 0.01
     max_spread: 0.05
+    min_order_size: 5
     max_order_size: 10         # Match BTC: smaller orders, build inventory slower
     max_dollar_delta: 150
     soft_limit: 75

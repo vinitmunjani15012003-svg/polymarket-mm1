@@ -38,6 +38,94 @@ log = get_logger("market_cycler")
 # bot from recycling capital into guaranteed-loss pairs.
 MIN_LIVE_PAIR_EDGE = 0.02
 
+# When flat and the model has a meaningful directional lean, enter on the side
+# favored by fair value first, then let the existing inventory-repair path quote
+# only the opposite side after a fill. This avoids opening with the adverse/cheap
+# side just because both sides are atomically quotable.
+FV_FAVORED_ENTRY_THRESHOLD = 0.55
+FV_FAVORED_ENTRY_MIN_EDGE = 0.005
+FV_FAVORED_ENTRY_MAX_SIZE = 5
+FV_FAVORED_ENTRY_STOP_SECONDS = 600
+
+
+def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: float,
+                                min_order_size: int,
+                                threshold: float = FV_FAVORED_ENTRY_THRESHOLD,
+                                best_ask_yes: Optional[float] = None,
+                                best_ask_no: Optional[float] = None,
+                                min_pair_edge: float = MIN_LIVE_PAIR_EDGE,
+                                min_entry_edge: float = FV_FAVORED_ENTRY_MIN_EDGE,
+                                max_entry_size: int = FV_FAVORED_ENTRY_MAX_SIZE) -> str | None:
+    """Quote only the best FV-edge side while flat, if it is repairable.
+
+    Returns "yes" or "no" when it converted normal flat quoting to one-sided
+    FV entry, "blocked" when opening a one-sided leg is too risky, otherwise
+    returns None.
+    """
+    if abs(share_imbalance) >= min_order_size:
+        return None
+    if quotes.yes_buy_size <= 0 or quotes.no_buy_size <= 0:
+        return None
+
+    yes_price = float(quotes.yes_buy_price or 0)
+    no_price = float(quotes.no_buy_price or 0)
+    if yes_price <= 0 or no_price <= 0:
+        return None
+
+    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
+    yes_edge = fv - yes_price
+    no_edge = (1.0 - fv) - no_price
+
+    side = None
+    if fv >= threshold and yes_edge >= no_edge and yes_edge >= min_entry_edge:
+        side = "yes"
+    elif fv <= 1.0 - threshold and no_edge >= yes_edge and no_edge >= min_entry_edge:
+        side = "no"
+
+    if not side:
+        return None
+
+    # Before opening a one-sided leg, require that the complementary repair leg
+    # is currently close enough to be quoted while preserving pair edge. Without
+    # this, a first-leg fill can sit naked for the whole window while repair is
+    # capped far below the book (the main 35-window residual failure mode).
+    if side == "yes":
+        repair_cap = 1.0 - yes_price - min_pair_edge
+        if best_ask_no is not None and (float(best_ask_no) - 0.01) > repair_cap:
+            quotes.yes_buy_size = 0
+            quotes.no_buy_size = 0
+            return "blocked"
+        quotes.yes_buy_size = min(int(quotes.yes_buy_size), max(min_order_size, int(max_entry_size)))
+        quotes.no_buy_size = 0
+        return "yes"
+
+    repair_cap = 1.0 - no_price - min_pair_edge
+    if best_ask_yes is not None and (float(best_ask_yes) - 0.01) > repair_cap:
+        quotes.yes_buy_size = 0
+        quotes.no_buy_size = 0
+        return "blocked"
+    quotes.no_buy_size = min(int(quotes.no_buy_size), max(min_order_size, int(max_entry_size)))
+    quotes.yes_buy_size = 0
+    return "no"
+
+
+def repair_min_edge_for_remaining(remaining: float, repair_mode: str) -> float:
+    """Relax pair edge only for close-only repair as expiry approaches.
+
+    Carrying a naked wrong-side tail is often worse than completing a scratch
+    pair. Normal quoting keeps the full live buffer; repair-only quotes can use
+    a smaller buffer near expiry.
+    """
+    if repair_mode not in ("repair_up", "repair_down"):
+        return MIN_LIVE_PAIR_EDGE
+    if remaining <= 90:
+        return 0.0
+    if remaining <= 240:
+        return 0.005
+    if remaining <= 480:
+        return 0.01
+    return MIN_LIVE_PAIR_EDGE
+
 
 class UpDownFairValue:
     """
@@ -157,6 +245,51 @@ def compute_inventory_repair_sizes(imbalance: float,
     if imbalance > 0:
         return 0, repair_size, "repair_down"
     return repair_size, 0, "repair_up"
+
+
+def compute_fv_aware_dust_repair_sizes(imbalance: float,
+                                       fair_value: float,
+                                       min_order_size: int,
+                                       max_order_size: int,
+                                       neutral_band: float = 0.02) -> tuple[int, int, str]:
+    """Handle sub-minimum tails with a two-step dust ladder.
+
+    Polymarket minimum order size means a 4-share tail cannot be repaired by
+    buying exactly 4 shares. For larger dust tails, quote ``tail + min_size`` on
+    the light side. Example: +4 UP → buy 9 DOWN → leaves -5 DOWN, then normal
+    repair buys 5 UP and lands exactly flat.
+
+    For tiny 1-2 share dust, avoid creating a much larger temporary residual;
+    hold if the tail side is not clearly disfavored by fair value.
+    """
+    min_order_size = max(1, int(min_order_size or 1))
+    max_order_size = max(min_order_size, int(max_order_size or min_order_size))
+    tail = abs(float(imbalance or 0))
+    if tail <= 0:
+        return 0, 0, "flat"
+    if tail >= min_order_size:
+        return compute_inventory_repair_sizes(imbalance, min_order_size, max_order_size)
+
+    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
+    ladder_threshold = max(3, int((min_order_size + 1) // 2))
+    if tail >= ladder_threshold:
+        ladder_size = min(max_order_size, int(round(tail)) + min_order_size)
+        if imbalance > 0:
+            return 0, ladder_size, "repair_down"
+        return ladder_size, 0, "repair_up"
+
+    # Positive imbalance = extra UP. For 1-2 share dust, hold if UP is still at
+    # least roughly favored; otherwise flip with the minimum DOWN clip.
+    if imbalance > 0:
+        if fv >= 0.5 - neutral_band:
+            return 0, 0, "dust_hold_up"
+        return 0, min_order_size, "repair_down"
+
+    # Negative imbalance = extra DOWN. For 1-2 share dust, hold if DOWN is still
+    # at least roughly favored; otherwise flip with the minimum UP clip.
+    if fv <= 0.5 + neutral_band:
+        return 0, 0, "dust_hold_down"
+    return min_order_size, 0, "repair_up"
 
 
 def apply_dust_price_guardrails(quotes, mode: str,
@@ -362,6 +495,7 @@ class MarketCycler:
         self.last_fair_value: Optional[float] = None
         self.stop_reason: str | None = None
         self._last_close_only_repair_mode: str | None = None
+        self._last_toxicity_repair_override_log: float = 0.0
         self._merge_unavailable_until: float = 0.0
 
         self._running = False
@@ -1285,16 +1419,10 @@ class MarketCycler:
         # We do NOT return early here, otherwise the bot freezes and stops updating quotes!
         self.edge_tracker.should_react(self.quote_engine)
 
-        # 9. Toxicity monitor
-        self.toxicity_monitor.update_delayed_mids(fv)
-        self.toxicity_monitor.adjust_spread(self.quote_engine)
-        if not is_halted and self.toxicity_monitor.check_kill_switch(self.edge_tracker):
-            is_halted = True
-            halt_reason = "TOXICITY_HALT"
-
-        # 10. Compute inventory state and sizes
-        #     Uses SHARE COUNT imbalance (Up - Down), not dollar delta
-        #     Pass t_normalized for time-aware dynamic thresholds
+        # 9. Compute inventory state before toxicity decisions. If a toxic fill
+        # leaves us imbalanced, the safest response is not a full quoting freeze;
+        # it is close-only repair on the light side with conservative sizing.
+        # Uses SHARE COUNT imbalance (Up - Down), not dollar delta.
         imbalance = pos.share_imbalance()
         abs_imbalance = abs(imbalance)
         # Treat any leftover as actionable inventory risk. If one side filled and
@@ -1302,6 +1430,39 @@ class MarketCycler:
         inventory_repair = abs_imbalance >= min_order_size
         dust_normalization = 0 < abs_imbalance < min_order_size
         close_only_phase = phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]
+
+        # 10. Toxicity monitor
+        self.toxicity_monitor.update_delayed_mids(fv)
+        self.toxicity_monitor.adjust_spread(self.quote_engine)
+        if not is_halted and self.toxicity_monitor.check_kill_switch(self.edge_tracker):
+            if inventory_repair:
+                # Keep repairing the imbalance. A toxicity halt should stop
+                # opening/normal quoting, but freezing an unpaired side leaves
+                # settlement exposure and made repair take too long in smoke runs.
+                is_halted = True
+                halt_reason = "TOXICITY_REPAIR_ONLY"
+                # Less punitive than a full risk/regime halt: keep pair-edge
+                # protection, but do not widen so far that the light-side repair
+                # sits behind the market for minutes.
+                self.quote_engine.spread_multiplier = max(self.quote_engine.spread_multiplier, 1.25)
+                self.quote_engine.min_spread = max(self.quote_engine.min_spread, 0.02)
+                if now - self._last_toxicity_repair_override_log >= 5.0:
+                    log.warning(
+                        "toxicity_repair_override",
+                        asset=self.asset,
+                        imbalance=round(imbalance, 4),
+                        up_shares=round(pos.yes_shares, 4),
+                        down_shares=round(pos.no_shares, 4),
+                        min_spread=round(self.quote_engine.min_spread, 4),
+                        spread_multiplier=round(self.quote_engine.spread_multiplier, 4),
+                        msg="toxicity halt converted to close-only repair",
+                    )
+                    self._last_toxicity_repair_override_log = now
+            else:
+                is_halted = True
+                halt_reason = "TOXICITY_HALT"
+
+        # 11. Compute base quote sizes
         repair_mode = "normal"
         inv_state = self.inventory.get_state(market.market_id, fv, t_norm)
         up_size, down_size = self.inventory.compute_size_adjustment(
@@ -1314,8 +1475,9 @@ class MarketCycler:
         # - dust mode is capped at 2x min size by compute_inventory_repair_sizes()
         # - do not open a two-sided dust plan during halts or close-only phases
         if dust_normalization and not is_halted and not close_only_phase:
-            up_size, down_size, repair_mode = compute_inventory_repair_sizes(
+            up_size, down_size, repair_mode = compute_fv_aware_dust_repair_sizes(
                 imbalance,
+                fv,
                 min_order_size,
                 self.quote_engine.max_order_size,
             )
@@ -1323,10 +1485,15 @@ class MarketCycler:
                 "sub_minimum_repair_quote",
                 market=market.market_id,
                 imbalance=round(imbalance, 4),
+                fair_value=round(fv, 4),
                 up_size=up_size,
                 down_size=down_size,
                 mode=repair_mode,
             )
+            if up_size == 0 and down_size == 0:
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self._update_dashboard(market, spot, fv, sigma, phase, remaining)
+                return
         elif balance_only or inventory_repair:
             if imbalance != 0:
                 up_size, down_size, repair_mode = compute_inventory_repair_sizes(
@@ -1351,11 +1518,21 @@ class MarketCycler:
         # 10.5 Enforce Close-Only quoting during near-expiry phases OR HALTS.
         if is_halted or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]:
             if imbalance > 0:
-                up_size = 0
-                down_size = min_order_size if abs_imbalance < min_order_size else _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
+                if abs_imbalance < min_order_size:
+                    up_size, down_size, repair_mode = compute_fv_aware_dust_repair_sizes(
+                        imbalance, fv, min_order_size, self.quote_engine.max_order_size)
+                else:
+                    up_size = 0
+                    down_size = _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
+                    repair_mode = "repair_down"
             elif imbalance < 0:
-                down_size = 0
-                up_size = min_order_size if abs_imbalance < min_order_size else _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
+                if abs_imbalance < min_order_size:
+                    up_size, down_size, repair_mode = compute_fv_aware_dust_repair_sizes(
+                        imbalance, fv, min_order_size, self.quote_engine.max_order_size)
+                else:
+                    down_size = 0
+                    up_size = _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
+                    repair_mode = "repair_up"
             else:
                 # If we're flat near expiry, we intentionally do not quote.
                 up_size = 0
@@ -1369,10 +1546,15 @@ class MarketCycler:
                 )
                 return
 
-            # If halted and flat, stop quoting entirely
-            if is_halted and up_size == 0 and down_size == 0:
+            # If halted/close-only and flat or intentionally holding a favored
+            # dust tail, stop quoting entirely.
+            if up_size == 0 and down_size == 0:
                 await self.order_mgr.cancel_market_quotes(market.market_id)
-                self._update_dashboard(market, spot, fv, sigma, halt_reason, remaining)
+                self._update_dashboard(
+                    market, spot, fv, sigma,
+                    halt_reason if is_halted else phase,
+                    remaining,
+                )
                 return
 
         # 11. Capital limit check (includes cross-asset arbiter)
@@ -1556,6 +1738,37 @@ class MarketCycler:
                     # NO is expensive, YES is cheap → block YES
                     quotes.yes_buy_size = 0
 
+        # 12.35 FV-favored entry mode: when flat, start by buying only the side
+        # the model likes (e.g. FV=0.60 => YES first). Once that side fills,
+        # the existing inventory-repair logic quotes only the opposite side to
+        # complete profitable pairs under the universal pair-cost guard.
+        fv_entry_side = None
+        if (repair_mode == "normal" and not balance_only and not is_halted
+                and not close_only_phase and remaining >= FV_FAVORED_ENTRY_STOP_SECONDS):
+            fv_entry_side = apply_fv_favored_entry_mode(
+                quotes,
+                fair_value=fv,
+                share_imbalance=imbalance,
+                min_order_size=min_order_size,
+                best_ask_yes=best_ask_yes,
+                best_ask_no=best_ask_no,
+            )
+            if fv_entry_side:
+                log_method = log.warning if fv_entry_side == "blocked" else log.info
+                log_method(
+                    "fv_favored_entry_mode" if fv_entry_side != "blocked" else "fv_favored_entry_blocked_unrepairable",
+                    asset=self.asset,
+                    fair_value=round(fv, 4),
+                    side=fv_entry_side,
+                    yes_size=quotes.yes_buy_size,
+                    no_size=quotes.no_buy_size,
+                    yes_price=quotes.yes_buy_price,
+                    no_price=quotes.no_buy_price,
+                    best_ask_yes=best_ask_yes,
+                    best_ask_no=best_ask_no,
+                    threshold=FV_FAVORED_ENTRY_THRESHOLD,
+                )
+
         # 12.5 Capital guardrail (prevents negative capital in dry-run and
         # keeps live sizing within available funds).
         # Conservative: assume both sides could fill immediately.
@@ -1682,13 +1895,14 @@ class MarketCycler:
             elif repair_mode == "repair_down":
                 quotes.yes_buy_size = 0
 
-            # Normal/balanced quoting is atomic: both sides or neither. Capital
-            # scaling/backoff must never turn a balanced market into a one-sided
-            # bet. This exact failure produced mode=normal yes_size=5/no_size=0.
+            # Normal/balanced quoting is atomic unless we intentionally entered
+            # FV-favored one-sided entry mode while flat. Capital scaling/backoff
+            # must not accidentally turn a balanced market into a one-sided bet.
             if repair_mode == "normal" and abs_imbalance < min_order_size:
                 one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
                 merge_blocked = self._merge_unavailable_until > _time.time()
-                if one_sided_normal or merge_blocked:
+                allowed_fv_entry = fv_entry_side in ("yes", "no") and one_sided_normal and not merge_blocked
+                if (one_sided_normal and not allowed_fv_entry) or merge_blocked:
                     log.warning(
                         "normal_quote_blocked_not_atomic",
                         asset=self.asset,
@@ -1702,6 +1916,23 @@ class MarketCycler:
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
+
+        # Belt-and-suspenders atomicity check outside the guardrail try-block:
+        # flat normal mode must be both-side, no-side, or an explicitly allowed
+        # FV entry. It must never accidentally leak one naked side.
+        if repair_mode == "normal" and abs_imbalance < min_order_size:
+            one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
+            allowed_fv_entry = fv_entry_side in ("yes", "no") and one_sided_normal
+            if one_sided_normal and not allowed_fv_entry:
+                log.warning(
+                    "normal_quote_blocked_not_atomic_final",
+                    asset=self.asset,
+                    yes_size=quotes.yes_buy_size,
+                    no_size=quotes.no_buy_size,
+                    imbalance=round(imbalance, 4),
+                )
+                quotes.yes_buy_size = 0
+                quotes.no_buy_size = 0
 
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
@@ -1738,8 +1969,9 @@ class MarketCycler:
             if size_val <= 0 or not price_val:
                 continue
 
+            pair_edge = repair_min_edge_for_remaining(remaining, repair_mode)
             cap = float(pos.max_profitable_repair_price(
-                side_label, size_val, min_edge=MIN_LIVE_PAIR_EDGE))
+                side_label, size_val, min_edge=pair_edge))
 
             # No unmatched fills on opposite → cap is 0.99, no constraint
             if cap >= 0.99:
@@ -1766,12 +1998,14 @@ class MarketCycler:
                     if old_price and old_price > cap:
                         log.warning("repair_quote_capped_for_pair_edge",
                                     market=market.market_id[:8], side=side_label,
-                                    quoted=old_price, cap=round(cap, 4))
+                                    quoted=old_price, cap=round(cap, 4),
+                                    min_edge=pair_edge)
                     elif new_price > float(old_price or 0):
                         log.info("repair_quote_aggressed_to_cap",
                                  market=market.market_id[:8], side=side_label,
                                  old=old_price, new=new_price,
-                                 cap=round(cap, 4), best_ask=best_ask)
+                                 cap=round(cap, 4), min_edge=pair_edge,
+                                 best_ask=best_ask)
                     setattr(quotes, buy_price_attr, new_price)
             elif float(price_val) > cap:
                 # Normal mode: silently clamp to cap
