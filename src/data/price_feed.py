@@ -38,10 +38,18 @@ class PriceFeed:
         self.symbols = [s.lower() for s in symbols]
         self.vol_lookback = vol_lookback
 
-        # Latest price per symbol (uppercase key)
+        # Latest usable price per symbol (uppercase key). For fast-moving
+        # markets we prefer recent aggTrade prints for movement visibility, and
+        # fall back to bookTicker mid when trades are quiet.
         self.prices: Dict[str, float] = {}
-        # Timestamp of latest price update
+        # Timestamp of latest usable feed update
         self.timestamps: Dict[str, float] = {}
+        self.price_sources: Dict[str, str] = {}
+        self.book_mid_prices: Dict[str, float] = {}
+        self.book_timestamps: Dict[str, float] = {}
+        self.trade_prices: Dict[str, float] = {}
+        self.trade_timestamps: Dict[str, float] = {}
+        self._trade_preference_seconds: float = 1.0
         # Rolling price history for vol calculation
         self._price_history: Dict[str, deque] = {
             s.upper(): deque(maxlen=vol_lookback) for s in self.symbols
@@ -66,11 +74,15 @@ class PriceFeed:
         return self.prices.get(symbol.upper())
 
     def get_price_age(self, symbol: str) -> float:
-        """Seconds since last price update for symbol."""
+        """Seconds since last usable price/feed update for symbol."""
         ts = self.timestamps.get(symbol.upper())
         if ts is None:
             return float('inf')
         return time.time() - ts
+
+    def get_price_source(self, symbol: str) -> str:
+        """Return the stream currently driving get_price() for symbol."""
+        return self.price_sources.get(symbol.upper(), "unknown")
 
     def realized_sigma_annualized(self, symbol: str) -> float:
         """
@@ -117,8 +129,13 @@ class PriceFeed:
 
     async def _connect_and_stream(self):
         """Connect to Binance combined stream and process messages."""
-        # Build combined stream URL for all symbols using bookTicker for ultra-fast updates
-        streams = "/".join(f"{s}@bookTicker" for s in self.symbols)
+        # Build combined stream URL for all symbols. bookTicker gives fast top
+        # of book; aggTrade gives visible trade prints when top bid/ask is sticky.
+        streams = "/".join(
+            stream
+            for s in self.symbols
+            for stream in (f"{s}@bookTicker", f"{s}@aggTrade")
+        )
         
         base_url = self.ws_url
         if base_url.endswith("/ws"):
@@ -163,37 +180,68 @@ class PriceFeed:
                     log.debug("ws_parse_error", error=str(e))
 
     def _process_trade(self, data: dict):
-        """Process a single trade event from Binance."""
+        """Process a Binance bookTicker or aggTrade event."""
         # Combined stream wraps data in {"stream": ..., "data": {...}}
         if "data" in data:
             data = data["data"]
 
         symbol = data.get("s", "").upper()  # Symbol
-        
-        # bookTicker uses 'b' (best bid) and 'a' (best ask)
-        bid = float(data.get("b", 0))
-        ask = float(data.get("a", 0))
-        
-        # Calculate mid price
-        if bid > 0 and ask > 0:
-            price = (bid + ask) / 2.0
-        else:
-            # Fallback for trade stream if it happens
-            price = float(data.get("p", 0))
         ts = time.time()
+        if not symbol:
+            return
 
-        if price <= 0 or not symbol:
+        event_type = data.get("e", "")
+        is_trade = event_type in ("aggTrade", "trade") or (
+            data.get("p") is not None and data.get("b") is None and data.get("a") is None
+        )
+
+        source = "unknown"
+        source_price = 0.0
+
+        if is_trade:
+            source_price = float(data.get("p", 0) or 0)
+            if source_price <= 0:
+                return
+            self.trade_prices[symbol] = source_price
+            self.trade_timestamps[symbol] = ts
+            self.trade_ticks = getattr(self, "trade_ticks", 0) + 1
+            source = "aggTrade"
+        else:
+            # bookTicker uses 'b' (best bid) and 'a' (best ask)
+            bid = float(data.get("b", 0) or 0)
+            ask = float(data.get("a", 0) or 0)
+            if bid <= 0 or ask <= 0:
+                return
+            source_price = (bid + ask) / 2.0
+            self.book_mid_prices[symbol] = source_price
+            self.book_timestamps[symbol] = ts
+            self.book_ticks = getattr(self, "book_ticks", 0) + 1
+            source = "bookTicker"
+
+        # Prefer a very recent trade print for the displayed/model spot. Binance
+        # top-of-book mid can be unchanged for many bookTicker messages while
+        # trades continue printing inside/at the spread; this made spot look
+        # frozen even though the feed was alive. If trades go quiet, fall back to
+        # bookTicker mid so the feed remains usable.
+        trade_ts = self.trade_timestamps.get(symbol, 0.0)
+        if source != "aggTrade" and ts - trade_ts <= self._trade_preference_seconds:
+            price = self.trade_prices.get(symbol, source_price)
+            selected_source = "aggTrade"
+        else:
+            price = source_price
+            selected_source = source
+
+        if price <= 0:
             return
 
         self.prices[symbol] = price
         self.timestamps[symbol] = ts
+        self.price_sources[symbol] = selected_source
         
         # Keep track of total ticks to prove it's alive
         self.ticks = getattr(self, 'ticks', 0) + 1
 
-        # Throttle price history to ~1 sample/sec for vol calculation
-        # bookTicker fires 50-100x/sec; recording every tick would
-        # collapse realized vol to near-zero and break the BS model.
+        # Throttle price history to ~1 sample/sec for vol calculation.
         last_hist = self._last_history_ts.get(symbol, 0)
         if ts - last_hist >= 1.0:
             self._price_history[symbol].append(price)
@@ -202,7 +250,6 @@ class PriceFeed:
         # Fire callbacks
         for cb in self._callbacks:
             try:
-                # pass ticks in callback if needed, or just let dashboard access it
                 cb(symbol, price, ts)
             except Exception as e:
                 log.error("price_callback_error", error=str(e))
@@ -231,8 +278,10 @@ class PriceFeed:
                 )
                 resp.raise_for_status()
                 price = float(resp.json()["price"])
-                self.prices[symbol.upper()] = price
-                self.timestamps[symbol.upper()] = time.time()
+                sym = symbol.upper()
+                self.prices[sym] = price
+                self.timestamps[sym] = time.time()
+                self.price_sources[sym] = "rest"
                 return price
         except Exception as e:
             log.error("rest_price_error", symbol=symbol, error=str(e))

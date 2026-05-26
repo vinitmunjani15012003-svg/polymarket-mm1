@@ -101,13 +101,15 @@ class Dashboard:
         raw = s.get("raw_spot", spot)
         spread = s.get("chainlink_spread", 0)
         table.add_row("Start Price", f"${start_p:,.2f}",
-                       "Polymarket Spot", f"${spot:,.4f}")
+                       "Adjusted Spot", f"${spot:,.4f}")
         
         ws_ticks = s.get("ws_ticks", 0)
+        price_age = s.get("price_age", 0) or 0
+        price_source = s.get("price_source", "unknown") or "unknown"
         table.add_row("Fair Value P(Up)", f"{fv:.6f}",
                        "Raw Binance Spot", f"${raw:,.2f} (Spread: ${spread:,.2f})")
         table.add_row("Sigma", f"{sigma:.1%}",
-                       "WS Ticks", f"{ws_ticks}")
+                       "Feed", f"{price_source} age {price_age:.2f}s / ticks {ws_ticks}")
 
         # Quotes
         table.add_row("UP Buy", f"${up_buy:.2f} x{int(up_size)}",

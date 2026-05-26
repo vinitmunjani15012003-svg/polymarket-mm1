@@ -527,6 +527,8 @@ async def run_bot(
         dashboard._states[asset_name]['spot_price'] = adjusted
         dashboard._states[asset_name]['raw_spot'] = price
         dashboard._states[asset_name]['chainlink_spread'] = spread
+        dashboard._states[asset_name]['price_age'] = price_feed.get_price_age(symbol)
+        dashboard._states[asset_name]['price_source'] = price_feed.get_price_source(symbol)
         if live_fv is not None:
             dashboard._states[asset_name]['fair_value'] = live_fv
 

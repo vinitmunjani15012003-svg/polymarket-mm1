@@ -5,6 +5,8 @@ import pytest
 from src.config import AssetConfig, BotConfig
 import time
 
+from src.data.orderbook import BookSnapshot
+from src.data.price_feed import PriceFeed
 from src.execution.clob_client import ClobClientWrapper
 from src.execution.ctf_ops import BalanceMonitor, SimulatedBalanceMonitor, infer_collateral_token_for_market
 from src.execution.dry_run import DryRunExecutor, SimulatedOrder
@@ -17,6 +19,8 @@ from src.orchestration.market_cycler import (
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     has_negative_matched_pair_edge,
+    polymarket_implied_up_mid,
+    basis_guard_triggered,
     repair_min_edge_for_remaining,
 )
 from src.monitoring.pnl_tracker import PnLTracker
@@ -56,6 +60,58 @@ class DummyBatchExecutor(DummyExecutor):
     async def cancel_orders(self, order_ids):
         self.cancel_batches.append(order_ids)
         return self.cancel_ok
+
+
+def make_book(mid: float) -> BookSnapshot:
+    bid = round(mid - 0.01, 4)
+    ask = round(mid + 0.01, 4)
+    return BookSnapshot(
+        token_id="T",
+        timestamp=time.time(),
+        bids=[(bid, 10)],
+        asks=[(ask, 10)],
+        best_bid=bid,
+        best_ask=ask,
+        best_bid_size=10,
+        best_ask_size=10,
+        mid_price=mid,
+        micro_price=mid,
+    )
+
+
+def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
+    feed = PriceFeed("wss://stream.binance.com:9443/ws", ["BTCUSDT"])
+
+    feed._process_trade({"data": {"s": "BTCUSDT", "b": "100.00", "a": "100.02"}})
+    assert feed.get_price("BTCUSDT") == pytest.approx(100.01)
+    assert feed.get_price_source("BTCUSDT") == "bookTicker"
+
+    feed._process_trade({"data": {"e": "aggTrade", "s": "BTCUSDT", "p": "100.50"}})
+    assert feed.get_price("BTCUSDT") == pytest.approx(100.50)
+    assert feed.get_price_source("BTCUSDT") == "aggTrade"
+
+    # A following bookTicker with unchanged top-of-book should not immediately
+    # hide visible trade movement.
+    feed._process_trade({"data": {"s": "BTCUSDT", "b": "100.00", "a": "100.02"}})
+    assert feed.get_price("BTCUSDT") == pytest.approx(100.50)
+    assert feed.get_price_source("BTCUSDT") == "aggTrade"
+
+    # If trades go quiet, fall back to book mid.
+    feed.trade_timestamps["BTCUSDT"] = time.time() - 2.0
+    feed._process_trade({"data": {"s": "BTCUSDT", "b": "100.10", "a": "100.12"}})
+    assert feed.get_price("BTCUSDT") == pytest.approx(100.11)
+    assert feed.get_price_source("BTCUSDT") == "bookTicker"
+
+
+def test_basis_guard_uses_polymarket_implied_probability():
+    up_book = make_book(0.60)
+    down_book = make_book(0.40)
+
+    implied = polymarket_implied_up_mid(up_book, down_book)
+
+    assert implied == pytest.approx(0.60)
+    assert basis_guard_triggered(0.73, implied, threshold=0.12)
+    assert not basis_guard_triggered(0.65, implied, threshold=0.12)
 
 
 def test_config_validation_rejects_invalid_spreads():

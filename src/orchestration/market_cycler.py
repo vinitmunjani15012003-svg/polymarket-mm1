@@ -47,6 +47,35 @@ FV_FAVORED_ENTRY_MIN_EDGE = 0.005
 FV_FAVORED_ENTRY_MAX_SIZE = 5
 FV_FAVORED_ENTRY_STOP_SECONDS = 600
 
+# Live FV safety. If the external spot feed is stale, all model prices are
+# suspect; remove active quotes rather than trading on frozen FV. The basis guard
+# compares model P(Up) against Polymarket's current implied P(Up); a large gap
+# means the Binance→Chainlink fixed-spread assumption is probably drifting.
+MAX_SPOT_PRICE_AGE_SECONDS = 3.0
+BASIS_GUARD_MAX_FV_DEVIATION = 0.12
+
+
+def polymarket_implied_up_mid(book_up, book_down) -> Optional[float]:
+    """Estimate Polymarket-implied P(Up) from YES and NO order books."""
+    mids = []
+    if book_up and getattr(book_up, "best_bid", 0) > 0 and getattr(book_up, "best_ask", 0) > 0:
+        mids.append((float(book_up.best_bid) + float(book_up.best_ask)) / 2.0)
+    if book_down and getattr(book_down, "best_bid", 0) > 0 and getattr(book_down, "best_ask", 0) > 0:
+        down_mid = (float(book_down.best_bid) + float(book_down.best_ask)) / 2.0
+        mids.append(1.0 - down_mid)
+    if not mids:
+        return None
+    return max(0.0, min(1.0, sum(mids) / len(mids)))
+
+
+def basis_guard_triggered(fair_value: float,
+                          polymarket_mid_up: Optional[float],
+                          threshold: float = BASIS_GUARD_MAX_FV_DEVIATION) -> bool:
+    if polymarket_mid_up is None:
+        return False
+    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
+    return abs(fv - polymarket_mid_up) >= threshold
+
 
 def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: float,
                                 min_order_size: int,
@@ -1207,9 +1236,42 @@ class MarketCycler:
         raw_spot = self.price_feed.get_price(self.ac.symbol)
         if not raw_spot:
             log.warning("no_spot_price", symbol=self.ac.symbol)
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            return
+
+        price_age = self.price_feed.get_price_age(self.ac.symbol)
+        if price_age > MAX_SPOT_PRICE_AGE_SECONDS:
+            log.warning(
+                "spot_price_stale_stop_quoting",
+                asset=self.asset,
+                symbol=self.ac.symbol,
+                raw_binance_spot=round(raw_spot, 4),
+                price_age=round(price_age, 3),
+                max_age=MAX_SPOT_PRICE_AGE_SECONDS,
+            )
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(
+                market,
+                raw_spot + self.chainlink_spread,
+                self.last_fair_value or 0,
+                0,
+                "STALE_SPOT",
+                remaining,
+            )
             return
             
         spot = raw_spot + self.chainlink_spread
+        log.info(
+            "spot_feed_snapshot",
+            asset=self.asset,
+            symbol=self.ac.symbol,
+            raw_binance_spot=round(raw_spot, 4),
+            adjusted_spot=round(spot, 4),
+            spread=round(self.chainlink_spread, 4),
+            price_age=round(price_age, 3),
+            price_source=(self.price_feed.get_price_source(self.ac.symbol)
+                          if hasattr(self.price_feed, "get_price_source") else "unknown"),
+        )
 
         # Set start price if not yet captured
         if self.fair_value_model and not self.fair_value_model.start_price:
@@ -1644,6 +1706,51 @@ class MarketCycler:
         if book_down:
             best_ask_no = book_down.best_ask
             best_bid_no = book_down.best_bid
+
+        polymarket_mid_up = polymarket_implied_up_mid(book_up, book_down)
+        basis_delta = abs(fv - polymarket_mid_up) if polymarket_mid_up is not None else None
+        log.info(
+            "basis_guard_check",
+            asset=self.asset,
+            fair_value=round(fv, 4),
+            polymarket_mid_up=(round(polymarket_mid_up, 4) if polymarket_mid_up is not None else None),
+            basis_delta=(round(basis_delta, 4) if basis_delta is not None else None),
+            threshold=BASIS_GUARD_MAX_FV_DEVIATION,
+        )
+        if (repair_mode == "normal"
+                and not balance_only
+                and not is_halted
+                and basis_guard_triggered(fv, polymarket_mid_up)):
+            if abs_imbalance >= min_order_size:
+                up_size, down_size, repair_mode = compute_inventory_repair_sizes(
+                    imbalance,
+                    min_order_size,
+                    self.quote_engine.max_order_size,
+                )
+                is_halted = True
+                halt_reason = "BASIS_GUARD"
+                log.warning(
+                    "basis_guard_close_only",
+                    asset=self.asset,
+                    fair_value=round(fv, 4),
+                    polymarket_mid_up=round(polymarket_mid_up, 4),
+                    basis_delta=round(basis_delta, 4),
+                    imbalance=round(imbalance, 4),
+                    repair_mode=repair_mode,
+                )
+            else:
+                log.warning(
+                    "basis_guard_stop_quoting",
+                    asset=self.asset,
+                    fair_value=round(fv, 4),
+                    polymarket_mid_up=round(polymarket_mid_up, 4),
+                    basis_delta=round(basis_delta, 4),
+                    imbalance=round(imbalance, 4),
+                    msg="FV disagrees with Polymarket implied probability; flat/dust inventory held close-only",
+                )
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self._update_dashboard(market, spot, fv, sigma, "BASIS_GUARD", remaining)
+                return
 
         # 12. Generate quotes using share imbalance for price skewing
         #     yes_buy = Up buy price, no_buy = Down buy price
@@ -2166,6 +2273,10 @@ class MarketCycler:
             return
             
         spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0)
+        price_age = (self.price_feed.get_price_age(self.ac.symbol)
+                     if hasattr(self.price_feed, "get_price_age") else 0)
+        price_source = (self.price_feed.get_price_source(self.ac.symbol)
+                        if hasattr(self.price_feed, "get_price_source") else "unknown")
         
         state = {
             "asset": self.asset,
@@ -2176,6 +2287,8 @@ class MarketCycler:
             "spot_price": spot,
             "raw_spot": spot,
             "chainlink_spread": 0,
+            "price_age": price_age,
+            "price_source": price_source,
             "fair_value": 0,
             "sigma": 0,
             "ws_ticks": getattr(self.price_feed, "ticks", 0),
@@ -2245,6 +2358,10 @@ class MarketCycler:
         real_state = self.inventory.get_state(market.market_id, fv)
 
         raw_spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, spot)
+        price_age = (self.price_feed.get_price_age(self.ac.symbol)
+                     if hasattr(self.price_feed, "get_price_age") else 0)
+        price_source = (self.price_feed.get_price_source(self.ac.symbol)
+                        if hasattr(self.price_feed, "get_price_source") else "unknown")
         
         state = {
             "asset": self.asset,
@@ -2255,6 +2372,8 @@ class MarketCycler:
             "spot_price": spot or 0,
             "raw_spot": raw_spot or 0,
             "chainlink_spread": getattr(self, 'chainlink_spread', 0),
+            "price_age": price_age,
+            "price_source": price_source,
             "fair_value": fv,
             "sigma": sigma,
             "ws_ticks": getattr(self.price_feed, "ticks", 0),
