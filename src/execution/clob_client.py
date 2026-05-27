@@ -539,6 +539,56 @@ class ClobClientWrapper:
             log.error("cancel_error", order_id=order_id[:8], error=str(e))
             return False
 
+    async def is_order_open(self, order_id: str) -> bool:
+        """Best-effort live check that an order still exists on CLOB.
+
+        Used before cancelling a BUY maker bid that has been touched/crossed by
+        the ask. If the order disappeared, it likely filled/cancelled remotely;
+        the quote loop should avoid immediately replacing it until fill sync has
+        updated inventory.
+        """
+        if not order_id:
+            return False
+        if order_id not in self.open_orders:
+            return False
+        if not self._initialized:
+            return True
+
+        get_orders = getattr(self._client, "get_orders", None)
+        if not callable(get_orders):
+            return order_id in self.open_orders
+
+        try:
+            try:
+                resp = await self._run_client_call(get_orders)
+            except TypeError:
+                resp = await self._run_client_call(get_orders, None)
+            orders = resp if isinstance(resp, list) else resp.get("data", []) if isinstance(resp, dict) else []
+            for order in orders:
+                oid = order.get("id") or order.get("orderID") or order.get("order_id")
+                if oid != order_id:
+                    continue
+                status = str(order.get("status") or order.get("state") or "").lower()
+                if status in ("cancelled", "canceled", "filled", "matched", "closed"):
+                    self._pop_open_order(order_id)
+                    self._save_orders_state()
+                    return False
+                original = float(order.get("original_size") or order.get("size") or 0)
+                matched = float(order.get("size_matched") or order.get("matched_size") or 0)
+                if original > 0 and matched >= original:
+                    self._pop_open_order(order_id)
+                    self._save_orders_state()
+                    return False
+                return True
+
+            # Not present in open-order listing: treat as no longer open.
+            self._pop_open_order(order_id)
+            self._save_orders_state()
+            return False
+        except Exception as e:
+            log.warning("order_open_check_failed", order_id=order_id[:8], error=str(e))
+            return order_id in self.open_orders
+
     async def cancel_orders(self, order_ids: list[str]) -> bool:
         """Cancel multiple orders in one CLOB cancel_orders request."""
         if not self._initialized:
