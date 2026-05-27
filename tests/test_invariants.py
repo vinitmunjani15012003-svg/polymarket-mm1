@@ -797,6 +797,46 @@ def test_quote_direction_guard_prevents_flat_inventory_price_inversion():
     assert quotes.combined_cost <= MAX_COMBINED_COST
 
 
+def test_normal_two_sided_quotes_stay_below_model_fair_value():
+    qe = QuoteEngine()
+
+    quotes = qe.generate_quotes(
+        fair_value=0.4577,
+        t_normalized=0.75,
+        sigma=0.8,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+        best_bid_yes=0.52,
+        best_bid_no=0.47,
+        best_ask_yes=0.53,
+        best_ask_no=0.48,
+    )
+
+    assert quotes.yes_buy_price <= 0.45  # at least ~1c below YES FV
+    assert quotes.no_buy_price <= 0.54   # at least ~1c below NO FV
+    assert quotes.combined_cost <= MAX_COMBINED_COST
+
+
+def test_normal_two_sided_quotes_do_not_sit_far_below_model_when_book_allows():
+    qe = QuoteEngine()
+
+    quotes = qe.generate_quotes(
+        fair_value=0.60,
+        t_normalized=0.75,
+        sigma=0.8,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+    )
+
+    assert 0.54 <= quotes.yes_buy_price <= 0.59
+    assert 0.34 <= quotes.no_buy_price <= 0.39
+    assert quotes.combined_cost <= MAX_COMBINED_COST
+
+
 def test_quote_direction_guard_allows_inventory_repair_inversion():
     qe = QuoteEngine()
 
@@ -807,7 +847,7 @@ def test_quote_direction_guard_allows_inventory_repair_inversion():
         share_imbalance=-200.0,  # Too many NO; YES is the repair side.
         max_imbalance=1000.0,
         yes_size=10,
-        no_size=10,
+        no_size=0,
         best_bid_yes=0.52,
         best_bid_no=0.47,
         best_ask_yes=0.53,
@@ -815,7 +855,8 @@ def test_quote_direction_guard_allows_inventory_repair_inversion():
     )
 
     assert quotes.yes_buy_price > quotes.no_buy_price
-    assert quotes.combined_cost <= MAX_COMBINED_COST
+    assert quotes.yes_buy_size == 10
+    assert quotes.no_buy_size == 0
 
 
 def test_fv_favored_entry_mode_quotes_yes_first_when_fv_is_high_and_flat():

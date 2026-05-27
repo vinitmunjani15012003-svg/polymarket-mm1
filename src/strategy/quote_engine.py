@@ -25,6 +25,8 @@ log = get_logger("quote_engine")
 # Polymarket tick size for crypto binary markets
 TICK_SIZE = 0.01
 MAX_COMBINED_COST = 0.98
+NORMAL_MIN_MODEL_EDGE = 0.01
+NORMAL_MAX_MODEL_EDGE = 0.06
 
 
 @dataclass
@@ -279,6 +281,46 @@ class QuoteEngine:
         yes_buy = max(0.01, yes_buy)
         no_buy = max(0.01, no_buy)
 
+        # 8.5. Normal-mode model-edge guard.
+        #
+        # Book shadowing and pair-cost repair can push normal two-sided quotes
+        # to odd places versus our own FV: sometimes above FV (negative edge),
+        # sometimes so far below FV that we effectively stop competing. In
+        # normal paired quoting, keep both BUY prices inside a model-relative
+        # band: at least 1c edge, at most 6c edge. If the external book is below
+        # that band, keep respecting post-only best-ask limits and log the miss
+        # instead of crossing.
+        normal_two_sided = yes_size > 0 and no_size > 0
+        if normal_two_sided:
+            yes_buy = self._clamp_normal_model_edge(
+                side="yes",
+                price=yes_buy,
+                side_fair=fair_value,
+                best_ask=best_ask_yes,
+            )
+            no_buy = self._clamp_normal_model_edge(
+                side="no",
+                price=no_buy,
+                side_fair=1.0 - fair_value,
+                best_ask=best_ask_no,
+            )
+
+            # The band itself preserves >= 2c pair edge because YES_FV+NO_FV=1,
+            # but book-ask clamps/rounding can still leave a tiny violation.
+            combined = round(yes_buy + no_buy, 4)
+            if combined > MAX_COMBINED_COST:
+                overshoot = combined - MAX_COMBINED_COST
+                cents_to_drop = max(1, round(overshoot * 100))
+                # Drop the side with less model edge first.
+                yes_edge = fair_value - yes_buy
+                no_edge = (1.0 - fair_value) - no_buy
+                if yes_edge <= no_edge:
+                    yes_buy -= cents_to_drop * TICK_SIZE
+                else:
+                    no_buy -= cents_to_drop * TICK_SIZE
+                yes_buy = max(0.01, round(yes_buy, 2))
+                no_buy = max(0.01, round(no_buy, 2))
+
         # 9. Directional sanity guard.
         #
         # Orderbook clamping + re-centering can otherwise create quotes that
@@ -318,6 +360,44 @@ class QuoteEngine:
         result.edge_per_pair = round(1.0 - combined, 4)
 
         return result
+
+    @staticmethod
+    def _clamp_normal_model_edge(side: str, price: float, side_fair: float,
+                                 best_ask: Optional[float] = None) -> float:
+        """Keep normal paired BUY quotes close to, but below, model fair.
+
+        Returns a rounded price. If best_ask is already below our minimum useful
+        band, post-only safety wins and the quote may remain farther below FV.
+        """
+        if side_fair <= NORMAL_MIN_MODEL_EDGE + TICK_SIZE:
+            return max(0.01, round(price, 2))
+
+        ceiling = max(0.01, side_fair - NORMAL_MIN_MODEL_EDGE)
+        floor = max(0.01, side_fair - NORMAL_MAX_MODEL_EDGE)
+
+        guarded = min(price, ceiling)
+        guarded = max(guarded, floor)
+
+        if best_ask is not None and best_ask > 0:
+            post_only_cap = max(0.01, best_ask - TICK_SIZE)
+            if guarded >= best_ask:
+                guarded = post_only_cap
+            # If the book is below our desired floor, do not cross just to stay
+            # inside the band. The quote will be far below FV, but safely so.
+            guarded = min(guarded, post_only_cap)
+
+        rounded = round(guarded, 2)
+        edge = round(side_fair - rounded, 4)
+        if edge < NORMAL_MIN_MODEL_EDGE - 1e-9 or edge > NORMAL_MAX_MODEL_EDGE + 1e-9:
+            log.info(
+                "normal_quote_model_edge_clamped_by_book",
+                side=side,
+                side_fair=round(side_fair, 4),
+                quote=rounded,
+                edge=edge,
+                best_ask=best_ask,
+            )
+        return rounded
 
     def _time_spread_adjustment(self, t_normalized: float) -> float:
         """
