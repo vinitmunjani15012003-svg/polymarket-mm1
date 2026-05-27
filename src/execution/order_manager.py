@@ -7,6 +7,8 @@ RULES:
   3. Smart reprice: only cancel+replace if price moved > threshold
 """
 
+import asyncio
+import inspect
 import time
 from typing import Optional
 from dataclasses import dataclass
@@ -45,7 +47,9 @@ class OrderManager:
     """
 
     def __init__(self, executor, reprice_threshold: float = 0.005,
-                 min_update_interval: float = 0.0):
+                 min_update_interval: float = 0.0,
+                 crossed_bid_grace_seconds: float = 0.6,
+                 repair_crossed_bid_grace_seconds: float = 1.0):
         """
         Args:
             executor: Either ClobClientWrapper (live) or DryRunExecutor (dry-run).
@@ -70,6 +74,14 @@ class OrderManager:
         # the order we need filled and leaves one-sided inventory into expiry.
         self.repair_reprice_threshold = max(0.05, reprice_threshold)
         self.repair_min_update_interval = max(10.0, min_update_interval)
+        # BUY maker orders that touch/cross the best ask are often exactly the
+        # orders about to fill. Do not immediately cancel and chase lower; give
+        # CLOB fill/order-state propagation a short chance to catch up first.
+        self.crossed_bid_grace_seconds = max(0.0, crossed_bid_grace_seconds)
+        self.repair_crossed_bid_grace_seconds = max(
+            self.crossed_bid_grace_seconds,
+            repair_crossed_bid_grace_seconds,
+        )
         self.last_order_error: Optional[str] = None
         # Active quotes per market
         self.active: dict[str, ActiveQuotes] = {}
@@ -162,6 +174,31 @@ class OrderManager:
         cancel_ids = []
         cancel_yes = bool(yes_needs and active.yes_order_id)
         cancel_no = bool(no_needs and active.no_order_id)
+
+        if cancel_yes and self._is_crossed_buy(active.yes_price, yes_book_snapshot):
+            deferred = await self._maybe_defer_crossed_bid_cancel(
+                market_id=market_id,
+                side="yes",
+                order_id=active.yes_order_id,
+                active=active,
+                sticky_repair=yes_repair_side,
+            )
+            if deferred:
+                cancel_yes = False
+                yes_needs = False
+
+        if cancel_no and self._is_crossed_buy(active.no_price, no_book_snapshot):
+            deferred = await self._maybe_defer_crossed_bid_cancel(
+                market_id=market_id,
+                side="no",
+                order_id=active.no_order_id,
+                active=active,
+                sticky_repair=no_repair_side,
+            )
+            if deferred:
+                cancel_no = False
+                no_needs = False
+
         if cancel_yes:
             cancel_ids.append(active.yes_order_id)
         if cancel_no:
@@ -456,7 +493,9 @@ class OrderManager:
         if new_price is None or new_size <= 0:
             return True, True
 
-        # If our BUY bid crosses/touches best ask, cancel immediately.
+        # If our BUY bid crosses/touches best ask, it needs attention, but the
+        # async update path confirms exchange state and applies a short grace
+        # before actually cancelling. A crossed maker bid may be in-flight fill.
         if book_snapshot is not None and existing_price >= book_snapshot.best_ask:
             return True, True
 
@@ -484,6 +523,95 @@ class OrderManager:
             return True, False
 
         return False, False
+
+    @staticmethod
+    def _is_crossed_buy(existing_price: Optional[float], book_snapshot=None) -> bool:
+        if existing_price is None or book_snapshot is None:
+            return False
+        best_ask = getattr(book_snapshot, "best_ask", None)
+        if best_ask is None or best_ask <= 0:
+            return False
+        return existing_price >= best_ask
+
+    async def _order_still_open(self, order_id: str) -> bool:
+        """Best-effort exchange/local check for whether an order is still open."""
+        checker = getattr(self.executor, "is_order_open", None)
+        if callable(checker):
+            result = checker(order_id)
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+
+        open_orders = getattr(self.executor, "open_orders", None)
+        if isinstance(open_orders, dict):
+            return order_id in open_orders
+
+        # Unknown executor: fail conservative and assume it is still open.
+        return True
+
+    def _clear_active_side(self, active: ActiveQuotes, side: str):
+        if side == "yes":
+            active.yes_order_id = None
+            active.yes_price = None
+            active.yes_size = 0
+        else:
+            active.no_order_id = None
+            active.no_price = None
+            active.no_size = 0
+
+    async def _maybe_defer_crossed_bid_cancel(self, market_id: str, side: str,
+                                              order_id: str,
+                                              active: ActiveQuotes,
+                                              sticky_repair: bool) -> bool:
+        """Return True when the caller should skip cancel/repost this cycle.
+
+        A BUY maker bid at/above best ask is ambiguous: it may be stale, but it
+        may also be filled or partially filled while local state lags. We first
+        check whether the order still exists, then wait a short grace window and
+        check again. If it disappeared, avoid cancel/repost so the next
+        pre-quote fill sync can update inventory before new exposure is placed.
+        """
+        if not await self._order_still_open(order_id):
+            self._clear_active_side(active, side)
+            log.warning(
+                "crossed_bid_already_closed_before_cancel",
+                market=market_id[:8],
+                side=side,
+                order_id=order_id[:8],
+            )
+            return True
+
+        grace = self.repair_crossed_bid_grace_seconds if sticky_repair else self.crossed_bid_grace_seconds
+        if grace > 0:
+            log.info(
+                "crossed_bid_grace_wait",
+                market=market_id[:8],
+                side=side,
+                order_id=order_id[:8],
+                grace_ms=round(grace * 1000),
+                repair=sticky_repair,
+            )
+            await asyncio.sleep(grace)
+
+        if not await self._order_still_open(order_id):
+            self._clear_active_side(active, side)
+            log.warning(
+                "crossed_bid_closed_during_grace",
+                market=market_id[:8],
+                side=side,
+                order_id=order_id[:8],
+                repair=sticky_repair,
+            )
+            return True
+
+        log.warning(
+            "crossed_bid_cancel_after_grace",
+            market=market_id[:8],
+            side=side,
+            order_id=order_id[:8],
+            repair=sticky_repair,
+        )
+        return False
 
     def check_stale_quotes(self, market_id: str,
                             yes_book=None, no_book=None) -> bool:

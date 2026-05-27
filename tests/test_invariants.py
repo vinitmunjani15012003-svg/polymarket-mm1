@@ -62,6 +62,20 @@ class DummyBatchExecutor(DummyExecutor):
         return self.cancel_ok
 
 
+class DummyOrderStateExecutor(DummyBatchExecutor):
+    def __init__(self, states):
+        super().__init__()
+        self.states = list(states)
+
+    async def is_order_open(self, order_id):
+        if self.states:
+            state = self.states.pop(0)
+            if not state:
+                self.open_orders.pop(order_id, None)
+            return state
+        return order_id in getattr(self, "open_orders", {})
+
+
 def make_book(mid: float) -> BookSnapshot:
     bid = round(mid - 0.01, 4)
     ask = round(mid + 0.01, 4)
@@ -595,6 +609,85 @@ def test_repair_quote_reprices_when_dangerously_stale():
     assert updated is True
     assert executor.cancel_batches == [["OLD-NO"]]
     assert executor.place_batches[0][0]["price"] == 0.50
+
+
+def test_crossed_buy_bid_waits_for_fill_state_before_cancel_replace():
+    executor = DummyOrderStateExecutor(states=[True, False])
+    executor.open_orders = {
+        "OLD-YES": {"token_id": "YES1", "price": 0.50, "size": 5},
+    }
+    om = OrderManager(
+        executor,
+        reprice_threshold=0.01,
+        crossed_bid_grace_seconds=0.0,
+    )
+    active = om.get_active("MARKET1")
+    active.yes_order_id = "OLD-YES"
+    active.yes_price = 0.50
+    active.yes_size = 5
+
+    quotes = SimpleNamespace(
+        yes_buy_price=0.45,
+        no_buy_price=None,
+        yes_buy_size=5,
+        no_buy_size=0,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+            yes_book_snapshot=make_book(0.47),  # best ask 0.48, below our 0.50 bid
+        )
+    )
+
+    assert updated is False
+    assert executor.cancel_batches == []
+    assert executor.place_batches == []
+    assert active.yes_order_id is None
+
+
+def test_crossed_buy_bid_cancels_after_grace_if_still_open():
+    executor = DummyOrderStateExecutor(states=[True, True])
+    executor.open_orders = {
+        "OLD-YES": {"token_id": "YES1", "price": 0.50, "size": 5},
+    }
+    om = OrderManager(
+        executor,
+        reprice_threshold=0.01,
+        crossed_bid_grace_seconds=0.0,
+    )
+    active = om.get_active("MARKET1")
+    active.yes_order_id = "OLD-YES"
+    active.yes_price = 0.50
+    active.yes_size = 5
+
+    quotes = SimpleNamespace(
+        yes_buy_price=0.45,
+        no_buy_price=None,
+        yes_buy_size=5,
+        no_buy_size=0,
+    )
+
+    import asyncio
+
+    updated = asyncio.run(
+        om.update_quotes(
+            market_id="MARKET1",
+            token_id_yes="YES1",
+            token_id_no="NO1",
+            quotes=quotes,
+            yes_book_snapshot=make_book(0.47),
+        )
+    )
+
+    assert updated is True
+    assert executor.cancel_batches == [["OLD-YES"]]
+    assert executor.place_batches[0][0]["price"] == 0.45
 
 
 def test_sub_minimum_down_tail_quotes_light_side_only():
