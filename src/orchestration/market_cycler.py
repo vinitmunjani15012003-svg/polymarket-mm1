@@ -61,7 +61,7 @@ BASIS_GUARD_MAX_FV_DEVIATION = 0.12
 # available, and otherwise temper model confidence by elapsed time + move size.
 FV_MIN_MODEL_CONFIDENCE = 0.10
 FV_MAX_MODEL_CONFIDENCE = 0.85
-FV_DISAGREEMENT_CONFIDENCE_CAP = 0.35
+FV_DISAGREEMENT_CONFIDENCE_CAP = 0.05
 FV_HARD_DISAGREEMENT = 0.15
 
 
@@ -1395,6 +1395,45 @@ class MarketCycler:
         except Exception:
             standardized_move = 0.0
 
+        # Fetch Polymarket books early so every dashboard/early-return path uses
+        # the same authoritative blended FV. Previously, early returns displayed
+        # raw/model FV while the UI/book price was already far away (e.g. UP 15c
+        # but dashboard stuck near 54c).
+        books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
+        book_up = books.get(market.token_id_up)
+        book_down = books.get(market.token_id_down)
+        best_ask_yes = book_up.best_ask if book_up else None
+        best_bid_yes = book_up.best_bid if book_up else None
+        best_ask_no = book_down.best_ask if book_down else None
+        best_bid_no = book_down.best_bid if book_down else None
+        polymarket_mid_up = polymarket_implied_up_mid(book_up, book_down)
+        model_confidence = fv_model_confidence(
+            model_fv,
+            elapsed_fraction,
+            standardized_move,
+            polymarket_mid_up,
+        )
+        fv = blended_fair_value(model_fv, polymarket_mid_up, model_confidence)
+        self.last_fair_value = fv
+        if hasattr(self.order_mgr.executor, 'update_fair_value'):
+            self.order_mgr.executor.update_fair_value(fv, spot)
+
+        basis_delta = abs(model_fv - polymarket_mid_up) if polymarket_mid_up is not None else None
+        log.info(
+            "fair_value_inputs",
+            asset=self.asset,
+            start_price=round(float(self.fair_value_model.start_price or 0), 4),
+            live_spot=round(float(spot or 0), 4),
+            sigma=round(float(sigma or 0), 4),
+            elapsed_fraction=round(elapsed_fraction, 4),
+            standardized_move=round(float(standardized_move or 0), 4),
+            model_fv=round(float(model_fv or 0), 4),
+            market_fv=(round(polymarket_mid_up, 4) if polymarket_mid_up is not None else None),
+            model_confidence=round(float(model_confidence or 0), 4),
+            final_fv=round(float(fv or 0), 4),
+            basis_delta=(round(basis_delta, 4) if basis_delta is not None else None),
+        )
+
         # 4. Determine phase
         phase = determine_phase(remaining, self.gc.stop_quoting_seconds,
                                 self.gc.reduce_size_seconds)
@@ -1797,48 +1836,8 @@ class MarketCycler:
         else:
             self._last_close_only_repair_mode = None
 
-        # 11.5 Fetch live orderbooks in one request to prevent crossing the book.
-        books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
-        book_up = books.get(market.token_id_up)
-        book_down = books.get(market.token_id_down)
-        best_ask_yes = None
-        best_ask_no = None
-        best_bid_yes = None
-        best_bid_no = None
-        if book_up:
-            best_ask_yes = book_up.best_ask
-            best_bid_yes = book_up.best_bid
-        if book_down:
-            best_ask_no = book_down.best_ask
-            best_bid_no = book_down.best_bid
-
-        polymarket_mid_up = polymarket_implied_up_mid(book_up, book_down)
-        model_confidence = fv_model_confidence(
-            model_fv,
-            elapsed_fraction,
-            standardized_move,
-            polymarket_mid_up,
-        )
-        fv = blended_fair_value(model_fv, polymarket_mid_up, model_confidence)
-        self.last_fair_value = fv
-        if hasattr(self.order_mgr.executor, 'update_fair_value'):
-            self.order_mgr.executor.update_fair_value(fv, spot)
-
-        basis_delta = abs(model_fv - polymarket_mid_up) if polymarket_mid_up is not None else None
-        log.info(
-            "fair_value_inputs",
-            asset=self.asset,
-            start_price=round(float(self.fair_value_model.start_price or 0), 4),
-            live_spot=round(float(spot or 0), 4),
-            sigma=round(float(sigma or 0), 4),
-            elapsed_fraction=round(elapsed_fraction, 4),
-            standardized_move=round(float(standardized_move or 0), 4),
-            model_fv=round(float(model_fv or 0), 4),
-            market_fv=(round(polymarket_mid_up, 4) if polymarket_mid_up is not None else None),
-            model_confidence=round(float(model_confidence or 0), 4),
-            final_fv=round(float(fv or 0), 4),
-            basis_delta=(round(basis_delta, 4) if basis_delta is not None else None),
-        )
+        # Book snapshots/FV blend were already computed before any early-return
+        # path so dashboard, risk, sizing, and quotes all use one FV source.
         if (repair_mode == "normal"
                 and not balance_only
                 and not is_halted
