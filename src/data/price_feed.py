@@ -280,6 +280,7 @@ class PriceFeed:
     async def fetch_mt5_bridge_price(self, symbol: str) -> Optional[float]:
         """Fetch primary Exness/MT5 spot from local/remote bridge if configured."""
         if not self.mt5_bridge_url:
+            log.debug("mt5_bridge_not_configured", symbol=symbol)
             return None
         import httpx
         sym = symbol.upper()
@@ -309,6 +310,11 @@ class PriceFeed:
             self.prices[sym] = price
             self.timestamps[sym] = ts or now
             self.price_sources[sym] = "exness_mt5"
+            log.info("mt5_bridge_price_ok",
+                     symbol=bridge_symbol,
+                     price=round(price, 4),
+                     age=round(age, 3),
+                     source="exness_mt5")
             for cb in self._callbacks:
                 try:
                     cb(sym, price, ts or now)

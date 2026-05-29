@@ -213,8 +213,9 @@ def _recursive_env_sub(obj):
     return obj
 
 
-def _load_optional_env_files(paths: list[str]):
+def _load_optional_env_files(paths: list[str]) -> list[str]:
     """Load KEY=VALUE env files without overriding existing environment."""
+    loaded: list[str] = []
     for path in paths:
         if not path or not os.path.exists(path):
             continue
@@ -229,10 +230,12 @@ def _load_optional_env_files(paths: list[str]):
                     value = value.strip().strip('"').strip("'")
                     if key and key not in os.environ:
                         os.environ[key] = value
+            loaded.append(path)
         except Exception:
             # Env file is a convenience; config loading should still surface the
             # real missing-value validation later instead of failing here.
             pass
+    return loaded
 
 
 def load_config(config_path: str = "config/default.yaml",
@@ -249,13 +252,20 @@ def load_config(config_path: str = "config/default.yaml",
     """
     # Convenience for local Windows/PowerShell runs: if the MT5 bridge env file
     # sits in the bot folder, load it automatically before ${...} substitution.
-    candidate_env_files = [
-        "mt5-bridge.env",
-        ".env.mt5",
-        os.path.join(os.getcwd(), "mt5-bridge.env"),
-        os.path.join(os.getcwd(), ".env.mt5"),
-    ]
-    _load_optional_env_files(candidate_env_files)
+    config_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd()
+    override_dir = os.path.dirname(os.path.abspath(override_path)) if override_path else ""
+    repo_dir = os.path.dirname(config_dir) if os.path.basename(config_dir) == "config" else os.getcwd()
+    candidate_env_files = []
+    for base in [os.getcwd(), repo_dir, config_dir, override_dir]:
+        if not base:
+            continue
+        candidate_env_files.extend([
+            os.path.join(base, "mt5-bridge.env"),
+            os.path.join(base, ".env.mt5"),
+        ])
+    # Also support the raw relative names for users launching from repo root.
+    candidate_env_files.extend(["mt5-bridge.env", ".env.mt5"])
+    _load_optional_env_files(list(dict.fromkeys(candidate_env_files)))
 
     with open(config_path, 'r') as f:
         raw = yaml.safe_load(f)

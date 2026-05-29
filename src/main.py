@@ -133,6 +133,13 @@ async def run_bot(
 
     # Price feed (REAL for both dry-run and live)
     symbols = [ac.symbol for ac in active_assets.values()]
+    log.info(
+        "mt5_bridge_config",
+        configured=bool(config.credentials.mt5_bridge_url),
+        url_host=(config.credentials.mt5_bridge_url.split('/')[2] if config.credentials.mt5_bridge_url.startswith('http') and len(config.credentials.mt5_bridge_url.split('/')) > 2 else ""),
+        has_api_key=bool(config.credentials.mt5_bridge_api_key),
+        stale_seconds=config.credentials.mt5_bridge_stale_seconds,
+    )
     price_feed = PriceFeed(
         ws_url=config.credentials.binance_ws_url,
         symbols=symbols,
