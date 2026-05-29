@@ -270,6 +270,41 @@ def test_live_fill_dedupe_distinguishes_partial_fills_without_provider_id():
     assert [f["size"] for f in processed] == [2.0, 3.0]
 
 
+def test_live_trade_with_multiple_own_maker_orders_books_every_leg():
+    wrapper = ClobClientWrapper(
+        host="https://clob.polymarket.com",
+        private_key="0xabc",
+        chain_id=137,
+        api_key="key",
+        api_secret="secret",
+        api_passphrase="pass",
+    )
+    wrapper.open_orders = {
+        "OID1": {"token_id": "YES_TOKEN", "token_side": "yes", "size": 5.0},
+        "OID2": {"token_id": "YES_TOKEN", "token_side": "yes", "size": 5.0},
+    }
+    fills = [{
+        "id": "TRADE1",
+        "price": "0.52",
+        "size": "10",
+        "maker_orders": [
+            {"order_id": "OID1", "asset_id": "YES_TOKEN", "matched_amount": "5", "price": "0.52"},
+            {"order_id": "OID2", "asset_id": "YES_TOKEN", "matched_amount": "5", "price": "0.52"},
+        ],
+    }]
+
+    processed = wrapper.process_fills(
+        fills,
+        inventory_mgr=None,
+        market_id="MARKET1",
+        token_id_to_side={"YES_TOKEN": "yes", "NO_TOKEN": "no"},
+    )
+
+    assert [f["order_id"] for f in processed] == ["OID1", "OID2"]
+    assert sum(f["size"] for f in processed) == 10.0
+    assert wrapper.open_orders == {}
+
+
 def test_post_orders_response_normalization_handles_common_sdk_shapes():
     assert ClobClientWrapper._normalize_post_orders_response(
         [{"orderID": "A"}, {"id": "B"}], 2
@@ -895,6 +930,25 @@ def test_fv_favored_entry_mode_quotes_no_first_when_fv_is_low_and_flat():
     assert side == "no"
     assert quotes.yes_buy_size == 0
     assert quotes.no_buy_size == 5
+
+
+def test_fv_favored_entry_mode_blocks_neutral_flat_quotes_instead_of_quoting_both_sides():
+    qe = QuoteEngine()
+    quotes = qe.generate_quotes(
+        fair_value=0.50,
+        t_normalized=0.9,
+        sigma=0.8,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+    )
+
+    side = apply_fv_favored_entry_mode(quotes, 0.50, share_imbalance=0.0, min_order_size=5)
+
+    assert side == "blocked"
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 0
 
 
 def test_fv_favored_entry_mode_blocks_when_complementary_repair_is_not_executable():

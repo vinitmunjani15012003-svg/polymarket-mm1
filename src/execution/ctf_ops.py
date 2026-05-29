@@ -1404,10 +1404,22 @@ class BalanceMonitor:
                         log.warning("post_merge_balance_allowance_sync_failed",
                                     attempts=attempt)
 
+                # Refresh the actual wallet balance after relayer/indexer sync.
+                # The optimistic estimate is useful immediately, but dashboard
+                # and sizing should converge to on-chain USDC as soon as RPC can
+                # see it.
+                refreshed_balance = self._last_balance
+                for attempt in range(1, 5):
+                    refreshed_balance = await self.get_usdc_balance()
+                    if refreshed_balance >= max(0.0, balance + total_usdc - 0.01):
+                        break
+                    await asyncio.sleep(min(2 * attempt, 6))
+
                 log.info("auto_merge_complete",
                          total_pairs=total_pairs,
                          usdc_recovered=f"${total_usdc:.2f}",
                          new_balance_est=f"${balance + total_usdc:.2f}",
+                         wallet_balance=f"${refreshed_balance:.2f}",
                          lifetime_merged=f"${self._total_merged_usdc:.2f}",
                          lifetime_count=self._total_merges)
 

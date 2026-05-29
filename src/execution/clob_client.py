@@ -752,6 +752,44 @@ class ClobClientWrapper:
         fills_changed = False
         orders_changed = False
         for fill in fills:
+            # v2 trade objects can include multiple maker_orders from us in one
+            # trade. Book every matching maker leg independently; otherwise a
+            # 2x5-share fill can appear as only +5 inventory, leaving the bot
+            # thinking it is flatter than the wallet really is.
+            maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
+            if isinstance(maker_orders, list) and len(maker_orders) > 1:
+                expanded = []
+                for mo in maker_orders:
+                    if not isinstance(mo, dict):
+                        continue
+                    mo_id = (
+                        mo.get("order_id")
+                        or mo.get("orderID")
+                        or mo.get("orderId")
+                        or mo.get("id")
+                    )
+                    if not self._order_context(mo_id):
+                        continue
+                    clone = dict(fill)
+                    clone["maker_orders"] = [mo]
+                    clone["makerOrders"] = [mo]
+                    clone["maker_order_id"] = mo_id
+                    clone["order_id"] = mo_id
+                    for key in ("id", "trade_id", "transaction_hash", "tx_hash", "hash"):
+                        if clone.get(key):
+                            clone[key] = f"{clone[key]}:{mo_id}"
+                    expanded.append(clone)
+                if expanded:
+                    processed.extend(self.process_fills(
+                        expanded,
+                        inventory_mgr,
+                        market_id,
+                        edge_tracker=edge_tracker,
+                        current_mid=current_mid,
+                        token_id_to_side=token_id_to_side,
+                    ))
+                    continue
+
             fill_id = self._fill_dedupe_key(fill, market_id)
             if fill_id in self._processed_fills:
                 continue

@@ -42,8 +42,11 @@ MIN_LIVE_PAIR_EDGE = 0.02
 # favored by fair value first, then let the existing inventory-repair path quote
 # only the opposite side after a fill. This avoids opening with the adverse/cheap
 # side just because both sides are atomically quotable.
-FV_FAVORED_ENTRY_THRESHOLD = 0.55
-FV_FAVORED_ENTRY_MIN_EDGE = 0.005
+# In live flat entry, never rest both sides at once. Pick the side with
+# stronger model edge first, then let close-only repair quote the complement
+# after that leg fills. A neutral tie is held flat instead of opening inventory.
+FV_FAVORED_ENTRY_THRESHOLD = 0.50
+FV_FAVORED_ENTRY_MIN_EDGE = 0.0
 FV_FAVORED_ENTRY_MAX_SIZE = 5
 FV_FAVORED_ENTRY_STOP_SECONDS = 600
 
@@ -106,13 +109,16 @@ def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: floa
     no_edge = (1.0 - fv) - no_price
 
     side = None
-    if fv >= threshold and yes_edge >= no_edge and yes_edge >= min_entry_edge:
+    edge_epsilon = 1e-9
+    if fv > threshold + edge_epsilon and yes_edge >= min_entry_edge:
         side = "yes"
-    elif fv <= 1.0 - threshold and no_edge >= yes_edge and no_edge >= min_entry_edge:
+    elif fv < (1.0 - threshold) - edge_epsilon and no_edge >= min_entry_edge:
         side = "no"
 
     if not side:
-        return None
+        quotes.yes_buy_size = 0
+        quotes.no_buy_size = 0
+        return "blocked"
 
     # Before opening a one-sided leg, require that the complementary repair leg
     # is currently close enough to be quoted while preserving pair edge. Without
@@ -1162,6 +1168,16 @@ class MarketCycler:
                     active.no_size = 0
 
         if saw_fill:
+            # Keep wallet/dashboard capital close to reality after live fills.
+            # The normal balance monitor interval can be too slow during a fast
+            # pile-up, making the bot size from stale USDC.
+            balance_monitor = getattr(self, "balance_monitor", None)
+            if balance_monitor and hasattr(balance_monitor, "get_usdc_balance"):
+                try:
+                    await balance_monitor.get_usdc_balance()
+                except Exception as e:
+                    log.warning("post_fill_balance_refresh_failed", error=str(e))
+
             if not await self.order_mgr.cancel_market_quotes(market.market_id):
                 self.stop_reason = "fill_reactive_cancel_market_failed"
                 log.error("fill_reactive_cancel_market_failed",
