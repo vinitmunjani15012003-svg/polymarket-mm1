@@ -1582,6 +1582,12 @@ class MarketCycler:
         )
         fv = blended_fair_value(model_fv, polymarket_mid_up, model_confidence)
         self.last_fair_value = fv
+        # The final blended FV is the authoritative trading FV. Refresh the
+        # model freshness timestamp here; otherwise pre_trade_checks sees the
+        # model as stale because raw model_fv is intentionally computed with
+        # update_state=False for dashboard/market blending.
+        self.fair_value_model._last_fair_value = fv
+        self.fair_value_model._last_update_ts = now
         if hasattr(self.order_mgr.executor, 'update_fair_value'):
             self.order_mgr.executor.update_fair_value(fv, spot)
 
