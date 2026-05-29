@@ -34,7 +34,11 @@ from src.execution.ctf_ops import (
     CTFOperations, GaslessMerger, BalanceMonitor, SimulatedBalanceMonitor
 )
 from src.risk.risk_engine import RiskEngine
-from src.orchestration.market_cycler import MarketCycler
+from src.orchestration.market_cycler import (
+    MarketCycler,
+    blended_fair_value,
+    fv_model_confidence,
+)
 from src.monitoring.alerter import alerter
 
 
@@ -512,9 +516,21 @@ async def run_bot(
         if (cycler and getattr(cycler, 'fair_value_model', None) is not None
                 and ts - last_fv_ts >= 0.25):
             sigma = cycler.vol_estimator.sigma_for_model() if hasattr(cycler, 'vol_estimator') else cycler.ac.default_sigma
-            live_fv = cycler.fair_value_model.fair_value(
+            model_fv = cycler.fair_value_model.fair_value(
                 live_price, sigma, ts, update_state=False
             )
+            try:
+                import math
+                total = max(1.0, cycler.fair_value_model.resolve_ts - cycler.fair_value_model.event_start_ts)
+                elapsed = max(0.0, min(1.0, (ts - cycler.fair_value_model.event_start_ts) / total))
+                standardized_move = abs(math.log(float(live_price) / float(cycler.fair_value_model.start_price))) / max(
+                    1e-9, float(sigma or 0) * math.sqrt(total / (365.25 * 86400))
+                )
+            except Exception:
+                elapsed = 0.0
+                standardized_move = 0.0
+            confidence = fv_model_confidence(model_fv, elapsed, standardized_move, None)
+            live_fv = blended_fair_value(model_fv, None, confidence)
             last_dashboard_fv_ts[asset_name] = ts
             
         # Initialize dashboard state if it doesn't exist yet (e.g., between windows)

@@ -56,10 +56,57 @@ FV_FAVORED_ENTRY_STOP_SECONDS = 600
 # means the Binance→Chainlink fixed-spread assumption is probably drifting.
 MAX_SPOT_PRICE_AGE_SECONDS = 3.0
 BASIS_GUARD_MAX_FV_DEVIATION = 0.12
-# Do not let the instantaneous close-probability formula overreact at the very
-# start of a 15m window. Early ticks are noisy relative to the whole window, so
-# blend the raw probability toward 50/50 until the window has actually developed.
-FV_PROGRESS_BLEND_ENABLED = True
+# FV blending: the raw sigma model is useful but too jumpy by itself early in
+# 15m windows. Blend it with Polymarket-implied probability when books are
+# available, and otherwise temper model confidence by elapsed time + move size.
+FV_MIN_MODEL_CONFIDENCE = 0.10
+FV_MAX_MODEL_CONFIDENCE = 0.85
+FV_DISAGREEMENT_CONFIDENCE_CAP = 0.35
+FV_HARD_DISAGREEMENT = 0.15
+
+
+def clamp_probability(value: float, lo: float = 0.01, hi: float = 0.99) -> float:
+    try:
+        return max(lo, min(hi, float(value)))
+    except Exception:
+        return 0.50
+
+
+def fv_model_confidence(model_fv: float,
+                        elapsed_fraction: float,
+                        standardized_move: float,
+                        market_fv: Optional[float] = None,
+                        min_confidence: float = FV_MIN_MODEL_CONFIDENCE,
+                        max_confidence: float = FV_MAX_MODEL_CONFIDENCE) -> float:
+    """Confidence weight for raw model FV in a 15m binary window.
+
+    Edge cases:
+    - first seconds: stay near market/neutral
+    - large standardized move: trust model more
+    - hard model-vs-market disagreement: cap confidence, don't blindly follow it
+    """
+    elapsed = max(0.0, min(1.0, float(elapsed_fraction or 0.0)))
+    move = max(0.0, float(standardized_move or 0.0))
+    time_component = 0.60 * (elapsed ** 0.75)
+    move_component = 0.25 * min(1.0, move / 1.5)
+    confidence = min_confidence + time_component + move_component
+    confidence = max(min_confidence, min(max_confidence, confidence))
+
+    if market_fv is not None and abs(clamp_probability(model_fv) - clamp_probability(market_fv)) >= FV_HARD_DISAGREEMENT:
+        confidence = min(confidence, FV_DISAGREEMENT_CONFIDENCE_CAP)
+    return max(0.0, min(1.0, confidence))
+
+
+def blended_fair_value(model_fv: float,
+                       market_fv: Optional[float],
+                       confidence: float) -> float:
+    model = clamp_probability(model_fv)
+    conf = max(0.0, min(1.0, float(confidence or 0.0)))
+    if market_fv is None:
+        # No book: temper raw model toward neutral using the same confidence.
+        return clamp_probability(0.5 + (model - 0.5) * conf)
+    market = clamp_probability(market_fv)
+    return clamp_probability(conf * model + (1.0 - conf) * market)
 
 
 def polymarket_implied_up_mid(book_up, book_down) -> Optional[float]:
@@ -213,12 +260,6 @@ class UpDownFairValue:
             # d = drift_so_far / remaining_vol
             d = log_return_so_far / vol_sqrt_t
             prob = norm.cdf(d)
-
-            if FV_PROGRESS_BLEND_ENABLED:
-                total = max(1.0, self.resolve_ts - self.event_start_ts)
-                elapsed = max(0.0, min(total, now_ts - self.event_start_ts))
-                confidence = elapsed / total
-                prob = 0.5 + (prob - 0.5) * confidence
         else:
             # No start price: assume 50/50
             prob = 0.50
@@ -1339,23 +1380,20 @@ class MarketCycler:
         self.vol_estimator.update(spot, now)
         sigma = self.vol_estimator.sigma_for_model()
 
-        # 3. Compute fair value: P(Up)
-        fv = self.fair_value_model.fair_value(spot, sigma, now)
-        self.last_fair_value = fv
+        # 3. Compute raw model fair value: P(Up). The final trading FV is
+        # blended with market-implied probability after books are fetched below.
+        model_fv = self.fair_value_model.fair_value(spot, sigma, now, update_state=False)
+        fv = model_fv
         t_norm = self.fair_value_model.normalized_time(now)
-        log.info(
-            "fair_value_inputs",
-            asset=self.asset,
-            start_price=round(float(self.fair_value_model.start_price or 0), 4),
-            live_spot=round(float(spot or 0), 4),
-            sigma=round(float(sigma or 0), 4),
-            remaining=round(float(remaining or 0), 2),
-            fair_value=round(float(fv or 0), 4),
-        )
 
-        # Feed FV to dry-run executor for price-crossing fill simulation
-        if hasattr(self.order_mgr.executor, 'update_fair_value'):
-            self.order_mgr.executor.update_fair_value(fv, spot)
+        total_window = max(1.0, self.fair_value_model.resolve_ts - self.fair_value_model.event_start_ts)
+        elapsed_fraction = max(0.0, min(1.0, (now - self.fair_value_model.event_start_ts) / total_window))
+        try:
+            import math
+            total_years = total_window / (365.25 * 86400)
+            standardized_move = abs(math.log(float(spot) / float(self.fair_value_model.start_price))) / max(1e-9, float(sigma or 0) * math.sqrt(total_years))
+        except Exception:
+            standardized_move = 0.0
 
         # 4. Determine phase
         phase = determine_phase(remaining, self.gc.stop_quoting_seconds,
@@ -1775,19 +1813,36 @@ class MarketCycler:
             best_bid_no = book_down.best_bid
 
         polymarket_mid_up = polymarket_implied_up_mid(book_up, book_down)
-        basis_delta = abs(fv - polymarket_mid_up) if polymarket_mid_up is not None else None
+        model_confidence = fv_model_confidence(
+            model_fv,
+            elapsed_fraction,
+            standardized_move,
+            polymarket_mid_up,
+        )
+        fv = blended_fair_value(model_fv, polymarket_mid_up, model_confidence)
+        self.last_fair_value = fv
+        if hasattr(self.order_mgr.executor, 'update_fair_value'):
+            self.order_mgr.executor.update_fair_value(fv, spot)
+
+        basis_delta = abs(model_fv - polymarket_mid_up) if polymarket_mid_up is not None else None
         log.info(
-            "basis_guard_check",
+            "fair_value_inputs",
             asset=self.asset,
-            fair_value=round(fv, 4),
-            polymarket_mid_up=(round(polymarket_mid_up, 4) if polymarket_mid_up is not None else None),
+            start_price=round(float(self.fair_value_model.start_price or 0), 4),
+            live_spot=round(float(spot or 0), 4),
+            sigma=round(float(sigma or 0), 4),
+            elapsed_fraction=round(elapsed_fraction, 4),
+            standardized_move=round(float(standardized_move or 0), 4),
+            model_fv=round(float(model_fv or 0), 4),
+            market_fv=(round(polymarket_mid_up, 4) if polymarket_mid_up is not None else None),
+            model_confidence=round(float(model_confidence or 0), 4),
+            final_fv=round(float(fv or 0), 4),
             basis_delta=(round(basis_delta, 4) if basis_delta is not None else None),
-            threshold=BASIS_GUARD_MAX_FV_DEVIATION,
         )
         if (repair_mode == "normal"
                 and not balance_only
                 and not is_halted
-                and basis_guard_triggered(fv, polymarket_mid_up)):
+                and basis_guard_triggered(model_fv, polymarket_mid_up)):
             if abs_imbalance >= min_order_size:
                 up_size, down_size, repair_mode = compute_inventory_repair_sizes(
                     imbalance,
@@ -1800,6 +1855,7 @@ class MarketCycler:
                     "basis_guard_close_only",
                     asset=self.asset,
                     fair_value=round(fv, 4),
+                    model_fv=round(model_fv, 4),
                     polymarket_mid_up=round(polymarket_mid_up, 4),
                     basis_delta=round(basis_delta, 4),
                     imbalance=round(imbalance, 4),
@@ -1810,10 +1866,11 @@ class MarketCycler:
                     "basis_guard_stop_quoting",
                     asset=self.asset,
                     fair_value=round(fv, 4),
+                    model_fv=round(model_fv, 4),
                     polymarket_mid_up=round(polymarket_mid_up, 4),
                     basis_delta=round(basis_delta, 4),
                     imbalance=round(imbalance, 4),
-                    msg="FV disagrees with Polymarket implied probability; flat/dust inventory held close-only",
+                    msg="Raw model FV disagrees with Polymarket implied probability; flat/dust inventory held close-only",
                 )
                 await self.order_mgr.cancel_market_quotes(market.market_id)
                 self._update_dashboard(market, spot, fv, sigma, "BASIS_GUARD", remaining)

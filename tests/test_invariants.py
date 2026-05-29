@@ -19,6 +19,8 @@ from src.orchestration.market_cycler import (
     apply_fv_favored_entry_mode,
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
+    blended_fair_value,
+    fv_model_confidence,
     has_negative_matched_pair_edge,
     polymarket_implied_up_mid,
     basis_guard_triggered,
@@ -113,16 +115,33 @@ def test_dashboard_fair_value_peek_does_not_mutate_authoritative_state():
     assert model._last_update_ts == last_ts
 
 
-def test_fair_value_progress_blend_prevents_early_window_overconfidence():
-    start_price = 73376.89032506653
-    live_spot = start_price + 95.0
-    model = UpDownFairValue(event_start_ts=1780056900, resolve_ts=1780057800, start_price=start_price)
+def test_blended_fair_value_prevents_early_window_overconfidence():
+    model_fv = 0.95
+    confidence = fv_model_confidence(
+        model_fv=model_fv,
+        elapsed_fraction=1 / 3,
+        standardized_move=1.2,
+        market_fv=0.55,
+    )
+    final_fv = blended_fair_value(model_fv, 0.55, confidence)
 
-    early_fv = model.fair_value(live_spot, sigma_annualized=0.20, now_ts=1780057200, update_state=False)
-    late_fv = model.fair_value(live_spot, sigma_annualized=0.20, now_ts=1780057740, update_state=False)
+    assert confidence <= 0.35
+    assert 0.55 < final_fv < 0.70
 
-    assert 0.50 < early_fv < 0.70
-    assert late_fv > early_fv
+
+def test_blended_fair_value_trusts_model_more_late_when_market_agrees():
+    early_conf = fv_model_confidence(0.70, elapsed_fraction=0.1, standardized_move=0.5, market_fv=0.66)
+    late_conf = fv_model_confidence(0.70, elapsed_fraction=0.85, standardized_move=1.5, market_fv=0.66)
+
+    assert late_conf > early_conf
+    assert blended_fair_value(0.70, 0.66, late_conf) > blended_fair_value(0.70, 0.66, early_conf)
+
+
+def test_blended_fair_value_missing_book_tempers_to_neutral():
+    confidence = fv_model_confidence(0.90, elapsed_fraction=0.05, standardized_move=0.5, market_fv=None)
+    final_fv = blended_fair_value(0.90, None, confidence)
+
+    assert 0.50 < final_fv < 0.60
 
 
 def test_live_spot_must_not_apply_fixed_start_price_basis():
