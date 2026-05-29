@@ -1134,6 +1134,38 @@ def test_fv_favored_entry_mode_allows_repair_bid_near_best_bid():
     assert quotes.no_buy_size == 0
 
 
+def test_fv_favored_entry_mode_allows_moderate_directional_entry_when_time_left_under_old_gate():
+    qe = QuoteEngine()
+    quotes = qe.generate_quotes(
+        fair_value=0.655,
+        t_normalized=362 / 900,
+        sigma=0.2,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+        best_bid_yes=0.65,
+        best_ask_yes=0.66,
+        best_bid_no=0.33,
+        best_ask_no=0.34,
+    )
+    # Simulate the directional/pair-cost guards leaving FV-favored YES only.
+    quotes.no_buy_size = 0
+
+    side = apply_fv_favored_entry_mode(
+        quotes,
+        0.655,
+        share_imbalance=0.0,
+        min_order_size=5,
+        best_bid_no=0.33,
+        best_ask_no=0.34,
+    )
+
+    assert side == "yes"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
 def test_fv_favored_entry_mode_blocks_when_complementary_repair_is_not_executable():
     qe = QuoteEngine()
     quotes = qe.generate_quotes(

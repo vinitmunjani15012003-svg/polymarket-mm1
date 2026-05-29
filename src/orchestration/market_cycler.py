@@ -185,7 +185,7 @@ def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: floa
     """
     if abs(share_imbalance) >= min_order_size:
         return None
-    if quotes.yes_buy_size <= 0 or quotes.no_buy_size <= 0:
+    if quotes.yes_buy_size <= 0 and quotes.no_buy_size <= 0:
         return None
 
     yes_price = float(quotes.yes_buy_price or 0)
@@ -199,9 +199,13 @@ def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: floa
 
     side = None
     edge_epsilon = 1e-9
-    if fv > threshold + edge_epsilon and yes_edge >= min_entry_edge:
+    if (fv > threshold + edge_epsilon
+            and yes_edge >= min_entry_edge
+            and quotes.yes_buy_size > 0):
         side = "yes"
-    elif fv < (1.0 - threshold) - edge_epsilon and no_edge >= min_entry_edge:
+    elif (fv < (1.0 - threshold) - edge_epsilon
+            and no_edge >= min_entry_edge
+            and quotes.no_buy_size > 0):
         side = "no"
 
     if not side:
@@ -2134,7 +2138,7 @@ class MarketCycler:
         # complete profitable pairs under the universal pair-cost guard.
         fv_entry_side = None
         if (repair_mode == "normal" and not balance_only and not is_halted
-                and not close_only_phase and remaining >= FV_FAVORED_ENTRY_STOP_SECONDS):
+                and not close_only_phase):
             fv_entry_side = apply_fv_favored_entry_mode(
                 quotes,
                 fair_value=fv,
