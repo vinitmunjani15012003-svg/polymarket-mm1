@@ -19,6 +19,7 @@ from src.orchestration.market_cycler import (
     apply_fv_favored_entry_mode,
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
+    effective_binary_sigma,
     has_negative_matched_pair_edge,
     polymarket_implied_up_mid,
     basis_guard_triggered,
@@ -111,6 +112,24 @@ def test_dashboard_fair_value_peek_does_not_mutate_authoritative_state():
     assert peek < 0.5
     assert model.last_fair_value == authoritative
     assert model._last_update_ts == last_ts
+
+
+def test_binary_sigma_floor_prevents_near_certain_fv_from_small_early_move():
+    start_price = 73376.89032506653
+    live_spot = start_price + 95.0
+    now_ts = 1780057200
+    model = UpDownFairValue(event_start_ts=1780056900, resolve_ts=1780057800, start_price=start_price)
+
+    unsafe_fv = model.fair_value(live_spot, sigma_annualized=0.20, now_ts=now_ts, update_state=False)
+    safe_fv = model.fair_value(
+        live_spot,
+        sigma_annualized=effective_binary_sigma(0.20),
+        now_ts=now_ts,
+        update_state=False,
+    )
+
+    assert unsafe_fv > 0.90
+    assert 0.50 < safe_fv < 0.70
 
 
 def test_live_spot_must_not_apply_fixed_start_price_basis():

@@ -56,6 +56,20 @@ FV_FAVORED_ENTRY_STOP_SECONDS = 600
 # means the Binance→Chainlink fixed-spread assumption is probably drifting.
 MAX_SPOT_PRICE_AGE_SECONDS = 3.0
 BASIS_GUARD_MAX_FV_DEVIATION = 0.12
+# Annualized vol used by the binary close-probability model must not collapse to
+# long-horizon BTC IV (e.g. 20%). On a 15m binary, that makes ordinary $20-$100
+# moves look like near-certainties and produced FV≈0.95 minutes after open.
+MIN_BINARY_MODEL_SIGMA = 1.0
+
+
+def effective_binary_sigma(sigma: float,
+                           floor: float = MIN_BINARY_MODEL_SIGMA) -> float:
+    """Return a live-safe annualized sigma for 15m binary FV."""
+    try:
+        value = float(sigma or 0)
+    except Exception:
+        value = 0.0
+    return max(float(floor), min(3.0, value))
 
 
 def polymarket_implied_up_mid(book_up, book_down) -> Optional[float]:
@@ -490,6 +504,7 @@ class MarketCycler:
         # Per-market components (recreated each cycle)
         self.current_market: Optional[MarketInfo] = None
         self.fair_value_model: Optional[UpDownFairValue] = None
+        self.min_binary_model_sigma = MIN_BINARY_MODEL_SIGMA
         self.vol_estimator = VolatilityEstimator(
             lookback_seconds=global_config.vol_lookback_seconds,
             default_sigma=asset_config.default_sigma,
@@ -1327,12 +1342,33 @@ class MarketCycler:
 
         # 2. Update volatility
         self.vol_estimator.update(spot, now)
-        sigma = self.vol_estimator.sigma_for_model()
+        raw_sigma = self.vol_estimator.sigma_for_model()
+        sigma = effective_binary_sigma(
+            raw_sigma,
+            getattr(self, "min_binary_model_sigma", MIN_BINARY_MODEL_SIGMA),
+        )
+        if sigma != raw_sigma:
+            log.warning(
+                "binary_sigma_floor_applied",
+                asset=self.asset,
+                raw_sigma=round(float(raw_sigma or 0), 4),
+                effective_sigma=round(sigma, 4),
+            )
 
         # 3. Compute fair value: P(Up)
         fv = self.fair_value_model.fair_value(spot, sigma, now)
         self.last_fair_value = fv
         t_norm = self.fair_value_model.normalized_time(now)
+        log.info(
+            "fair_value_inputs",
+            asset=self.asset,
+            start_price=round(float(self.fair_value_model.start_price or 0), 4),
+            live_spot=round(float(spot or 0), 4),
+            raw_sigma=round(float(raw_sigma or 0), 4),
+            effective_sigma=round(float(sigma or 0), 4),
+            remaining=round(float(remaining or 0), 2),
+            fair_value=round(float(fv or 0), 4),
+        )
 
         # Feed FV to dry-run executor for price-crossing fill simulation
         if hasattr(self.order_mgr.executor, 'update_fair_value'):
