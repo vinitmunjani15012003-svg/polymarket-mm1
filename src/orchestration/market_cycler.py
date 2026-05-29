@@ -1430,6 +1430,8 @@ class MarketCycler:
             await self.price_feed.fetch_mt5_bridge_price(self.ac.symbol)
         raw_spot = self.price_feed.get_price(self.ac.symbol)
         price_age = self.price_feed.get_price_age(self.ac.symbol)
+        price_source = (self.price_feed.get_price_source(self.ac.symbol)
+                        if hasattr(self.price_feed, "get_price_source") else "unknown")
 
         # Binance websocket stalls are especially toxic for 15m binaries: a
         # frozen spot produces a frozen fair value while the market keeps
@@ -1448,6 +1450,8 @@ class MarketCycler:
                 )
                 raw_spot = rest_spot
                 price_age = self.price_feed.get_price_age(self.ac.symbol)
+                price_source = (self.price_feed.get_price_source(self.ac.symbol)
+                                if hasattr(self.price_feed, "get_price_source") else "unknown")
 
         if not raw_spot:
             log.warning("no_spot_price", symbol=self.ac.symbol)
@@ -1483,8 +1487,7 @@ class MarketCycler:
             live_spot=round(spot, 4),
             spread=round(self.chainlink_spread, 4),
             price_age=round(price_age, 3),
-            price_source=(self.price_feed.get_price_source(self.ac.symbol)
-                          if hasattr(self.price_feed, "get_price_source") else "unknown"),
+            price_source=price_source,
         )
 
         # Vatic is authoritative for the dashboard price-to-beat. If startup had
@@ -1536,17 +1539,18 @@ class MarketCycler:
         best_bid_no = book_down.best_bid if book_down else None
         polymarket_mid_up = polymarket_implied_up_mid(book_up, book_down)
 
-        # Dynamic live oracle/Polymarket spot estimate. Polymarket's displayed
-        # spot can run consistently away from Binance by $100+; raw Binance then
-        # biases FV. Invert the market-implied UP probability into a spot and use
-        # it as the adjusted live spot when the inferred basis is plausible.
+        # Dynamic live oracle/Polymarket spot estimate. Only use this to adjust
+        # Binance/fallback feeds. If Exness/MT5 is active, it is the primary live
+        # spot and must not be overwritten by book-implied spot.
         market_implied_spot = spot_from_binary_probability(
             self.fair_value_model.start_price,
             polymarket_mid_up,
             sigma,
             remaining,
         )
-        if market_implied_spot and abs(market_implied_spot - raw_spot) <= 300:
+        if (price_source != "exness_mt5"
+                and market_implied_spot
+                and abs(market_implied_spot - raw_spot) <= 300):
             old_spot = spot
             spot = market_implied_spot
             self.chainlink_spread = spot - raw_spot
@@ -1561,6 +1565,14 @@ class MarketCycler:
             )
         else:
             self.chainlink_spread = 0
+            if price_source == "exness_mt5" and market_implied_spot:
+                log.info(
+                    "live_spot_uses_exness_primary",
+                    asset=self.asset,
+                    exness_spot=round(raw_spot, 4),
+                    market_implied_spot=round(market_implied_spot, 4),
+                    market_fv=(round(polymarket_mid_up, 4) if polymarket_mid_up is not None else None),
+                )
 
         # 3. Compute raw model fair value: P(Up), using the dynamically adjusted
         # live spot when available. The final trading FV is blended with
