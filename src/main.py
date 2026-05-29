@@ -137,6 +137,7 @@ async def run_bot(
         ws_url=config.credentials.binance_ws_url,
         symbols=symbols,
         vol_lookback=config.global_params.vol_lookback_seconds,
+        rest_url=config.credentials.binance_rest_url,
     )
 
     # Market discovery (REAL for both modes)

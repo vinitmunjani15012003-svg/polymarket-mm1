@@ -27,14 +27,17 @@ class PriceFeed:
     """
 
     def __init__(self, ws_url: str, symbols: list[str],
-                 vol_lookback: int = 300):
+                 vol_lookback: int = 300,
+                 rest_url: str = "https://api.binance.com/api/v3"):
         """
         Args:
             ws_url: Binance WebSocket base URL.
             symbols: List of symbols like ["BTCUSDT", "ETHUSDT"].
             vol_lookback: Number of 1s price samples for vol calculation.
+            rest_url: Binance REST API base URL for stale/cold feed fallback.
         """
         self.ws_url = ws_url
+        self.rest_url = rest_url
         self.symbols = [s.lower() for s in symbols]
         self.vol_lookback = vol_lookback
 

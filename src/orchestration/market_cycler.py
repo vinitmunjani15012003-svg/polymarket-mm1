@@ -1234,12 +1234,31 @@ class MarketCycler:
 
         # 1. Get live spot price (shifted to Chainlink estimate)
         raw_spot = self.price_feed.get_price(self.ac.symbol)
+        price_age = self.price_feed.get_price_age(self.ac.symbol)
+
+        # Binance websocket stalls are especially toxic for 15m binaries: a
+        # frozen spot produces a frozen fair value while the market keeps
+        # moving. Try one REST refresh before failing closed/canceling quotes.
+        if (not raw_spot) or price_age > MAX_SPOT_PRICE_AGE_SECONDS:
+            rest_url = getattr(self.price_feed, "rest_url", "https://api.binance.com/api/v3")
+            rest_spot = await self.price_feed.fetch_price_rest(self.ac.symbol, rest_url)
+            if rest_spot:
+                log.warning(
+                    "spot_price_rest_fallback",
+                    asset=self.asset,
+                    symbol=self.ac.symbol,
+                    previous_raw_spot=(round(raw_spot, 4) if raw_spot else None),
+                    previous_price_age=(round(price_age, 3) if price_age != float('inf') else "inf"),
+                    rest_spot=round(rest_spot, 4),
+                )
+                raw_spot = rest_spot
+                price_age = self.price_feed.get_price_age(self.ac.symbol)
+
         if not raw_spot:
             log.warning("no_spot_price", symbol=self.ac.symbol)
             await self.order_mgr.cancel_market_quotes(market.market_id)
             return
 
-        price_age = self.price_feed.get_price_age(self.ac.symbol)
         if price_age > MAX_SPOT_PRICE_AGE_SECONDS:
             log.warning(
                 "spot_price_stale_stop_quoting",
