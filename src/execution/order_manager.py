@@ -388,11 +388,11 @@ class OrderManager:
             )
         return ok
 
-    async def cancel_market_quotes(self, market_id: str):
+    async def cancel_market_quotes(self, market_id: str) -> bool:
         """Cancel all quotes for a specific market."""
         active = self.active.get(market_id)
         if not active:
-            return
+            return True
 
         ok = True
         if active.yes_order_id:
@@ -404,6 +404,8 @@ class OrderManager:
             self.active[market_id] = ActiveQuotes()
         else:
             log.error("cancel_market_quotes_failed", market=market_id[:8])
+            self.last_order_error = "cancel_market_quotes_failed"
+        return ok
 
     async def cancel_all(self) -> bool:
         """Cancel all orders across all markets."""

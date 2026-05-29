@@ -1112,14 +1112,18 @@ class MarketCycler:
     async def _handle_standardized_fills(self, market: MarketInfo,
                                          fills: list[dict], fv: float,
                                          pos) -> bool:
-        """Record fills and immediately remove the newly-heavy side.
+        """Record fills and fail closed by removing all resting market quotes.
 
-        Dry-run creates fills only when the quote loop asks for them. Live CLOB
-        fills happen asynchronously, so both pre-quote and post-quote paths must
-        share the same accounting/cancel behavior. Returning False means live
-        safety failed and the caller should stop this market loop.
+        A live fill changes the inventory state immediately. If we leave any
+        stale quote resting — especially another order on the side that just
+        filled — the bot can keep buying the heavy side while the dashboard only
+        shows the last synced +5 tail. After any fill, flatten the quote surface;
+        the next cycle will rebuild from updated inventory and quote only the
+        light side when repair is needed.
         """
+        saw_fill = False
         for fill in fills:
+            saw_fill = True
             self.inventory.record_fill(
                 market.market_id, fill["side"],
                 fill["size"], fill["price"], self.asset
@@ -1138,39 +1142,40 @@ class MarketCycler:
                     fill["side"], fill["price"], fill["size"], fv
                 )
 
+            # Keep local ActiveQuotes in sync with the fill before canceling the
+            # rest. Fully filled orders may already be gone exchange-side, so do
+            # not try to cancel an order id that we know was consumed.
             active = self.order_mgr.get_active(market.market_id)
-            # After a fill, cancel the FILLED/now-heavier side immediately.
-            # Keeping that side live is exactly how live diverged from dry-run:
-            # the exchange filled us, local inventory lagged, and the next quote
-            # cycle placed/kept more wrong-side exposure.
-            if fill["side"] in ("no", "down") and active.no_order_id:
-                cancelled = await self.order_mgr.executor.cancel_order(active.no_order_id)
-                if cancelled:
-                    active.no_order_id = None
-                    active.no_price = None
-                    active.no_size = 0
-                    log.debug("fill_reactive_reprice", cancelled="no",
-                              trigger_side="no", imbalance=pos.share_imbalance())
-                else:
-                    self.stop_reason = "fill_reactive_cancel_failed:no"
-                    log.error("fill_reactive_cancel_failed",
-                              side="no", market=market.market_id[:8])
-                    self._running = False
-                    return False
-            elif fill["side"] in ("yes", "up") and active.yes_order_id:
-                cancelled = await self.order_mgr.executor.cancel_order(active.yes_order_id)
-                if cancelled:
+            fill_order_id = str(fill.get("order_id") or "")
+            fill_size = float(fill.get("size") or 0)
+            if fill["side"] in ("yes", "up") and active.yes_order_id == fill_order_id:
+                active.yes_size = max(0, float(active.yes_size or 0) - fill_size)
+                if active.yes_size <= 0.0001:
                     active.yes_order_id = None
                     active.yes_price = None
                     active.yes_size = 0
-                    log.debug("fill_reactive_reprice", cancelled="yes",
-                              trigger_side="yes", imbalance=pos.share_imbalance())
-                else:
-                    self.stop_reason = "fill_reactive_cancel_failed:yes"
-                    log.error("fill_reactive_cancel_failed",
-                              side="yes", market=market.market_id[:8])
-                    self._running = False
-                    return False
+            elif fill["side"] in ("no", "down") and active.no_order_id == fill_order_id:
+                active.no_size = max(0, float(active.no_size or 0) - fill_size)
+                if active.no_size <= 0.0001:
+                    active.no_order_id = None
+                    active.no_price = None
+                    active.no_size = 0
+
+        if saw_fill:
+            if not await self.order_mgr.cancel_market_quotes(market.market_id):
+                self.stop_reason = "fill_reactive_cancel_market_failed"
+                log.error("fill_reactive_cancel_market_failed",
+                          market=market.market_id[:8],
+                          imbalance=round(pos.share_imbalance(), 4))
+                self._running = False
+                return False
+            self._last_close_only_repair_mode = None
+            log.warning("fill_reactive_cancelled_market_quotes",
+                        market=market.market_id[:8],
+                        fills=len(fills),
+                        imbalance=round(pos.share_imbalance(), 4),
+                        up_shares=round(pos.yes_shares, 4),
+                        down_shares=round(pos.no_shares, 4))
         return True
 
     async def _sync_live_fills_before_quote(self, market: MarketInfo,

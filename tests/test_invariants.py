@@ -1173,6 +1173,9 @@ def test_live_prequote_fill_sync_updates_inventory_before_quotes():
         token_id_down="NO_TOKEN",
     )
     active = cycler.order_mgr.get_active("M1")
+    active.yes_order_id = "YES-RESTING"
+    active.yes_price = 0.57
+    active.yes_size = 5
     active.no_order_id = "NO-1"
     active.no_price = 0.43
     active.no_size = 5
@@ -1185,7 +1188,10 @@ def test_live_prequote_fill_sync_updates_inventory_before_quotes():
     assert pos.no_shares == 5
     assert pos.share_imbalance() == -5
     assert active.no_order_id is None
-    assert executor.cancelled == ["NO-1"]
+    assert cycler.order_mgr.get_active("M1").yes_order_id is None
+    # The filled NO order is already consumed; the still-resting YES quote must
+    # be canceled so the next cycle can quote close-only from fresh inventory.
+    assert executor.cancelled == ["YES-RESTING"]
 
 
 # ---------------------------------------------------------------------------
