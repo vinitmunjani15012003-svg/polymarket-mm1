@@ -261,10 +261,11 @@ def load_config(config_path: str = "config/default.yaml",
             continue
         candidate_env_files.extend([
             os.path.join(base, "mt5-bridge.env"),
+            os.path.join(base, "mt5_bridge.env"),
             os.path.join(base, ".env.mt5"),
         ])
     # Also support the raw relative names for users launching from repo root.
-    candidate_env_files.extend(["mt5-bridge.env", ".env.mt5"])
+    candidate_env_files.extend(["mt5-bridge.env", "mt5_bridge.env", ".env.mt5"])
     _load_optional_env_files(list(dict.fromkeys(candidate_env_files)))
 
     with open(config_path, 'r') as f:
