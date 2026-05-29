@@ -1424,7 +1424,10 @@ class MarketCycler:
         now = _time.time()
         remaining = market.time_remaining
 
-        # 1. Get live spot price (shifted to Chainlink estimate)
+        # 1. Get live spot price. Prefer Exness/MT5 bridge when configured;
+        # it has tracked the Polymarket oracle faster than Binance in live tests.
+        if hasattr(self.price_feed, "fetch_mt5_bridge_price"):
+            await self.price_feed.fetch_mt5_bridge_price(self.ac.symbol)
         raw_spot = self.price_feed.get_price(self.ac.symbol)
         price_age = self.price_feed.get_price_age(self.ac.symbol)
 

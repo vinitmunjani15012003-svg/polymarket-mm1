@@ -28,7 +28,10 @@ class PriceFeed:
 
     def __init__(self, ws_url: str, symbols: list[str],
                  vol_lookback: int = 300,
-                 rest_url: str = "https://api.binance.com/api/v3"):
+                 rest_url: str = "https://api.binance.com/api/v3",
+                 mt5_bridge_url: str = "",
+                 mt5_bridge_api_key: str = "",
+                 mt5_bridge_stale_seconds: float = 5.0):
         """
         Args:
             ws_url: Binance WebSocket base URL.
@@ -38,6 +41,9 @@ class PriceFeed:
         """
         self.ws_url = ws_url
         self.rest_url = rest_url
+        self.mt5_bridge_url = (mt5_bridge_url or "").rstrip("/")
+        self.mt5_bridge_api_key = mt5_bridge_api_key or ""
+        self.mt5_bridge_stale_seconds = float(mt5_bridge_stale_seconds or 5.0)
         self.symbols = [s.lower() for s in symbols]
         self.vol_lookback = vol_lookback
 
@@ -264,6 +270,54 @@ class PriceFeed:
             await self._ws.close()
             self._ws = None
         log.info("price_feed_stopped")
+
+    def _mt5_symbol_for(self, symbol: str) -> str:
+        sym = symbol.upper()
+        if sym.endswith("USDT"):
+            return sym[:-1]  # BTCUSDT -> BTCUSD
+        return sym
+
+    async def fetch_mt5_bridge_price(self, symbol: str) -> Optional[float]:
+        """Fetch primary Exness/MT5 spot from local/remote bridge if configured."""
+        if not self.mt5_bridge_url:
+            return None
+        import httpx
+        sym = symbol.upper()
+        bridge_symbol = self._mt5_symbol_for(sym)
+        try:
+            headers = {}
+            if self.mt5_bridge_api_key:
+                headers["X-API-Key"] = self.mt5_bridge_api_key
+            async with httpx.AsyncClient(timeout=1.5) as client:
+                resp = await client.get(
+                    f"{self.mt5_bridge_url}/price/{bridge_symbol}",
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            price = float(data.get("mid") or data.get("price") or 0)
+            ts = float(data.get("ts") or 0)
+            now = time.time()
+            if price <= 0:
+                return None
+            age = max(0.0, now - ts) if ts else 0.0
+            if age > self.mt5_bridge_stale_seconds:
+                log.warning("mt5_bridge_price_stale",
+                            symbol=bridge_symbol, age=round(age, 3),
+                            max_age=self.mt5_bridge_stale_seconds)
+                return None
+            self.prices[sym] = price
+            self.timestamps[sym] = ts or now
+            self.price_sources[sym] = "exness_mt5"
+            for cb in self._callbacks:
+                try:
+                    cb(sym, price, ts or now)
+                except Exception as e:
+                    log.debug("mt5_price_callback_error", error=str(e))
+            return price
+        except Exception as e:
+            log.warning("mt5_bridge_price_error", symbol=bridge_symbol, error=str(e))
+            return None
 
     async def fetch_price_rest(self, symbol: str,
                                 rest_url: str) -> Optional[float]:

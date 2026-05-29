@@ -138,6 +138,9 @@ async def run_bot(
         symbols=symbols,
         vol_lookback=config.global_params.vol_lookback_seconds,
         rest_url=config.credentials.binance_rest_url,
+        mt5_bridge_url=config.credentials.mt5_bridge_url,
+        mt5_bridge_api_key=config.credentials.mt5_bridge_api_key,
+        mt5_bridge_stale_seconds=config.credentials.mt5_bridge_stale_seconds,
     )
 
     # Market discovery (REAL for both modes)

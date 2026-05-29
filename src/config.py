@@ -78,9 +78,12 @@ class CredentialsConfig:
     # Polygon RPC (for balance monitoring and on-chain ops)
     # NOTE: polygon-rpc.com has become unreliable/paid for many tenants.
     polygon_rpc_url: str = "https://polygon-bor.publicnode.com"
-    # Binance
+    # Binance / primary spot bridge
     binance_ws_url: str = "wss://stream.binance.com:9443/ws"
     binance_rest_url: str = "https://api.binance.com/api/v3"
+    mt5_bridge_url: str = ""
+    mt5_bridge_api_key: str = ""
+    mt5_bridge_stale_seconds: float = 5.0
 
 
 @dataclass
@@ -243,6 +246,7 @@ def load_config(config_path: str = "config/default.yaml",
     creds_raw = raw.get("credentials", {})
     pm = creds_raw.get("polymarket", {})
     bn = creds_raw.get("binance", {})
+    mt5 = creds_raw.get("mt5_bridge", {})
     builder = creds_raw.get("builder", {})
     config.credentials = CredentialsConfig(
         private_key=pm.get("private_key", ""),
@@ -264,6 +268,9 @@ def load_config(config_path: str = "config/default.yaml",
         polygon_rpc_url=pm.get("polygon_rpc_url", "https://polygon-bor.publicnode.com"),
         binance_ws_url=bn.get("ws_url", "wss://stream.binance.com:9443/ws"),
         binance_rest_url=bn.get("rest_url", "https://api.binance.com/api/v3"),
+        mt5_bridge_url=mt5.get("url", ""),
+        mt5_bridge_api_key=mt5.get("api_key", ""),
+        mt5_bridge_stale_seconds=float(mt5.get("stale_seconds", 5.0)),
     )
 
     # Assets
