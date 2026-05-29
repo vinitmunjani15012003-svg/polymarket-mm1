@@ -939,9 +939,13 @@ class MarketCycler:
 
     async def _find_next_market(self) -> Optional[MarketInfo]:
         """Find the next eligible market for this asset."""
+        # Start/resume the actual current window until the configured dead zone.
+        # The previous +30s buffer made mid-window restarts silently skip to the
+        # next 15m market while the user was looking at the still-live current
+        # Polymarket UI, making FV appear wildly wrong.
         market = await self.discovery.discover_single(
             self.asset,
-            min_remaining=self.gc.stop_quoting_seconds + 30
+            min_remaining=self.gc.stop_quoting_seconds
         )
         if not market:
             # Try with lower threshold — maybe market just opened
