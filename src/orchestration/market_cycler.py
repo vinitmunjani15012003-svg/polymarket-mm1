@@ -1090,21 +1090,7 @@ class MarketCycler:
             self.ac.symbol, market.event_start_ts
         )
         
-        # 3. If Vatic failed, try to calibrate from the Polymarket Orderbook
-        if not start_price and binance_start_price:
-            raw_spot = self.price_feed.get_price(self.ac.symbol)
-            if raw_spot:
-                self.vol_estimator.update(raw_spot, _time.time())
-                sigma = self.vol_estimator.sigma_for_model()
-                calibrated = self._calibrate_strike_from_market(market, raw_spot, sigma)
-                if calibrated:
-                    start_price = calibrated
-                    start_price_source = "market_calibration"
-                    log.info("start_price_from_calibration",
-                             asset=self.asset, price=start_price)
-
-        # 4. Fallback: Chainlink on-chain aggregator before Binance. Binance is
-        # not the Polymarket price-to-beat source; only use it as a last resort.
+        # 3. Fallback: Chainlink on-chain aggregator before any synthetic value.
         if not start_price:
             start_price = await self.price_feed.fetch_chainlink_price(
                 self.ac.symbol, market.event_start_ts
@@ -1114,13 +1100,19 @@ class MarketCycler:
                 log.info("start_price_from_chainlink",
                          asset=self.asset, price=start_price)
 
-        # 5. Last-resort fallback: Binance. This is non-authoritative and will
-        # be replaced by Vatic in quote cycles as soon as Vatic is available.
-        if binance_start_price and not start_price:
-            start_price = binance_start_price
-            start_price_source = "binance"
-            log.warning("start_price_from_binance_non_authoritative",
-                        asset=self.asset, price=start_price)
+        # Do not use Binance/adjusted/current spot as price-to-beat. If Vatic
+        # and Chainlink are unavailable, fail closed and retry the market loop;
+        # showing spot as the strike is worse than not quoting.
+        if not start_price:
+            log.error(
+                "price_to_beat_unavailable",
+                asset=self.asset,
+                market=market.slug,
+                msg="Vatic/Chainlink strike unavailable; refusing Binance/spot fallback",
+            )
+            self.stop_reason = "price_to_beat_unavailable"
+            self._update_dashboard(market, spot, 0, 0, "NO_STRIKE", market.time_remaining)
+            return
             
         # Do NOT apply a fixed start-time Vatic/Chainlink-vs-Binance basis to
         # live Binance spot. The oracle target can differ sharply from Binance's
@@ -1145,57 +1137,8 @@ class MarketCycler:
                 getattr(self.price_feed, "rest_url", "https://api.binance.com/api/v3"),
             )
 
-        # Validate only fallback/calibrated strikes against live Polymarket
-        # books. Vatic is the strike/price-to-beat source of truth for the
-        # dashboard; do not replace it with a market-calibrated value, or the
-        # displayed price-to-beat can drift away from the actual strike.
-        if start_price and current_spot and start_price_source != "vatic":
-            try:
-                books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
-                market_mid = polymarket_implied_up_mid(
-                    books.get(market.token_id_up),
-                    books.get(market.token_id_down),
-                )
-                self.vol_estimator.update(current_spot, _time.time())
-                sigma = self.vol_estimator.sigma_for_model()
-                if start_price_disagrees_with_market(
-                    start_price,
-                    current_spot,
-                    sigma,
-                    market.event_start_ts,
-                    market.resolve_ts,
-                    market_mid,
-                    now_ts=_time.time(),
-                ):
-                    calibrated = self._calibrate_strike_from_market(
-                        market, current_spot, sigma, p_up_override=market_mid)
-                    if calibrated:
-                        log.warning(
-                            "start_price_replaced_by_market_calibration",
-                            asset=self.asset,
-                            old_start=round(start_price, 4),
-                            calibrated=round(calibrated, 4),
-                            current_spot=round(current_spot, 4),
-                            market_fv=(round(market_mid, 4) if market_mid is not None else None),
-                        )
-                        start_price = calibrated
-            except Exception as e:
-                log.warning("start_price_validation_failed", asset=self.asset, error=str(e))
-
-        # 6. Last resort: Current spot
-        if not start_price:
-            elapsed = _time.time() - market.event_start_ts
-            start_price = current_spot
-            start_price_source = "spot"
-            if elapsed < 30:
-                log.info("start_price_from_spot",
-                         asset=self.asset, reason="window_just_opened")
-            else:
-                log.warning("start_price_from_spot",
-                            asset=self.asset,
-                            reason="all_sources_failed",
-                            elapsed_s=round(elapsed))
-
+        # Vatic/Chainlink are the price-to-beat source of truth; do not replace
+        # them with market-calibrated or spot-derived values.
         self.start_price_source = start_price_source
         log.info("market_start_price",
                  asset=self.asset,
@@ -1514,9 +1457,13 @@ class MarketCycler:
             except Exception as e:
                 log.debug("vatic_retry_failed", asset=self.asset, error=str(e))
 
-        # Set start price if not yet captured
+        # Never set price-to-beat from live/adjusted spot in quote cycles. The
+        # strike must come from Vatic/Chainlink initialization or retry above.
         if self.fair_value_model and not self.fair_value_model.start_price:
-            self.fair_value_model.set_start_price(spot)
+            log.warning("missing_authoritative_start_price", asset=self.asset)
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, 0, 0, "NO_STRIKE", remaining)
+            return
 
         # 2. Update volatility
         self.vol_estimator.update(spot, now)

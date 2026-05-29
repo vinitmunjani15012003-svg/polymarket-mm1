@@ -213,6 +213,28 @@ def _recursive_env_sub(obj):
     return obj
 
 
+def _load_optional_env_files(paths: list[str]):
+    """Load KEY=VALUE env files without overriding existing environment."""
+    for path in paths:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except Exception:
+            # Env file is a convenience; config loading should still surface the
+            # real missing-value validation later instead of failing here.
+            pass
+
+
 def load_config(config_path: str = "config/default.yaml",
                 override_path: Optional[str] = None) -> BotConfig:
     """
@@ -225,6 +247,16 @@ def load_config(config_path: str = "config/default.yaml",
     Returns:
         Fully populated BotConfig instance.
     """
+    # Convenience for local Windows/PowerShell runs: if the MT5 bridge env file
+    # sits in the bot folder, load it automatically before ${...} substitution.
+    candidate_env_files = [
+        "mt5-bridge.env",
+        ".env.mt5",
+        os.path.join(os.getcwd(), "mt5-bridge.env"),
+        os.path.join(os.getcwd(), ".env.mt5"),
+    ]
+    _load_optional_env_files(candidate_env_files)
+
     with open(config_path, 'r') as f:
         raw = yaml.safe_load(f)
 
