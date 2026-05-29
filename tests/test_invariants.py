@@ -13,6 +13,7 @@ from src.execution.dry_run import DryRunExecutor, SimulatedOrder
 from src.execution.order_manager import OrderManager
 from src.orchestration.market_cycler import (
     MarketCycler,
+    UpDownFairValue,
     aggressive_repair_price,
     apply_dust_price_guardrails,
     apply_fv_favored_entry_mode,
@@ -91,6 +92,40 @@ def make_book(mid: float) -> BookSnapshot:
         mid_price=mid,
         micro_price=mid,
     )
+
+
+def test_updown_fair_value_polarity_tracks_raw_price_vs_start():
+    model = UpDownFairValue(event_start_ts=1000, resolve_ts=1900, start_price=100.0)
+
+    assert model.fair_value(101.0, sigma_annualized=0.8, now_ts=1300) > 0.5
+    assert model.fair_value(99.0, sigma_annualized=0.8, now_ts=1300) < 0.5
+
+
+def test_dashboard_fair_value_peek_does_not_mutate_authoritative_state():
+    model = UpDownFairValue(event_start_ts=1000, resolve_ts=1900, start_price=100.0)
+    authoritative = model.fair_value(101.0, sigma_annualized=0.8, now_ts=1200)
+    last_ts = model._last_update_ts
+
+    peek = model.fair_value(99.0, sigma_annualized=0.8, now_ts=1300, update_state=False)
+
+    assert peek < 0.5
+    assert model.last_fair_value == authoritative
+    assert model._last_update_ts == last_ts
+
+
+def test_live_spot_must_not_apply_fixed_start_price_basis():
+    # Regression for live bug: Vatic/Chainlink target differed from Binance's
+    # window-open print by ~-$111. Applying that fixed basis to live Binance spot
+    # made raw spot above the target appear far below it, flipping FV DOWN.
+    start_price = 73376.89032506653
+    raw_live_spot = 73380.0
+    mistaken_basis = start_price - 73487.98
+    mistaken_adjusted = raw_live_spot + mistaken_basis
+
+    assert raw_live_spot > start_price
+    assert mistaken_adjusted < start_price
+    model = UpDownFairValue(event_start_ts=1780056000, resolve_ts=1780056900, start_price=start_price)
+    assert model.fair_value(raw_live_spot, sigma_annualized=0.8, now_ts=1780056300) > 0.5
 
 
 def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():

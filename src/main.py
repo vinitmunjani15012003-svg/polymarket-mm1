@@ -502,7 +502,7 @@ async def run_bot(
         if cycler:
             cycler.notify_price_update()
         spread = getattr(cycler, 'chainlink_spread', 0) if cycler else 0
-        adjusted = price + spread
+        live_price = price + spread
         
         # Compute live FV for the dashboard at a bounded rate. Binance bookTicker
         # can fire many times/sec; recomputing sigma+FV on every tick is avoidable
@@ -512,20 +512,21 @@ async def run_bot(
         if (cycler and getattr(cycler, 'fair_value_model', None) is not None
                 and ts - last_fv_ts >= 0.25):
             sigma = cycler.vol_estimator.sigma_for_model() if hasattr(cycler, 'vol_estimator') else cycler.ac.default_sigma
-            # We use 'adjusted' price to match Chainlink assumption
-            live_fv = cycler.fair_value_model.fair_value(adjusted, sigma, ts)
+            live_fv = cycler.fair_value_model.fair_value(
+                live_price, sigma, ts, update_state=False
+            )
             last_dashboard_fv_ts[asset_name] = ts
             
         # Initialize dashboard state if it doesn't exist yet (e.g., between windows)
         if asset_name not in dashboard._states:
             dashboard._states[asset_name] = {
-                'asset': asset_name, 'spot_price': adjusted,
+                'asset': asset_name, 'spot_price': live_price,
                 'phase': 'WAITING', 'time_remaining': 0,
                 'start_price': 0, 'fair_value': 0, 'sigma': 0,
             }
             dashboard._global_state.update(dashboard._states[asset_name])
         # Update spot price in-place
-        dashboard._states[asset_name]['spot_price'] = adjusted
+        dashboard._states[asset_name]['spot_price'] = live_price
         dashboard._states[asset_name]['raw_spot'] = price
         dashboard._states[asset_name]['chainlink_spread'] = spread
         dashboard._states[asset_name]['price_age'] = price_feed.get_price_age(symbol)
@@ -534,7 +535,7 @@ async def run_bot(
             dashboard._states[asset_name]['fair_value'] = live_fv
 
         if dashboard._global_state.get('asset') == asset_name:
-            dashboard._global_state['spot_price'] = adjusted
+            dashboard._global_state['spot_price'] = live_price
             dashboard._global_state['raw_spot'] = price
             dashboard._global_state['chainlink_spread'] = spread
             if live_fv is not None:

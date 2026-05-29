@@ -182,7 +182,7 @@ class UpDownFairValue:
         self._last_update_ts = 0.0
 
     def fair_value(self, current_price: float, sigma_annualized: float,
-                   now_ts: float = None) -> float:
+                   now_ts: float = None, update_state: bool = True) -> float:
         """
         Compute P(Up) = P(price_end >= price_start).
 
@@ -214,8 +214,9 @@ class UpDownFairValue:
             prob = 0.50
 
         prob = max(0.01, min(0.99, prob))
-        self._last_fair_value = prob
-        self._last_update_ts = now_ts
+        if update_state:
+            self._last_fair_value = prob
+            self._last_update_ts = now_ts
         return prob
 
     def set_start_price(self, price: float):
@@ -994,16 +995,23 @@ class MarketCycler:
             log.info("start_price_from_binance",
                      asset=self.asset, price=start_price)
             
-        # Calculate the Chainlink vs Binance spread
+        # Do NOT apply a fixed start-time Vatic/Chainlink-vs-Binance basis to
+        # live Binance spot. The oracle target can differ sharply from Binance's
+        # exact window-open print because of provider timing/lag, and carrying
+        # that one-time basis forward inverted FV in live windows (e.g. target
+        # 73376, Binance open 73488, live Binance 73374 became false live spot
+        # 73263). Use Vatic/Chainlink only as the price-to-beat; use raw live
+        # Binance as the best estimate of the final price path.
         self.chainlink_spread = 0
         if start_price and binance_start_price and start_price != binance_start_price:
-            self.chainlink_spread = start_price - binance_start_price
-            log.info("chainlink_spread_calculated", 
-                     asset=self.asset, spread=round(self.chainlink_spread, 2))
+            log.info("start_price_basis_observed_not_applied",
+                     asset=self.asset,
+                     start_price=round(start_price, 4),
+                     binance_start_price=round(binance_start_price, 4),
+                     basis=round(start_price - binance_start_price, 4))
 
-        # Adjust the current Binance spot by the spread to simulate Chainlink live spot
         raw_binance_spot = self.price_feed.get_price(self.ac.symbol)
-        current_spot = raw_binance_spot + self.chainlink_spread if raw_binance_spot else None
+        current_spot = raw_binance_spot if raw_binance_spot else None
 
         # 3. Fallback: Chainlink on-chain aggregator
         if not start_price:
@@ -1292,7 +1300,7 @@ class MarketCycler:
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(
                 market,
-                raw_spot + self.chainlink_spread,
+                raw_spot,
                 self.last_fair_value or 0,
                 0,
                 "STALE_SPOT",
@@ -1300,13 +1308,13 @@ class MarketCycler:
             )
             return
             
-        spot = raw_spot + self.chainlink_spread
+        spot = raw_spot
         log.info(
             "spot_feed_snapshot",
             asset=self.asset,
             symbol=self.ac.symbol,
             raw_binance_spot=round(raw_spot, 4),
-            adjusted_spot=round(spot, 4),
+            live_spot=round(spot, 4),
             spread=round(self.chainlink_spread, 4),
             price_age=round(price_age, 3),
             price_source=(self.price_feed.get_price_source(self.ac.symbol)
