@@ -231,7 +231,11 @@ def _load_optional_env_files(paths: list[str]) -> list[str]:
                     key, value = line.split("=", 1)
                     key = key.strip()
                     value = value.strip().strip('"').strip("'")
-                    if key and key not in os.environ:
+                    # Override only missing/empty process env values. This fixes
+                    # PowerShell sessions where MT5_BRIDGE_URL/API_KEY exist but
+                    # are empty, causing config to stay disabled even though the
+                    # env file was found and loaded.
+                    if key and (key not in os.environ or os.environ.get(key, "") == ""):
                         os.environ[key] = value
             loaded.append(path)
         except Exception:
