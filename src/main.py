@@ -34,11 +34,7 @@ from src.execution.ctf_ops import (
     CTFOperations, GaslessMerger, BalanceMonitor, SimulatedBalanceMonitor
 )
 from src.risk.risk_engine import RiskEngine
-from src.orchestration.market_cycler import (
-    MarketCycler,
-    blended_fair_value,
-    fv_model_confidence,
-)
+from src.orchestration.market_cycler import MarketCycler
 from src.monitoring.alerter import alerter
 
 
@@ -490,7 +486,6 @@ async def run_bot(
     # Build symbol -> asset lookup and cycler lookup for live price piping
     symbol_to_asset = {ac.symbol.upper(): name for name, ac in active_assets.items()}
     cycler_by_asset = {}
-    last_dashboard_fv_ts: dict[str, float] = {}
 
     # Market cycler tasks
     for cycler in cyclers:
@@ -508,32 +503,9 @@ async def run_bot(
         spread = getattr(cycler, 'chainlink_spread', 0) if cycler else 0
         live_price = price + spread
         
-        # Compute live FV for the dashboard at a bounded rate. Binance bookTicker
-        # can fire many times/sec; recomputing sigma+FV on every tick is avoidable
-        # event-loop noise and quote cycles compute the authoritative FV anyway.
-        live_fv = None
-        last_fv_ts = last_dashboard_fv_ts.get(asset_name, 0.0)
-        if (cycler and getattr(cycler, 'fair_value_model', None) is not None
-                and ts - last_fv_ts >= 0.25):
-            sigma = cycler.vol_estimator.sigma_for_model() if hasattr(cycler, 'vol_estimator') else cycler.ac.default_sigma
-            model_fv = cycler.fair_value_model.fair_value(
-                live_price, sigma, ts, update_state=False
-            )
-            try:
-                import math
-                total = max(1.0, cycler.fair_value_model.resolve_ts - cycler.fair_value_model.event_start_ts)
-                elapsed = max(0.0, min(1.0, (ts - cycler.fair_value_model.event_start_ts) / total))
-                standardized_move = abs(math.log(float(live_price) / float(cycler.fair_value_model.start_price))) / max(
-                    1e-9, float(sigma or 0) * math.sqrt(total / (365.25 * 86400))
-                )
-            except Exception:
-                elapsed = 0.0
-                standardized_move = 0.0
-            confidence = fv_model_confidence(model_fv, elapsed, standardized_move, None)
-            live_fv = blended_fair_value(model_fv, None, confidence)
-            last_dashboard_fv_ts[asset_name] = ts
-            
-        # Initialize dashboard state if it doesn't exist yet (e.g., between windows)
+        # Initialize dashboard state if it doesn't exist yet (e.g., between windows).
+        # Do not recompute fair_value here: quote cycles are the only
+        # authoritative FV writer because they include Polymarket book context.
         if asset_name not in dashboard._states:
             dashboard._states[asset_name] = {
                 'asset': asset_name, 'spot_price': live_price,
@@ -547,15 +519,11 @@ async def run_bot(
         dashboard._states[asset_name]['chainlink_spread'] = spread
         dashboard._states[asset_name]['price_age'] = price_feed.get_price_age(symbol)
         dashboard._states[asset_name]['price_source'] = price_feed.get_price_source(symbol)
-        if live_fv is not None:
-            dashboard._states[asset_name]['fair_value'] = live_fv
 
         if dashboard._global_state.get('asset') == asset_name:
             dashboard._global_state['spot_price'] = live_price
             dashboard._global_state['raw_spot'] = price
             dashboard._global_state['chainlink_spread'] = spread
-            if live_fv is not None:
-                dashboard._global_state['fair_value'] = live_fv
 
     price_feed.on_price_update(on_live_price)
 
