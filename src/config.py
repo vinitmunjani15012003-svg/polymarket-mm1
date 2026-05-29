@@ -213,6 +213,9 @@ def _recursive_env_sub(obj):
     return obj
 
 
+_LOADED_ENV_FILES: list[str] = []
+
+
 def _load_optional_env_files(paths: list[str]) -> list[str]:
     """Load KEY=VALUE env files without overriding existing environment."""
     loaded: list[str] = []
@@ -235,6 +238,8 @@ def _load_optional_env_files(paths: list[str]) -> list[str]:
             # Env file is a convenience; config loading should still surface the
             # real missing-value validation later instead of failing here.
             pass
+    global _LOADED_ENV_FILES
+    _LOADED_ENV_FILES = loaded
     return loaded
 
 
@@ -262,10 +267,29 @@ def load_config(config_path: str = "config/default.yaml",
         candidate_env_files.extend([
             os.path.join(base, "mt5-bridge.env"),
             os.path.join(base, "mt5_bridge.env"),
+            os.path.join(base, "mt5-bridge.env.txt"),
+            os.path.join(base, "mt5_bridge.env.txt"),
             os.path.join(base, ".env.mt5"),
         ])
     # Also support the raw relative names for users launching from repo root.
-    candidate_env_files.extend(["mt5-bridge.env", "mt5_bridge.env", ".env.mt5"])
+    candidate_env_files.extend([
+        "mt5-bridge.env", "mt5_bridge.env", "mt5-bridge.env.txt",
+        "mt5_bridge.env.txt", ".env.mt5",
+    ])
+    # Last-resort local search: Windows downloads often append .txt or users run
+    # from a sibling folder. Keep this bounded to likely repo/config roots.
+    for root in {os.getcwd(), repo_dir, config_dir, override_dir}:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_depth = os.path.relpath(dirpath, root).count(os.sep)
+            if rel_depth > 2:
+                dirnames[:] = []
+                continue
+            for name in filenames:
+                lname = name.lower()
+                if lname in {"mt5-bridge.env", "mt5_bridge.env", ".env.mt5"} or lname.startswith(("mt5-bridge.env", "mt5_bridge.env")):
+                    candidate_env_files.append(os.path.join(dirpath, name))
     _load_optional_env_files(list(dict.fromkeys(candidate_env_files)))
 
     with open(config_path, 'r') as f:

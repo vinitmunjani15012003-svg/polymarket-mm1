@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from src import config as config_module
 from src.config import load_config, BotConfig
 from src.monitoring.logger import setup_logging, get_logger
 from src.monitoring.dashboard import Dashboard
@@ -139,6 +140,7 @@ async def run_bot(
         url_host=(config.credentials.mt5_bridge_url.split('/')[2] if config.credentials.mt5_bridge_url.startswith('http') and len(config.credentials.mt5_bridge_url.split('/')) > 2 else ""),
         has_api_key=bool(config.credentials.mt5_bridge_api_key),
         stale_seconds=config.credentials.mt5_bridge_stale_seconds,
+        loaded_env_files=getattr(config_module, "_LOADED_ENV_FILES", []),
     )
     price_feed = PriceFeed(
         ws_url=config.credentials.binance_ws_url,
