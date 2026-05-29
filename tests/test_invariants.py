@@ -26,6 +26,7 @@ from src.orchestration.market_cycler import (
     basis_guard_triggered,
     repair_min_edge_for_remaining,
     start_price_disagrees_with_market,
+    spot_from_binary_probability,
 )
 from src.monitoring.pnl_tracker import PnLTracker
 from src.risk.risk_engine import pre_trade_checks
@@ -143,6 +144,18 @@ def test_blended_fair_value_missing_book_tempers_to_neutral():
     final_fv = blended_fair_value(0.90, None, confidence)
 
     assert 0.50 < final_fv < 0.60
+
+
+def test_market_implied_spot_recovers_polymarket_oracle_basis():
+    implied = spot_from_binary_probability(
+        start_price=74146.08001391211,
+        p_up=0.355,
+        sigma=0.20,
+        time_remaining=855.7,
+    )
+
+    assert implied == pytest.approx(74117.37, abs=0.1)
+    assert 74207.21 - implied > 80
 
 
 def test_start_price_validation_rejects_strike_inconsistent_with_market_mid():
