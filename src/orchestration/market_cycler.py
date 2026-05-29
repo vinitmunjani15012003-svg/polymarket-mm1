@@ -616,6 +616,8 @@ class MarketCycler:
             immediate_drift_threshold=tox_immediate_drift_threshold,
         )
         self.last_fair_value: Optional[float] = None
+        self.start_price_source: str = "unknown"
+        self._last_vatic_retry_ts: float = 0.0
         self.stop_reason: str | None = None
         self._last_close_only_repair_mode: str | None = None
         self._last_toxicity_repair_override_log: float = 0.0
@@ -1050,6 +1052,8 @@ class MarketCycler:
         self._repair_mode_started_at = None
         start_price = None
         start_price_source = "unknown"
+        self.start_price_source = "unknown"
+        self._last_vatic_retry_ts = 0.0
         binance_start_price = None
 
         log.info("initializing_new_market", asset=self.asset, slug=market.slug)
@@ -1083,12 +1087,24 @@ class MarketCycler:
                     log.info("start_price_from_calibration",
                              asset=self.asset, price=start_price)
 
-        # 4. Fallback: just use Binance if calibration failed
+        # 4. Fallback: Chainlink on-chain aggregator before Binance. Binance is
+        # not the Polymarket price-to-beat source; only use it as a last resort.
+        if not start_price:
+            start_price = await self.price_feed.fetch_chainlink_price(
+                self.ac.symbol, market.event_start_ts
+            )
+            if start_price:
+                start_price_source = "chainlink"
+                log.info("start_price_from_chainlink",
+                         asset=self.asset, price=start_price)
+
+        # 5. Last-resort fallback: Binance. This is non-authoritative and will
+        # be replaced by Vatic in quote cycles as soon as Vatic is available.
         if binance_start_price and not start_price:
             start_price = binance_start_price
             start_price_source = "binance"
-            log.info("start_price_from_binance",
-                     asset=self.asset, price=start_price)
+            log.warning("start_price_from_binance_non_authoritative",
+                        asset=self.asset, price=start_price)
             
         # Do NOT apply a fixed start-time Vatic/Chainlink-vs-Binance basis to
         # live Binance spot. The oracle target can differ sharply from Binance's
@@ -1150,17 +1166,7 @@ class MarketCycler:
             except Exception as e:
                 log.warning("start_price_validation_failed", asset=self.asset, error=str(e))
 
-        # 3. Fallback: Chainlink on-chain aggregator
-        if not start_price:
-            start_price = await self.price_feed.fetch_chainlink_price(
-                self.ac.symbol, market.event_start_ts
-            )
-            if start_price:
-                start_price_source = "chainlink"
-                log.info("start_price_from_chainlink",
-                         asset=self.asset, price=start_price)
-
-        # 4. Last resort: Current spot
+        # 6. Last resort: Current spot
         if not start_price:
             elapsed = _time.time() - market.event_start_ts
             start_price = current_spot
@@ -1174,6 +1180,7 @@ class MarketCycler:
                             reason="all_sources_failed",
                             elapsed_s=round(elapsed))
 
+        self.start_price_source = start_price_source
         log.info("market_start_price",
                  asset=self.asset,
                  start_price=start_price,
@@ -1460,6 +1467,30 @@ class MarketCycler:
             price_source=(self.price_feed.get_price_source(self.ac.symbol)
                           if hasattr(self.price_feed, "get_price_source") else "unknown"),
         )
+
+        # Vatic is authoritative for the dashboard price-to-beat. If startup had
+        # to fall back to Binance/spot because Vatic was temporarily unavailable,
+        # keep retrying and replace the displayed/model strike as soon as Vatic
+        # responds.
+        if (self.fair_value_model
+                and getattr(self, "start_price_source", "unknown") != "vatic"
+                and now - getattr(self, "_last_vatic_retry_ts", 0.0) >= 5.0):
+            self._last_vatic_retry_ts = now
+            try:
+                vatic_price = await self.price_feed.fetch_vatic_strike(
+                    self.ac.symbol, market.event_start_ts)
+                if vatic_price:
+                    old_start = self.fair_value_model.start_price
+                    self.fair_value_model.start_price = vatic_price
+                    self.start_price_source = "vatic"
+                    log.warning(
+                        "start_price_corrected_to_vatic",
+                        asset=self.asset,
+                        old_start=round(float(old_start or 0), 4),
+                        vatic=round(float(vatic_price), 4),
+                    )
+            except Exception as e:
+                log.debug("vatic_retry_failed", asset=self.asset, error=str(e))
 
         # Set start price if not yet captured
         if self.fair_value_model and not self.fair_value_model.start_price:
