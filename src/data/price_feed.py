@@ -79,19 +79,26 @@ class PriceFeed:
         self._callbacks.append(callback)
 
     def get_price(self, symbol: str) -> Optional[float]:
-        """Get latest price for symbol (e.g., 'BTCUSDT')."""
-        return self.prices.get(symbol.upper())
+        """Get latest active price for symbol (e.g., 'BTCUSDT')."""
+        sym = symbol.upper()
+        if self.mt5_bridge_url and not self._mt5_active(sym):
+            return getattr(self, "binance_fallback_price", None)
+        return self.prices.get(sym)
 
     def get_price_age(self, symbol: str) -> float:
-        """Seconds since last usable price/feed update for symbol."""
-        ts = self.timestamps.get(symbol.upper())
+        """Seconds since last usable active price/feed update for symbol."""
+        sym = symbol.upper()
+        ts = self.timestamps.get(sym)
         if ts is None:
             return float('inf')
         return time.time() - ts
 
     def get_price_source(self, symbol: str) -> str:
         """Return the stream currently driving get_price() for symbol."""
-        return self.price_sources.get(symbol.upper(), "unknown")
+        sym = symbol.upper()
+        if self.mt5_bridge_url and not self._mt5_active(sym):
+            return getattr(self, "binance_fallback_source", "fallback_unavailable")
+        return self.price_sources.get(sym, "unknown")
 
     def _mt5_active(self, symbol: str) -> bool:
         """True when Exness/MT5 is the current fresh primary spot."""
@@ -100,7 +107,10 @@ class PriceFeed:
             return False
         if self.price_sources.get(sym) != "exness_mt5":
             return False
-        return self.get_price_age(sym) <= self.mt5_bridge_stale_seconds
+        ts = self.timestamps.get(sym)
+        if ts is None:
+            return False
+        return time.time() - ts <= self.mt5_bridge_stale_seconds
 
     def realized_sigma_annualized(self, symbol: str) -> float:
         """
@@ -252,17 +262,18 @@ class PriceFeed:
         if price <= 0:
             return
 
-        # When Exness/MT5 is configured and fresh, Binance is fallback only. Do
-        # not let Binance websocket ticks overwrite the active spot or dashboard;
-        # otherwise adjusted/live spot flips between Exness and Binance.
-        if self._mt5_active(symbol):
+        # When Exness/MT5 is configured, Binance is fallback only. Do not let
+        # bookTicker/aggTrade overwrite active spot/dashboard. If MT5 later goes
+        # stale, get_price() will expose this fallback price.
+        if self.mt5_bridge_url:
             self.binance_fallback_price = price
             self.binance_fallback_ts = ts
             self.binance_fallback_source = selected_source
-            log.debug("binance_tick_ignored_mt5_primary",
-                      symbol=symbol,
-                      source=selected_source,
-                      mt5_age=round(self.get_price_age(symbol), 3))
+            if self._mt5_active(symbol):
+                log.debug("binance_tick_ignored_mt5_primary",
+                          symbol=symbol,
+                          source=selected_source,
+                          mt5_age=round(self.get_price_age(symbol), 3))
             return
 
         self.prices[symbol] = price
