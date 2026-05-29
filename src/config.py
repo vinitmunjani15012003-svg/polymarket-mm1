@@ -229,7 +229,19 @@ def _load_optional_env_files(paths: list[str]) -> list[str]:
                     if not line or line.startswith("#") or "=" not in line:
                         continue
                     key, value = line.split("=", 1)
-                    key = key.strip()
+                    key = key.strip().lstrip("\ufeff")
+                    # Support common Windows/PowerShell/env syntaxes:
+                    #   MT5_BRIDGE_URL=...
+                    #   export MT5_BRIDGE_URL=...
+                    #   $env:MT5_BRIDGE_URL=...
+                    #   set MT5_BRIDGE_URL=...
+                    lowered = key.lower()
+                    if lowered.startswith("export "):
+                        key = key[7:].strip()
+                    elif lowered.startswith("$env:"):
+                        key = key[5:].strip()
+                    elif lowered.startswith("set "):
+                        key = key[4:].strip()
                     value = value.strip().strip('"').strip("'")
                     # Override only missing/empty process env values. This fixes
                     # PowerShell sessions where MT5_BRIDGE_URL/API_KEY exist but

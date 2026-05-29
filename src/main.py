@@ -141,6 +141,8 @@ async def run_bot(
         has_api_key=bool(config.credentials.mt5_bridge_api_key),
         stale_seconds=config.credentials.mt5_bridge_stale_seconds,
         loaded_env_files=getattr(config_module, "_LOADED_ENV_FILES", []),
+        mt5_env_url_present=bool(os.environ.get("MT5_BRIDGE_URL")),
+        mt5_env_key_present=bool(os.environ.get("MT5_BRIDGE_API_KEY")),
     )
     price_feed = PriceFeed(
         ws_url=config.credentials.binance_ws_url,
