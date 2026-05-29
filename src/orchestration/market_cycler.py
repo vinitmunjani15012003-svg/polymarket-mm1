@@ -1049,6 +1049,7 @@ class MarketCycler:
         self._has_done_30s_merge = False
         self._repair_mode_started_at = None
         start_price = None
+        start_price_source = "unknown"
         binance_start_price = None
 
         log.info("initializing_new_market", asset=self.asset, slug=market.slug)
@@ -1060,6 +1061,7 @@ class MarketCycler:
             self.ac.symbol, market.event_start_ts
         )
         if start_price:
+            start_price_source = "vatic"
             log.info("start_price_from_vatic",
                      asset=self.asset, price=start_price)
 
@@ -1077,12 +1079,14 @@ class MarketCycler:
                 calibrated = self._calibrate_strike_from_market(market, raw_spot, sigma)
                 if calibrated:
                     start_price = calibrated
+                    start_price_source = "market_calibration"
                     log.info("start_price_from_calibration",
                              asset=self.asset, price=start_price)
 
         # 4. Fallback: just use Binance if calibration failed
         if binance_start_price and not start_price:
             start_price = binance_start_price
+            start_price_source = "binance"
             log.info("start_price_from_binance",
                      asset=self.asset, price=start_price)
             
@@ -1109,12 +1113,11 @@ class MarketCycler:
                 getattr(self.price_feed, "rest_url", "https://api.binance.com/api/v3"),
             )
 
-        # Validate the candidate strike against live Polymarket books. Vatic can
-        # occasionally return a provider/window value that is inconsistent with
-        # the actively traded Polymarket market (observed ~100 points away on
-        # BTC). In that case, infer the price-to-beat from the market's UP mid
-        # rather than anchoring FV to a bad strike.
-        if start_price and current_spot:
+        # Validate only fallback/calibrated strikes against live Polymarket
+        # books. Vatic is the strike/price-to-beat source of truth for the
+        # dashboard; do not replace it with a market-calibrated value, or the
+        # displayed price-to-beat can drift away from the actual strike.
+        if start_price and current_spot and start_price_source != "vatic":
             try:
                 books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
                 market_mid = polymarket_implied_up_mid(
@@ -1153,6 +1156,7 @@ class MarketCycler:
                 self.ac.symbol, market.event_start_ts
             )
             if start_price:
+                start_price_source = "chainlink"
                 log.info("start_price_from_chainlink",
                          asset=self.asset, price=start_price)
 
@@ -1160,6 +1164,7 @@ class MarketCycler:
         if not start_price:
             elapsed = _time.time() - market.event_start_ts
             start_price = current_spot
+            start_price_source = "spot"
             if elapsed < 30:
                 log.info("start_price_from_spot",
                          asset=self.asset, reason="window_just_opened")
@@ -1173,7 +1178,8 @@ class MarketCycler:
                  asset=self.asset,
                  start_price=start_price,
                  current_spot=current_spot,
-                 window_start_ts=market.event_start_ts)
+                 window_start_ts=market.event_start_ts,
+                 source=start_price_source)
 
         self.fair_value_model = UpDownFairValue(
             event_start_ts=market.event_start_ts,

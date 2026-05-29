@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -144,6 +145,51 @@ def test_blended_fair_value_missing_book_tempers_to_neutral():
     final_fv = blended_fair_value(0.90, None, confidence)
 
     assert 0.50 < final_fv < 0.60
+
+
+def test_vatic_strike_remains_price_to_beat_even_when_market_model_disagrees():
+    import asyncio
+
+    class FakePriceFeed:
+        prices = {"BTCUSDT": 74207.21}
+        rest_url = "https://api.binance.com/api/v3"
+
+        async def fetch_vatic_strike(self, symbol, ts):
+            return 74146.08001391211
+
+        async def fetch_historical_price(self, symbol, ts):
+            return 74283.0
+
+        def get_price(self, symbol):
+            return self.prices.get(symbol)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = FakePriceFeed()
+    cycler.book_reader = SimpleNamespace(get_books=AsyncMock(return_value={}))
+    cycler.vol_estimator = SimpleNamespace(update=lambda *a, **k: None, sigma_for_model=lambda: 0.20)
+    cycler._update_dashboard = lambda *a, **k: None
+    cycler.chainlink_spread = 0
+    cycler.regime_config = SimpleNamespace()
+    cycler.toxicity_config = SimpleNamespace()
+    cycler.quote_engine = SimpleNamespace(reset_params=lambda: None)
+    cycler.edge_tracker = SimpleNamespace()
+    cycler.toxicity_monitor = SimpleNamespace()
+    cycler._running = False
+
+    market = SimpleNamespace(
+        slug="btc-updown-15m-test",
+        event_start_ts=1780074900,
+        resolve_ts=1780075800,
+        time_remaining=800,
+        token_id_up="UP",
+        token_id_down="DOWN",
+    )
+
+    asyncio.run(cycler._run_market(market))
+
+    assert cycler.fair_value_model.start_price == pytest.approx(74146.08001391211)
 
 
 def test_market_implied_spot_recovers_polymarket_oracle_basis():
