@@ -131,6 +131,25 @@ def basis_guard_triggered(fair_value: float,
     return abs(fv - polymarket_mid_up) >= threshold
 
 
+def start_price_disagrees_with_market(start_price: float,
+                                      current_spot: float,
+                                      sigma: float,
+                                      event_start_ts: float,
+                                      resolve_ts: float,
+                                      market_fv: Optional[float],
+                                      threshold: float = 0.25,
+                                      now_ts: Optional[float] = None) -> bool:
+    """Return True when a candidate price-to-beat is implausible vs live books."""
+    if market_fv is None or not start_price or not current_spot:
+        return False
+    model_fv = UpDownFairValue(
+        event_start_ts=event_start_ts,
+        resolve_ts=resolve_ts,
+        start_price=start_price,
+    ).fair_value(current_spot, sigma, now_ts=now_ts, update_state=False)
+    return abs(clamp_probability(model_fv) - clamp_probability(market_fv)) >= threshold
+
+
 def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: float,
                                 min_order_size: int,
                                 threshold: float = FV_FAVORED_ENTRY_THRESHOLD,
@@ -1067,6 +1086,49 @@ class MarketCycler:
 
         raw_binance_spot = self.price_feed.get_price(self.ac.symbol)
         current_spot = raw_binance_spot if raw_binance_spot else None
+        if not current_spot and hasattr(self.price_feed, "fetch_price_rest"):
+            current_spot = await self.price_feed.fetch_price_rest(
+                self.ac.symbol,
+                getattr(self.price_feed, "rest_url", "https://api.binance.com/api/v3"),
+            )
+
+        # Validate the candidate strike against live Polymarket books. Vatic can
+        # occasionally return a provider/window value that is inconsistent with
+        # the actively traded Polymarket market (observed ~100 points away on
+        # BTC). In that case, infer the price-to-beat from the market's UP mid
+        # rather than anchoring FV to a bad strike.
+        if start_price and current_spot:
+            try:
+                books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
+                market_mid = polymarket_implied_up_mid(
+                    books.get(market.token_id_up),
+                    books.get(market.token_id_down),
+                )
+                self.vol_estimator.update(current_spot, _time.time())
+                sigma = self.vol_estimator.sigma_for_model()
+                if start_price_disagrees_with_market(
+                    start_price,
+                    current_spot,
+                    sigma,
+                    market.event_start_ts,
+                    market.resolve_ts,
+                    market_mid,
+                    now_ts=_time.time(),
+                ):
+                    calibrated = self._calibrate_strike_from_market(
+                        market, current_spot, sigma, p_up_override=market_mid)
+                    if calibrated:
+                        log.warning(
+                            "start_price_replaced_by_market_calibration",
+                            asset=self.asset,
+                            old_start=round(start_price, 4),
+                            calibrated=round(calibrated, 4),
+                            current_spot=round(current_spot, 4),
+                            market_fv=(round(market_mid, 4) if market_mid is not None else None),
+                        )
+                        start_price = calibrated
+            except Exception as e:
+                log.warning("start_price_validation_failed", asset=self.asset, error=str(e))
 
         # 3. Fallback: Chainlink on-chain aggregator
         if not start_price:

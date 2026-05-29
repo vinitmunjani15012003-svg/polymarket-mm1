@@ -25,6 +25,7 @@ from src.orchestration.market_cycler import (
     polymarket_implied_up_mid,
     basis_guard_triggered,
     repair_min_edge_for_remaining,
+    start_price_disagrees_with_market,
 )
 from src.monitoring.pnl_tracker import PnLTracker
 from src.risk.risk_engine import pre_trade_checks
@@ -142,6 +143,33 @@ def test_blended_fair_value_missing_book_tempers_to_neutral():
     final_fv = blended_fair_value(0.90, None, confidence)
 
     assert 0.50 < final_fv < 0.60
+
+
+def test_start_price_validation_rejects_strike_inconsistent_with_market_mid():
+    # Observed live failure mode: a candidate strike made the raw model near 0.99
+    # while the live UP book was around 0.545. That strike must be replaced by
+    # market calibration before the dashboard/trader trusts it.
+    assert start_price_disagrees_with_market(
+        start_price=73173.25705600431,
+        current_spot=73330.0,
+        sigma=0.20,
+        event_start_ts=1780058700,
+        resolve_ts=1780059600,
+        market_fv=0.545,
+        now_ts=1780059111,
+    ) is True
+
+
+def test_start_price_validation_keeps_candidate_consistent_with_market_mid():
+    assert start_price_disagrees_with_market(
+        start_price=73320.0,
+        current_spot=73330.0,
+        sigma=0.20,
+        event_start_ts=1780058700,
+        resolve_ts=1780059600,
+        market_fv=0.545,
+        now_ts=1780059111,
+    ) is False
 
 
 def test_live_spot_must_not_apply_fixed_start_price_basis():
