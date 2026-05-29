@@ -172,6 +172,8 @@ def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: floa
                                 threshold: float = FV_FAVORED_ENTRY_THRESHOLD,
                                 best_ask_yes: Optional[float] = None,
                                 best_ask_no: Optional[float] = None,
+                                best_bid_yes: Optional[float] = None,
+                                best_bid_no: Optional[float] = None,
                                 min_pair_edge: float = MIN_LIVE_PAIR_EDGE,
                                 min_entry_edge: float = FV_FAVORED_ENTRY_MIN_EDGE,
                                 max_entry_size: int = FV_FAVORED_ENTRY_MAX_SIZE) -> str | None:
@@ -208,12 +210,18 @@ def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: floa
         return "blocked"
 
     # Before opening a one-sided leg, require that the complementary repair leg
-    # is currently close enough to be quoted while preserving pair edge. Without
-    # this, a first-leg fill can sit naked for the whole window while repair is
-    # capped far below the book (the main 35-window residual failure mode).
+    # is not far behind the current maker queue while preserving pair edge.
+    # Checking against best_ask was too strict and stopped quoting entirely in
+    # normal 59/40 style books; repair is a BUY bid, so best_bid proximity is the
+    # right maker-feasibility check.
+    max_repair_bid_lag = 0.02
     if side == "yes":
         repair_cap = 1.0 - yes_price - min_pair_edge
-        if best_ask_no is not None and (float(best_ask_no) - 0.01) > repair_cap:
+        if best_bid_no is not None:
+            repair_too_far = repair_cap < float(best_bid_no) - max_repair_bid_lag
+        else:
+            repair_too_far = best_ask_no is not None and (float(best_ask_no) - 0.01) > repair_cap
+        if repair_too_far:
             quotes.yes_buy_size = 0
             quotes.no_buy_size = 0
             return "blocked"
@@ -222,7 +230,11 @@ def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: floa
         return "yes"
 
     repair_cap = 1.0 - no_price - min_pair_edge
-    if best_ask_yes is not None and (float(best_ask_yes) - 0.01) > repair_cap:
+    if best_bid_yes is not None:
+        repair_too_far = repair_cap < float(best_bid_yes) - max_repair_bid_lag
+    else:
+        repair_too_far = best_ask_yes is not None and (float(best_ask_yes) - 0.01) > repair_cap
+    if repair_too_far:
         quotes.yes_buy_size = 0
         quotes.no_buy_size = 0
         return "blocked"
@@ -2130,6 +2142,8 @@ class MarketCycler:
                 min_order_size=min_order_size,
                 best_ask_yes=best_ask_yes,
                 best_ask_no=best_ask_no,
+                best_bid_yes=best_bid_yes,
+                best_bid_no=best_bid_no,
             )
             if fv_entry_side:
                 log_method = log.warning if fv_entry_side == "blocked" else log.info

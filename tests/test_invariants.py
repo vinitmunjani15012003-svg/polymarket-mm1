@@ -1104,6 +1104,36 @@ def test_fv_favored_entry_mode_blocks_neutral_flat_quotes_instead_of_quoting_bot
     assert quotes.no_buy_size == 0
 
 
+def test_fv_favored_entry_mode_allows_repair_bid_near_best_bid():
+    qe = QuoteEngine()
+    quotes = qe.generate_quotes(
+        fair_value=0.595,
+        t_normalized=0.8,
+        sigma=0.2,
+        share_imbalance=0.0,
+        max_imbalance=1000.0,
+        yes_size=10,
+        no_size=10,
+        best_bid_yes=0.59,
+        best_ask_yes=0.60,
+        best_bid_no=0.40,
+        best_ask_no=0.41,
+    )
+
+    side = apply_fv_favored_entry_mode(
+        quotes,
+        0.595,
+        share_imbalance=0.0,
+        min_order_size=5,
+        best_bid_no=0.40,
+        best_ask_no=0.41,
+    )
+
+    assert side == "yes"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
 def test_fv_favored_entry_mode_blocks_when_complementary_repair_is_not_executable():
     qe = QuoteEngine()
     quotes = qe.generate_quotes(
