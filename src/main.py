@@ -512,7 +512,6 @@ async def run_bot(
         if (cycler and getattr(cycler, 'fair_value_model', None) is not None
                 and ts - last_fv_ts >= 0.25):
             sigma = cycler.vol_estimator.sigma_for_model() if hasattr(cycler, 'vol_estimator') else cycler.ac.default_sigma
-            sigma = max(float(getattr(cycler, "min_binary_model_sigma", 1.0)), min(3.0, float(sigma or 0)))
             live_fv = cycler.fair_value_model.fair_value(
                 live_price, sigma, ts, update_state=False
             )
