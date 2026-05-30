@@ -324,6 +324,21 @@ def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     assert feed.get_price_source("BTCUSDT") == "bookTicker"
 
 
+def test_stale_spot_dashboard_sigma_does_not_collapse_to_zero():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.last_sigma = 0.72
+    cycler.vol_estimator = SimpleNamespace(sigma_for_model=lambda: 0.60)
+    cycler.ac = SimpleNamespace(default_sigma=0.45)
+
+    assert cycler._dashboard_sigma_for_stale_spot() == pytest.approx(0.72)
+
+    cycler.last_sigma = None
+    assert cycler._dashboard_sigma_for_stale_spot() == pytest.approx(0.60)
+
+    cycler.vol_estimator = SimpleNamespace(sigma_for_model=lambda: 0)
+    assert cycler._dashboard_sigma_for_stale_spot() == pytest.approx(0.45)
+
+
 def test_basis_guard_uses_polymarket_implied_probability():
     up_book = make_book(0.60)
     down_book = make_book(0.40)

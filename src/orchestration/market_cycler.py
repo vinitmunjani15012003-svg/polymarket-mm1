@@ -632,6 +632,7 @@ class MarketCycler:
             immediate_drift_threshold=tox_immediate_drift_threshold,
         )
         self.last_fair_value: Optional[float] = None
+        self.last_sigma: Optional[float] = None
         self.start_price_source: str = "unknown"
         self._last_vatic_retry_ts: float = 0.0
         self.stop_reason: str | None = None
@@ -1416,7 +1417,7 @@ class MarketCycler:
                 market,
                 raw_spot,
                 self.last_fair_value or 0,
-                0,
+                self._dashboard_sigma_for_stale_spot(),
                 "STALE_SPOT",
                 remaining,
             )
@@ -1469,6 +1470,7 @@ class MarketCycler:
         # 2. Update volatility
         self.vol_estimator.update(spot, now)
         sigma = self.vol_estimator.sigma_for_model()
+        self.last_sigma = sigma
 
         t_norm = self.fair_value_model.normalized_time(now)
         total_window = max(1.0, self.fair_value_model.resolve_ts - self.fair_value_model.event_start_ts)
@@ -2594,6 +2596,18 @@ class MarketCycler:
             state["merge_message"] = bm_stats.get("merge_message", "")
             
         self._dashboard_cb(state)
+
+    def _dashboard_sigma_for_stale_spot(self) -> float:
+        """Best dashboard sigma when spot is stale and model updates are paused."""
+        if self.last_sigma and self.last_sigma > 0:
+            return self.last_sigma
+        try:
+            sigma = self.vol_estimator.sigma_for_model()
+            if sigma and sigma > 0:
+                return sigma
+        except Exception:
+            pass
+        return float(getattr(self.ac, "default_sigma", 0) or 0)
 
     def _update_dashboard(self, market, spot, fv, sigma, phase,
                            remaining, quotes=None, pos=None,
