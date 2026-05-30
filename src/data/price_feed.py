@@ -85,10 +85,15 @@ class PriceFeed:
         # becomes stale. Staleness should fail closed in the quote cycle, not
         # silently swap dashboard/trading state back to Binance aggTrade between
         # MT5 bridge polls.
-        if self.mt5_bridge_url and self.price_sources.get(sym) == "exness_mt5":
-            return self.prices.get(sym)
         if self.mt5_bridge_url:
-            return getattr(self, "binance_fallback_price", None)
+            # MT5/Exness is primary-by-policy once configured. Before the first
+            # successful MT5 tick, fail closed instead of promoting Binance
+            # aggTrade/bookTicker to the active trading/dashboard price. After a
+            # successful tick, keep returning that MT5 value even if it becomes
+            # stale; the quote cycle will cancel quoting on staleness.
+            if self.price_sources.get(sym) == "exness_mt5":
+                return self.prices.get(sym)
+            return None
         return self.prices.get(sym)
 
     def get_price_age(self, symbol: str) -> float:
@@ -102,10 +107,12 @@ class PriceFeed:
     def get_price_source(self, symbol: str) -> str:
         """Return the stream currently driving get_price() for symbol."""
         sym = symbol.upper()
-        if self.mt5_bridge_url and self.price_sources.get(sym) == "exness_mt5":
-            return "exness_mt5" if self._mt5_active(sym) else "exness_mt5_stale"
         if self.mt5_bridge_url:
-            return getattr(self, "binance_fallback_source", "fallback_unavailable")
+            if self.price_sources.get(sym) == "exness_mt5":
+                return "exness_mt5" if self._mt5_active(sym) else "exness_mt5_stale"
+            # Binance may still be collected as diagnostics/fallback cache, but
+            # it must not appear as the active source while MT5 is configured.
+            return "exness_mt5_unavailable"
         return self.price_sources.get(sym, "unknown")
 
     def _mt5_active(self, symbol: str) -> bool:
@@ -372,6 +379,14 @@ class PriceFeed:
         Fallback: fetch price via REST if WebSocket is down.
         Uses Binance public ticker endpoint (no auth needed).
         """
+        if self.mt5_bridge_url:
+            log.warning(
+                "rest_price_fallback_blocked_mt5_primary",
+                symbol=symbol,
+                msg="MT5 bridge is configured; refusing Binance REST as active spot fallback.",
+            )
+            return None
+
         import httpx
         try:
             async with httpx.AsyncClient() as client:

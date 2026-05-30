@@ -266,6 +266,22 @@ def test_price_feed_keeps_fresh_mt5_as_primary_over_binance_ticks():
     assert seen == []
 
 
+def test_price_feed_fails_closed_before_first_mt5_tick_instead_of_binance_fallback():
+    pf = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=5.0,
+    )
+
+    pf._process_trade({"data": {"e": "aggTrade", "s": "BTCUSDT", "p": "74300.00"}})
+    pf._process_trade({"data": {"s": "BTCUSDT", "b": "74299.00", "a": "74301.00"}})
+
+    assert pf.get_price("BTCUSDT") is None
+    assert pf.get_price_source("BTCUSDT") == "exness_mt5_unavailable"
+    assert getattr(pf, "binance_fallback_price") == pytest.approx(74300.0)
+
+
 def test_price_feed_does_not_switch_to_aggtrade_between_stale_mt5_ticks():
     pf = PriceFeed(
         "wss://stream.binance.com:9443/ws",

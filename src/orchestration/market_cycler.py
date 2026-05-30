@@ -1379,7 +1379,8 @@ class MarketCycler:
         # Binance websocket stalls are especially toxic for 15m binaries: a
         # frozen spot produces a frozen fair value while the market keeps
         # moving. Try one REST refresh before failing closed/canceling quotes.
-        if (not raw_spot) or price_age > MAX_SPOT_PRICE_AGE_SECONDS:
+        mt5_configured = bool(getattr(self.price_feed, "mt5_bridge_url", ""))
+        if ((not raw_spot) or price_age > MAX_SPOT_PRICE_AGE_SECONDS) and not mt5_configured:
             rest_url = getattr(self.price_feed, "rest_url", "https://api.binance.com/api/v3")
             rest_spot = await self.price_feed.fetch_price_rest(self.ac.symbol, rest_url)
             if rest_spot:
