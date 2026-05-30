@@ -325,6 +325,13 @@ class PriceFeed:
             return sym[:-1]  # BTCUSDT -> BTCUSD
         return sym
 
+    def _store_mt5_bridge_price(self, symbol: str, price: float, ts: float) -> None:
+        """Store an MT5 bridge price, even when stale, as the active MT5 source."""
+        sym = symbol.upper()
+        self.prices[sym] = price
+        self.timestamps[sym] = ts or time.time()
+        self.price_sources[sym] = "exness_mt5"
+
     async def fetch_mt5_bridge_price(self, symbol: str) -> Optional[float]:
         """Fetch primary Exness/MT5 spot from local/remote bridge if configured."""
         if not self.mt5_bridge_url:
@@ -350,14 +357,12 @@ class PriceFeed:
             if price <= 0:
                 return None
             age = max(0.0, now - ts) if ts else 0.0
+            self._store_mt5_bridge_price(sym, price, ts or now)
             if age > self.mt5_bridge_stale_seconds:
                 log.warning("mt5_bridge_price_stale",
                             symbol=bridge_symbol, age=round(age, 3),
                             max_age=self.mt5_bridge_stale_seconds)
-                return None
-            self.prices[sym] = price
-            self.timestamps[sym] = ts or now
-            self.price_sources[sym] = "exness_mt5"
+                return price
             log.info("mt5_bridge_price_ok",
                      symbol=bridge_symbol,
                      price=round(price, 4),
