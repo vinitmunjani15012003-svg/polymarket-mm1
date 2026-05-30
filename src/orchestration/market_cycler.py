@@ -1381,7 +1381,8 @@ class MarketCycler:
         # frozen spot produces a frozen fair value while the market keeps
         # moving. Try one REST refresh before failing closed/canceling quotes.
         mt5_configured = bool(getattr(self.price_feed, "mt5_bridge_url", ""))
-        if ((not raw_spot) or price_age > MAX_SPOT_PRICE_AGE_SECONDS) and not mt5_configured:
+        max_spot_age = self._max_spot_price_age_seconds()
+        if ((not raw_spot) or price_age > max_spot_age) and not mt5_configured:
             rest_url = getattr(self.price_feed, "rest_url", "https://api.binance.com/api/v3")
             rest_spot = await self.price_feed.fetch_price_rest(self.ac.symbol, rest_url)
             if rest_spot:
@@ -1403,14 +1404,14 @@ class MarketCycler:
             await self.order_mgr.cancel_market_quotes(market.market_id)
             return
 
-        if price_age > MAX_SPOT_PRICE_AGE_SECONDS:
+        if price_age > max_spot_age:
             log.warning(
                 "spot_price_stale_stop_quoting",
                 asset=self.asset,
                 symbol=self.ac.symbol,
                 raw_binance_spot=round(raw_spot, 4),
                 price_age=round(price_age, 3),
-                max_age=MAX_SPOT_PRICE_AGE_SECONDS,
+                max_age=max_spot_age,
             )
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(
@@ -2596,6 +2597,13 @@ class MarketCycler:
             state["merge_message"] = bm_stats.get("merge_message", "")
             
         self._dashboard_cb(state)
+
+    def _max_spot_price_age_seconds(self) -> float:
+        """Allowed active spot age; Exness/MT5 can use its configured tolerance."""
+        if bool(getattr(self.price_feed, "mt5_bridge_url", "")):
+            return float(getattr(self.price_feed, "mt5_bridge_stale_seconds", MAX_SPOT_PRICE_AGE_SECONDS)
+                         or MAX_SPOT_PRICE_AGE_SECONDS)
+        return MAX_SPOT_PRICE_AGE_SECONDS
 
     def _dashboard_sigma_for_stale_spot(self) -> float:
         """Best dashboard sigma when spot is stale and model updates are paused."""

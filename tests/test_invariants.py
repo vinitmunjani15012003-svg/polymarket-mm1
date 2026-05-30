@@ -338,6 +338,15 @@ def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     assert feed.get_price_source("BTCUSDT") == "bookTicker"
 
 
+def test_exness_spot_age_uses_mt5_stale_tolerance():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.price_feed = SimpleNamespace(mt5_bridge_url="http://bridge:8765", mt5_bridge_stale_seconds=15.0)
+    assert cycler._max_spot_price_age_seconds() == pytest.approx(15.0)
+
+    cycler.price_feed = SimpleNamespace(mt5_bridge_url="", mt5_bridge_stale_seconds=15.0)
+    assert cycler._max_spot_price_age_seconds() == pytest.approx(3.0)
+
+
 def test_stale_spot_dashboard_sigma_does_not_collapse_to_zero():
     cycler = MarketCycler.__new__(MarketCycler)
     cycler.last_sigma = 0.72
