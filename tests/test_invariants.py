@@ -266,6 +266,24 @@ def test_price_feed_keeps_fresh_mt5_as_primary_over_binance_ticks():
     assert seen == []
 
 
+def test_price_feed_does_not_switch_to_aggtrade_between_stale_mt5_ticks():
+    pf = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=0.01,
+    )
+    pf.prices["BTCUSDT"] = 74150.0
+    pf.timestamps["BTCUSDT"] = time.time() - 1.0
+    pf.price_sources["BTCUSDT"] = "exness_mt5"
+
+    pf._process_trade({"data": {"e": "aggTrade", "s": "BTCUSDT", "p": "74300.00"}})
+
+    assert pf.get_price("BTCUSDT") == 74150.0
+    assert pf.get_price_source("BTCUSDT") == "exness_mt5_stale"
+    assert pf.get_price_age("BTCUSDT") >= 1.0
+
+
 def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     feed = PriceFeed("wss://stream.binance.com:9443/ws", ["BTCUSDT"])
 

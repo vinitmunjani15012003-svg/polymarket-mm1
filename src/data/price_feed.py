@@ -81,7 +81,13 @@ class PriceFeed:
     def get_price(self, symbol: str) -> Optional[float]:
         """Get latest active price for symbol (e.g., 'BTCUSDT')."""
         sym = symbol.upper()
-        if self.mt5_bridge_url and not self._mt5_active(sym):
+        # Once Exness has produced a tick, keep it as the active feed even if it
+        # becomes stale. Staleness should fail closed in the quote cycle, not
+        # silently swap dashboard/trading state back to Binance aggTrade between
+        # MT5 bridge polls.
+        if self.mt5_bridge_url and self.price_sources.get(sym) == "exness_mt5":
+            return self.prices.get(sym)
+        if self.mt5_bridge_url:
             return getattr(self, "binance_fallback_price", None)
         return self.prices.get(sym)
 
@@ -96,7 +102,9 @@ class PriceFeed:
     def get_price_source(self, symbol: str) -> str:
         """Return the stream currently driving get_price() for symbol."""
         sym = symbol.upper()
-        if self.mt5_bridge_url and not self._mt5_active(sym):
+        if self.mt5_bridge_url and self.price_sources.get(sym) == "exness_mt5":
+            return "exness_mt5" if self._mt5_active(sym) else "exness_mt5_stale"
+        if self.mt5_bridge_url:
             return getattr(self, "binance_fallback_source", "fallback_unavailable")
         return self.price_sources.get(sym, "unknown")
 
