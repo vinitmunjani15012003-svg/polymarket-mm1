@@ -63,6 +63,11 @@ FV_MIN_MODEL_CONFIDENCE = 0.10
 FV_MAX_MODEL_CONFIDENCE = 0.85
 FV_DISAGREEMENT_CONFIDENCE_CAP = 0.05
 FV_HARD_DISAGREEMENT = 0.15
+# When the sigma model is already deep in the tail, a thin/noisy Polymarket
+# book can briefly pull FV back toward neutral (e.g. 0.05 -> 0.12) even with no
+# spot move. Keep that market input diagnostic, but cap small tail pulls.
+FV_TAIL_BLEND_GUARD = 0.10
+FV_TAIL_MAX_MARKET_PULL = 0.02
 
 
 def clamp_probability(value: float, lo: float = 0.01, hi: float = 0.99) -> float:
@@ -123,6 +128,13 @@ def blended_fair_value(model_fv: float,
         # No book: temper raw model toward neutral using the same confidence.
         return clamp_probability(0.5 + (model - 0.5) * conf)
     market = clamp_probability(market_fv)
+    if model <= FV_TAIL_BLEND_GUARD and market > model and (market - model) <= FV_HARD_DISAGREEMENT:
+        # Low-tail model says UP is very unlikely. Do not let a transient/thin
+        # book pull the trading FV materially upward while spot is unchanged.
+        return clamp_probability(model + min(FV_TAIL_MAX_MARKET_PULL, (market - model) * (1.0 - conf)))
+    if model >= 1.0 - FV_TAIL_BLEND_GUARD and market < model and (model - market) <= FV_HARD_DISAGREEMENT:
+        # Symmetric high-tail guard for DOWN-side noisy book pulls.
+        return clamp_probability(model - min(FV_TAIL_MAX_MARKET_PULL, (model - market) * (1.0 - conf)))
     return clamp_probability(conf * model + (1.0 - conf) * market)
 
 

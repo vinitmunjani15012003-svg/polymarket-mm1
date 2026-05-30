@@ -132,6 +132,16 @@ def test_blended_fair_value_prevents_early_window_overconfidence():
     assert 0.55 < final_fv < 0.70
 
 
+def test_blended_fair_value_caps_noisy_tail_pull_toward_neutral():
+    # Regression: with unchanged spot/model FV around 5c, a transient book mid
+    # around 12c should not make trading/dashboard FV jump to 12c.
+    low_tail = blended_fair_value(0.05, 0.12, confidence=0.10)
+    high_tail = blended_fair_value(0.95, 0.88, confidence=0.10)
+
+    assert low_tail <= 0.07
+    assert high_tail == pytest.approx(0.93)
+
+
 def test_blended_fair_value_trusts_model_more_late_when_market_agrees():
     early_conf = fv_model_confidence(0.70, elapsed_fraction=0.1, standardized_move=0.5, market_fv=0.66)
     late_conf = fv_model_confidence(0.70, elapsed_fraction=0.85, standardized_move=1.5, market_fv=0.66)
