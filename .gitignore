@@ -17,6 +17,7 @@ runs/
 # Secrets / Live credentials (NEVER commit these)
 config/live.yaml
 config/live_20_smoke.yaml
+config/live_20_config.yaml
 config/live_50.yaml
 config/micro_live.yaml
 secrets.txt
