@@ -35,3 +35,6 @@ Thumbs.db
 
 # Local CLI auth/config secrets
 .config/
+
+# Local secret helper scripts
+src/data/fetch_keys.py
