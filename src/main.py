@@ -474,6 +474,7 @@ async def run_bot(
             ctf_ops=ctf_ops,
             gasless_merger=gasless_merger,
             balance_monitor=balance_monitor,
+            small_capital_config=config.small_capital_test,
         )
         cyclers.append(cycler)
 

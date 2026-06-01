@@ -151,6 +151,19 @@ dry_run:
   fill_delay_max: 10
   toxicity_multiplier: 2.0
 
+# --- Small Capital Test Mode ---
+# Disabled by default. When enabled, each market/window spends only one opening
+# quote cycle, then allows close-only balancing. Once a matched YES/NO pair is
+# filled and inventory is flat, the bot cancels leftovers and stops quoting that
+# window until the next 15m market.
+small_capital_test:
+  enabled: false
+  one_cycle_per_window: false
+  stop_after_balanced_fill: true
+  cancel_remaining_orders_on_stop: true
+  max_quote_cycles_per_window: 1
+  max_shares_per_order: 5
+
 # --- Balance Monitor (live mode only) ---
 # Auto-merges matched pairs when USDC wallet balance drops low.
 # Uses gasless relayer (Builder credentials) → on-chain fallback.

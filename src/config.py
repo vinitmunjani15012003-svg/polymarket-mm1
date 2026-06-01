@@ -142,6 +142,17 @@ class DryRunConfig:
 
 
 @dataclass
+class SmallCapitalTestConfig:
+    """Small-capital live/dry-run test controls."""
+    enabled: bool = False
+    one_cycle_per_window: bool = False
+    stop_after_balanced_fill: bool = True
+    cancel_remaining_orders_on_stop: bool = True
+    max_quote_cycles_per_window: int = 1
+    max_shares_per_order: int = 0
+
+
+@dataclass
 class BotConfig:
     """Root configuration object."""
     mode: str = "dry-run"
@@ -153,6 +164,7 @@ class BotConfig:
     balance_monitor: BalanceMonitorConfig = field(default_factory=BalanceMonitorConfig)
     polymarket_ws: PolymarketWSConfig = field(default_factory=PolymarketWSConfig)
     dry_run: DryRunConfig = field(default_factory=DryRunConfig)
+    small_capital_test: SmallCapitalTestConfig = field(default_factory=SmallCapitalTestConfig)
 
     def validate(self):
         """Validate all configuration invariants."""
@@ -447,6 +459,17 @@ def load_config(config_path: str = "config/default.yaml",
         fill_delay_min=d.get("fill_delay_min", 2),
         fill_delay_max=d.get("fill_delay_max", 10),
         toxicity_multiplier=d.get("toxicity_multiplier", 2.0),
+    )
+
+    # Small-capital testing controls
+    sct = raw.get("small_capital_test", {})
+    config.small_capital_test = SmallCapitalTestConfig(
+        enabled=bool(sct.get("enabled", False)),
+        one_cycle_per_window=bool(sct.get("one_cycle_per_window", False)),
+        stop_after_balanced_fill=bool(sct.get("stop_after_balanced_fill", True)),
+        cancel_remaining_orders_on_stop=bool(sct.get("cancel_remaining_orders_on_stop", True)),
+        max_quote_cycles_per_window=int(sct.get("max_quote_cycles_per_window", 1)),
+        max_shares_per_order=int(sct.get("max_shares_per_order", 0) or 0),
     )
 
     # Validate config invariants

@@ -21,6 +21,8 @@ class StateManager:
             # Each entry: {slug, asset, window_start_ts, market_id, yes_avg_entry,
             #              no_avg_entry, unmatched_up, unmatched_down, created_ts}
             "pending_resolutions": [],
+            # Small-capital one-cycle mode state, keyed by market_id.
+            "small_capital_windows": {},
             "last_updated": 0.0
         }
         os.makedirs(os.path.dirname(state_file), exist_ok=True)
@@ -61,12 +63,45 @@ class StateManager:
         self.state["processed_fills"] = processed_fills_list
         self.save_state()
 
+    def get_small_capital_window(self, market_id: str) -> Dict[str, Any]:
+        """Return persisted small-capital lifecycle state for a market."""
+        windows = self.state.setdefault("small_capital_windows", {})
+        if not isinstance(windows, dict):
+            windows = {}
+            self.state["small_capital_windows"] = windows
+        state = windows.get(market_id)
+        if not isinstance(state, dict):
+            state = {
+                "quote_cycles_started": 0,
+                "quote_cycle_started": False,
+                "initial_filled": False,
+                "balancing_filled": False,
+                "stopped_for_window": False,
+                "initial_side": "",
+                "balancing_side": "",
+                "initial_order_id": "",
+                "balancing_order_id": "",
+                "updated_ts": time.time(),
+            }
+            windows[market_id] = state
+        return state
+
+    def update_small_capital_window(self, market_id: str, window_state: Dict[str, Any]):
+        windows = self.state.setdefault("small_capital_windows", {})
+        if not isinstance(windows, dict):
+            windows = {}
+            self.state["small_capital_windows"] = windows
+        window_state["updated_ts"] = time.time()
+        windows[market_id] = window_state
+        self.save_state()
+
     def clear_state(self):
         self.state = {
             "inventory": {},
             "open_orders": {},
             "processed_fills": [],
             "pending_resolutions": [],
+            "small_capital_windows": {},
             "last_updated": time.time()
         }
         self.save_state()
