@@ -32,3 +32,6 @@ secrets.txt
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local CLI auth/config secrets
+.config/
