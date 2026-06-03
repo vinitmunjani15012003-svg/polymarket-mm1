@@ -129,6 +129,14 @@ async def run_bot(
         return RunResult(False, mode, target_windows, 0, 0, 0.0, "no active assets")
 
     log.info("active_assets", assets=list(active_assets.keys()))
+    log.info(
+        "small_capital_config",
+        enabled=bool(getattr(config.small_capital_test, "enabled", False)),
+        one_cycle_per_window=bool(getattr(config.small_capital_test, "one_cycle_per_window", False)),
+        max_shares_per_order=int(getattr(config.small_capital_test, "max_shares_per_order", 0) or 0),
+        stop_after_balanced_fill=bool(getattr(config.small_capital_test, "stop_after_balanced_fill", True)),
+        cancel_remaining_orders_on_stop=bool(getattr(config.small_capital_test, "cancel_remaining_orders_on_stop", True)),
+    )
 
     # --- Initialize shared components ---
 

@@ -601,6 +601,14 @@ class MarketCycler:
         self.gasless_merger: Optional[GaslessMerger] = gasless_merger
         self.balance_monitor: Optional[BalanceMonitor] = balance_monitor
         self.small_capital_config = small_capital_config
+        log.info(
+            "market_cycler_small_capital_mode",
+            asset=self.asset,
+            enabled=self._small_capital_enabled(),
+            configured=bool(small_capital_config),
+            one_cycle_per_window=bool(getattr(small_capital_config, "one_cycle_per_window", False)),
+            max_shares_per_order=int(getattr(small_capital_config, "max_shares_per_order", 0) or 0),
+        )
         
         # Merge threshold: auto-merge when locked capital exceeds this
         self._merge_dollar_threshold = 15.0  # dollars
