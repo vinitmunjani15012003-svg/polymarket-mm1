@@ -344,6 +344,19 @@ def test_price_feed_rewrites_local_mt5_bridge_url_inside_container(monkeypatch):
     assert PriceFeed._normalize_mt5_bridge_url("http://192.168.1.10:8765") == "http://192.168.1.10:8765"
 
 
+def test_pre_expiry_auto_merge_triggers_only_within_two_minutes_and_pairs():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler._has_done_pre_expiry_merge = False
+
+    assert cycler._should_pre_expiry_auto_merge(121, 10) is False
+    assert cycler._should_pre_expiry_auto_merge(120, 0) is False
+    assert cycler._should_pre_expiry_auto_merge(120, 1) is True
+    assert cycler._should_pre_expiry_auto_merge(30, 1) is True
+
+    cycler._has_done_pre_expiry_merge = True
+    assert cycler._should_pre_expiry_auto_merge(120, 1) is False
+
+
 def test_dashboard_event_helper_uses_market_cycler_time_alias():
     cycler = MarketCycler.__new__(MarketCycler)
 

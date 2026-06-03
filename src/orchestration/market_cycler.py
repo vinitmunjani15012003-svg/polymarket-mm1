@@ -37,6 +37,7 @@ log = get_logger("market_cycler")
 # pairs repeatedly landed at/above 1.00. Two cents is still tight, but stops the
 # bot from recycling capital into guaranteed-loss pairs.
 MIN_LIVE_PAIR_EDGE = 0.02
+PRE_EXPIRY_AUTO_MERGE_SECONDS = 120
 
 # When flat and the model has a meaningful directional lean, enter on the side
 # favored by fair value first, then let the existing inventory-repair path quote
@@ -679,6 +680,13 @@ class MarketCycler:
         cfg = getattr(self, "small_capital_config", None)
         return bool(cfg and getattr(cfg, "enabled", False) and getattr(cfg, "one_cycle_per_window", False))
 
+    def _should_pre_expiry_auto_merge(self, remaining: float, matched_pairs: int) -> bool:
+        return (
+            remaining <= PRE_EXPIRY_AUTO_MERGE_SECONDS
+            and int(matched_pairs or 0) > 0
+            and not getattr(self, "_has_done_pre_expiry_merge", False)
+        )
+
     def _small_capital_state(self, market_id: str) -> dict:
         sm = getattr(self.inventory, "state_manager", None)
         if sm and hasattr(sm, "get_small_capital_window"):
@@ -1201,7 +1209,7 @@ class MarketCycler:
 
     async def _run_market(self, market: MarketInfo):
         """Run the quote loop for a single 15-minute market."""
-        self._has_done_30s_merge = False
+        self._has_done_pre_expiry_merge = False
         self._repair_mode_started_at = None
         start_price = None
         start_price_source = "unknown"
@@ -2687,10 +2695,17 @@ class MarketCycler:
         # 15.5. Auto-merge check: dollar-based threshold OR low balance OR near expiry
         force_merge = False
         merge_reason = "routine"
-        if remaining <= 30 and not getattr(self, '_has_done_30s_merge', False):
+        matched_pairs_for_merge = int(pos.matched_pairs() or 0)
+        if self._should_pre_expiry_auto_merge(remaining, matched_pairs_for_merge):
             force_merge = True
-            merge_reason = "near_expiry"
-            self._has_done_30s_merge = True
+            merge_reason = "pre_expiry_2m"
+            self._has_done_pre_expiry_merge = True
+            log.info(
+                "pre_expiry_auto_merge_triggered",
+                asset=self.asset,
+                remaining=round(remaining, 1),
+                matched_pairs=matched_pairs_for_merge,
+            )
 
         # Dollar-based mid-market merge trigger
         if not force_merge and self.inventory.should_merge(market.market_id):
@@ -2711,19 +2726,26 @@ class MarketCycler:
                 balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
             )
             if merge_result.get("merged"):
-                msg = "auto_merge_end_of_market" if merge_reason == "near_expiry" else "auto_merge_during_trading"
+                msg = "auto_merge_pre_expiry" if merge_reason == "pre_expiry_2m" else "auto_merge_during_trading"
                 log.info(msg,
                          asset=self.asset,
                          reason=merge_reason,
                          pairs=merge_result["pairs_merged"],
                          usdc=f"${merge_result['usdc_recovered']:.2f}")
+                if merge_reason == "pre_expiry_2m":
+                    self._set_dashboard_event(
+                        "info",
+                        "PRE_EXPIRY_AUTO_MERGE",
+                        f"merged {merge_result['pairs_merged']} pairs; synced tradeable balance",
+                    )
                 # Update capital arbiter on recovery
                 if self.inventory.capital_arbiter:
                     self.inventory.capital_arbiter.record_recovery(
                         self.asset, merge_result['usdc_recovered'])
 
         # 16. Update dashboard
-        self._clear_dashboard_event()
+        if not (getattr(self, "_dashboard_event", {}) or {}).get("event_reason") == "PRE_EXPIRY_AUTO_MERGE":
+            self._clear_dashboard_event()
         self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining,
                                 quotes, pos, imbalance, inv_state.value)
 
