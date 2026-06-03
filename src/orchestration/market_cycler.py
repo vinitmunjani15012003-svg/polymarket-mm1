@@ -941,6 +941,69 @@ class MarketCycler:
     def _small_capital_opening_spent(self, state: dict) -> bool:
         return bool(state.get("opening_attempt_spent") or state.get("quote_cycle_started"))
 
+    async def _small_capital_fail_closed_before_quotes(self, market: MarketInfo, pos, wallet_snapshot: dict | None, fv: float, sigma: float, remaining: float) -> bool:
+        """Block all opening quote generation after small-cap opening is spent.
+
+        This runs before directional/FV/reverse-move quote branches. Those
+        branches can intentionally switch out of normal mode, so a late guard is
+        not sufficient for one-cycle-per-window semantics.
+        """
+        if not self._small_capital_enabled():
+            return False
+        state = self._small_capital_state(market.market_id)
+        if state.get("stopped_for_window"):
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
+                                   fv or self.last_fair_value or 0, sigma or self.last_sigma or 0,
+                                   "SMALL_CAP_DONE", remaining)
+            return True
+        if not self._small_capital_opening_spent(state):
+            return False
+
+        active = self.order_mgr.get_active(market.market_id)
+        has_resting = bool(active.yes_order_id or active.no_order_id)
+        wallet_imbalance = None
+        wallet_pairs = 0
+        if wallet_snapshot:
+            wallet_imbalance = float(wallet_snapshot.get("share_imbalance", 0) or 0)
+            wallet_pairs = int(float(wallet_snapshot.get("matched_pairs", 0) or 0))
+        effective_imbalance = wallet_imbalance if wallet_imbalance is not None else float(pos.share_imbalance() or 0)
+        effective_pairs = max(int(pos.matched_pairs() or 0), wallet_pairs)
+
+        # If one side exists, allow the later balancing/repair logic. If both
+        # sides are balanced, completion handler handles it first.
+        if abs(effective_imbalance) > 0.0001:
+            return False
+        if effective_pairs > 0:
+            return await self._small_capital_maybe_stop_completed(
+                market, pos, "pre_quote_wallet_balanced", wallet_snapshot=wallet_snapshot
+            )
+        if has_resting and not state.get("initial_filled"):
+            log.info(
+                "small_capital_holding_opening_quote_pre_generation",
+                asset=self.asset,
+                market=market.market_id[:8],
+                msg="opening quote already spent; blocking reverse-move normal quote generation",
+            )
+            self._set_dashboard_event("info", "SMALL_CAP_HOLD_OPENING", "opening quote already placed; waiting")
+            self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
+                                   fv or self.last_fair_value or 0, sigma or self.last_sigma or 0,
+                                   "SMALL_CAP_HOLD_OPENING", remaining)
+            return True
+
+        log.warning(
+            "small_capital_opening_spent_pre_generation",
+            asset=self.asset,
+            market=market.market_id[:8],
+            msg="opening attempt already spent; blocking all new opening quotes this window",
+        )
+        self._set_dashboard_event("skip", "SMALL_CAP_OPENING_SPENT", "opening attempt already spent this window")
+        await self.order_mgr.cancel_market_quotes(market.market_id)
+        self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
+                               fv or self.last_fair_value or 0, sigma or self.last_sigma or 0,
+                               "SMALL_CAP_WAIT_NEXT", remaining)
+        return True
+
     def _mark_small_capital_quote_started(self, market: MarketInfo, quotes, repair_mode: str):
         """Persist that this window has spent its one opening quote cycle."""
         if not self._small_capital_enabled() or repair_mode != "normal":
@@ -2021,6 +2084,10 @@ class MarketCycler:
         wallet_imbalance: float | None = None
         if await self._small_capital_maybe_stop_completed(
             market, pos, "pre_quote_balanced", wallet_snapshot=wallet_snapshot
+        ):
+            return
+        if await self._small_capital_fail_closed_before_quotes(
+            market, pos, wallet_snapshot, fv, sigma, remaining
         ):
             return
 
