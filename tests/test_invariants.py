@@ -509,6 +509,52 @@ def test_dashboard_event_helper_uses_market_cycler_time_alias():
     assert cycler._dashboard_event["event_ts"] > 0
 
 
+def test_small_capital_done_uses_wallet_truth_even_when_local_inventory_lags():
+    import asyncio
+
+    states = []
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.fair_value_model = None
+    cycler.last_fair_value = 0.5
+    cycler.last_sigma = 0.2
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.inventory.state_manager = SimpleNamespace(
+        get_small_capital_window=lambda market_id: {"quote_cycle_started": True, "initial_filled": True},
+        update_small_capital_window=lambda market_id, state: None,
+    )
+    cycler.balance_monitor = None
+    cycler._dashboard_cb = states.append
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {
+        "M1": {"yes_shares": 5.0, "no_shares": 5.0, "matched_pairs": 5.0, "share_imbalance": 0.0}
+    }
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True, stop_after_balanced_fill=True, cancel_remaining_orders_on_stop=True)
+    cycler.order_mgr = SimpleNamespace(cancel_market_quotes=AsyncMock(return_value=True))
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC up?", time_remaining=600)
+    pos = cycler.inventory.get_or_create("M1", "BTC")
+    pos.add_fill("no", 0.5, 5)  # local accounting lagged/missed YES fill
+
+    ok = asyncio.run(cycler._small_capital_maybe_stop_completed(
+        market,
+        pos,
+        "wallet_balanced",
+        wallet_snapshot=cycler._wallet_truth_by_market["M1"],
+    ))
+
+    assert ok is True
+    assert states[-1]["phase"] == "SMALL_CAP_DONE"
+    assert states[-1]["up_shares"] == 5.0
+    assert states[-1]["down_shares"] == 5.0
+    assert states[-1]["share_imbalance"] == 0.0
+    assert states[-1]["matched_pairs"] == 5.0
+    assert states[-1]["inventory_source"] == "wallet"
+
+
 def test_dashboard_uses_wallet_truth_for_live_inventory_display():
     states = []
     cycler = MarketCycler.__new__(MarketCycler)

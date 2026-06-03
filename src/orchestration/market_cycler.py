@@ -896,6 +896,14 @@ class MarketCycler:
             log.warning("wallet_position_truth_error", asset=self.asset, error=str(e))
             return None
 
+    async def _refresh_wallet_truth_for_market(self, market: MarketInfo) -> tuple[tuple[float, float] | None, dict | None]:
+        wallet_truth = await self._wallet_position_truth(market)
+        wallet_snapshot = self._wallet_truth_snapshot(wallet_truth)
+        if wallet_snapshot is not None:
+            self._wallet_truth_by_market[market.market_id] = wallet_snapshot
+            self._apply_wallet_truth_to_small_capital_state(market.market_id, wallet_snapshot)
+        return wallet_truth, wallet_snapshot
+
     def _small_capital_state(self, market_id: str) -> dict:
         sm = getattr(self.inventory, "state_manager", None)
         if sm and hasattr(sm, "get_small_capital_window"):
@@ -990,7 +998,7 @@ class MarketCycler:
                 state["balancing_order_id"] = order_id
         self._save_small_capital_state(market.market_id, state)
 
-    async def _small_capital_maybe_stop_completed(self, market: MarketInfo, pos, reason: str = "") -> bool:
+    async def _small_capital_maybe_stop_completed(self, market: MarketInfo, pos, reason: str = "", wallet_snapshot: dict | None = None) -> bool:
         """Stop quoting this window after the first balanced pair cycle completes."""
         if not self._small_capital_enabled():
             return False
@@ -1001,10 +1009,15 @@ class MarketCycler:
                                    self.last_fair_value or 0, self.last_sigma or 0,
                                    "SMALL_CAP_DONE", market.time_remaining)
             return True
+        matched_pairs = int(pos.matched_pairs() or 0)
+        imbalance = float(pos.share_imbalance() or 0)
+        if wallet_snapshot:
+            matched_pairs = int(float(wallet_snapshot.get("matched_pairs", matched_pairs) or 0))
+            imbalance = float(wallet_snapshot.get("share_imbalance", imbalance) or 0)
         if (state.get("quote_cycle_started")
                 and getattr(self.small_capital_config, "stop_after_balanced_fill", True)
-                and int(pos.matched_pairs() or 0) > 0
-                and abs(float(pos.share_imbalance() or 0)) < 0.0001):
+                and matched_pairs > 0
+                and abs(imbalance) < 0.0001):
             state["balancing_filled"] = True
             state["stopped_for_window"] = True
             state["stop_reason"] = reason or "balanced_fill_complete"
@@ -1016,8 +1029,9 @@ class MarketCycler:
                 asset=self.asset,
                 market=market.market_id[:8],
                 slug=market.slug,
-                matched_pairs=int(pos.matched_pairs() or 0),
+                matched_pairs=matched_pairs,
                 reason=state["stop_reason"],
+                inventory_source="wallet" if wallet_snapshot else "local",
             )
             self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
                                    self.last_fair_value or 0, self.last_sigma or 0,
@@ -1999,15 +2013,13 @@ class MarketCycler:
         if not await self._sync_live_fills_before_quote(market, fv, pos):
             return
 
-        if await self._small_capital_maybe_stop_completed(market, pos, "pre_quote_balanced"):
+        wallet_truth, wallet_snapshot = await self._refresh_wallet_truth_for_market(market)
+        wallet_imbalance: float | None = None
+        if await self._small_capital_maybe_stop_completed(
+            market, pos, "pre_quote_balanced", wallet_snapshot=wallet_snapshot
+        ):
             return
 
-        wallet_truth = await self._wallet_position_truth(market)
-        wallet_imbalance: float | None = None
-        wallet_snapshot = self._wallet_truth_snapshot(wallet_truth)
-        if wallet_snapshot is not None:
-            self._wallet_truth_by_market[market.market_id] = wallet_snapshot
-            self._apply_wallet_truth_to_small_capital_state(market.market_id, wallet_snapshot)
         if wallet_truth is not None:
             wallet_yes, wallet_no = wallet_truth
             wallet_imbalance = wallet_yes - wallet_no
@@ -2941,7 +2953,9 @@ class MarketCycler:
 
         if fills and not await self._handle_standardized_fills(market, fills, fv, pos):
             return
-        if fills and await self._small_capital_maybe_stop_completed(market, pos, "post_fill_balanced"):
+        if fills:
+            wallet_truth, wallet_snapshot = await self._refresh_wallet_truth_for_market(market)
+        if fills and await self._small_capital_maybe_stop_completed(market, pos, "post_fill_balanced", wallet_snapshot=wallet_snapshot):
             return
         if fills and has_negative_matched_pair_edge(pos):
             pairs = int(pos.matched_pairs())
