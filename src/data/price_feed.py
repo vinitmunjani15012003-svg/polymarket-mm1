@@ -56,6 +56,7 @@ class PriceFeed:
         # Timestamp of latest usable feed update
         self.timestamps: Dict[str, float] = {}
         self.price_sources: Dict[str, str] = {}
+        self.mt5_tick_timestamps: Dict[str, float] = {}
         self.book_mid_prices: Dict[str, float] = {}
         self.book_timestamps: Dict[str, float] = {}
         self.trade_prices: Dict[str, float] = {}
@@ -359,11 +360,16 @@ class PriceFeed:
             return urlunparse(parsed._replace(netloc=netloc))
         return clean
 
-    def _store_mt5_bridge_price(self, symbol: str, price: float, ts: float) -> None:
+    def _store_mt5_bridge_price(self, symbol: str, price: float, ts: float, received_ts: float | None = None) -> None:
         """Store an MT5 bridge price, even when stale, as the active MT5 source."""
         sym = symbol.upper()
         self.prices[sym] = price
-        self.timestamps[sym] = ts or time.time()
+        # Active feed age should mean "seconds since the bot successfully
+        # received an MT5 bridge update". MT5 tick timestamps can remain old or
+        # repeat even while the bridge is healthy, which made the dashboard show
+        # false STALE_SPOT events.
+        self.timestamps[sym] = received_ts or time.time()
+        self.mt5_tick_timestamps[sym] = ts or self.timestamps[sym]
         self.price_sources[sym] = "exness_mt5"
 
     @staticmethod
@@ -422,7 +428,7 @@ class PriceFeed:
             if price <= 0:
                 return None
             age = max(0.0, now - ts) if ts else 0.0
-            self._store_mt5_bridge_price(sym, price, ts or now)
+            self._store_mt5_bridge_price(sym, price, ts or now, received_ts=now)
             if age > self.mt5_bridge_stale_seconds:
                 log.warning("mt5_bridge_price_stale",
                             symbol=bridge_symbol, age=round(age, 3),

@@ -310,7 +310,7 @@ def test_price_feed_does_not_switch_to_aggtrade_between_stale_mt5_ticks():
     assert pf.get_price_age("BTCUSDT") >= 1.0
 
 
-def test_price_feed_records_stale_mt5_tick_instead_of_showing_unavailable():
+def test_price_feed_uses_mt5_bridge_receive_time_for_active_age():
     pf = PriceFeed(
         "wss://stream.binance.com:9443/ws",
         ["BTCUSDT"],
@@ -318,7 +318,23 @@ def test_price_feed_records_stale_mt5_tick_instead_of_showing_unavailable():
         mt5_bridge_stale_seconds=0.01,
     )
 
-    pf._store_mt5_bridge_price("BTCUSDT", 74150.0, time.time() - 1.0)
+    pf._store_mt5_bridge_price("BTCUSDT", 74150.0, time.time() - 1.0, received_ts=time.time())
+
+    assert pf.get_price("BTCUSDT") == 74150.0
+    assert pf.get_price_source("BTCUSDT") == "exness_mt5"
+    assert pf.get_price_age("BTCUSDT") < 0.01
+    assert pf.mt5_tick_timestamps["BTCUSDT"] <= time.time() - 0.5
+
+
+def test_price_feed_marks_mt5_stale_when_bridge_receive_time_is_stale():
+    pf = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=0.01,
+    )
+
+    pf._store_mt5_bridge_price("BTCUSDT", 74150.0, time.time(), received_ts=time.time() - 1.0)
 
     assert pf.get_price("BTCUSDT") == 74150.0
     assert pf.get_price_source("BTCUSDT") == "exness_mt5_stale"
@@ -409,6 +425,34 @@ def test_small_capital_balancing_override_uses_inventory_imbalance_even_without_
     assert quotes.no_buy_size == 0
 
 
+def test_pre_expiry_auto_merge_uses_wallet_pairs_when_local_inventory_lags():
+    import asyncio
+
+    class FakeBalanceMonitor:
+        async def check_and_merge(self, **kwargs):
+            self.kwargs = kwargs
+            return {"checked": True, "merged": True, "pairs_merged": 1, "usdc_recovered": 1.0}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler._has_done_pre_expiry_merge = False
+    cycler.balance_monitor = FakeBalanceMonitor()
+    cycler.gasless_merger = None
+    cycler.ctf = None
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.order_mgr = SimpleNamespace(executor=SimpleNamespace(sync_balance_allowance=lambda: True))
+    market = SimpleNamespace(market_id="M1")
+    pos = SimpleNamespace(matched_pairs=lambda: 0)
+
+    result = asyncio.run(cycler._maybe_pre_expiry_auto_merge(market, pos, 120, wallet_truth=(1.0, 1.0)))
+
+    assert result["merged"] is True
+    assert result["pairs_merged"] == 1
+    assert cycler._has_done_pre_expiry_merge is True
+    assert cycler._dashboard_event["event_reason"] == "PRE_EXPIRY_AUTO_MERGE"
+
+
 def test_pre_expiry_auto_merge_triggers_only_within_two_minutes_and_pairs():
     cycler = MarketCycler.__new__(MarketCycler)
     cycler._has_done_pre_expiry_merge = False
@@ -431,6 +475,32 @@ def test_dashboard_event_helper_uses_market_cycler_time_alias():
     assert cycler._dashboard_event["event_reason"] == "PRE_TRADE_FAILED"
     assert cycler._dashboard_event["event_detail"] == "risk check"
     assert cycler._dashboard_event["event_ts"] > 0
+
+
+def test_small_capital_repairs_canceled_unfilled_opening_quote_state():
+    class StateManager:
+        def __init__(self):
+            self.saved = None
+
+        def update_small_capital_window(self, market_id, state):
+            self.saved = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    state = {
+        "quote_cycle_started": True,
+        "initial_filled": False,
+        "initial_order_id": "OID-CANCELED",
+        "initial_side": "no",
+    }
+
+    repaired = cycler._repair_small_capital_unfilled_opening_state("M1", state, False, 0)
+
+    assert repaired is True
+    assert state["quote_cycle_started"] is False
+    assert state["initial_order_id"] == ""
+    assert state["initial_side"] == ""
+    assert cycler.inventory.state_manager.saved["stale_quote_cycle_repaired"] is True
 
 
 def test_small_capital_does_not_mark_opening_cycle_without_order_id():

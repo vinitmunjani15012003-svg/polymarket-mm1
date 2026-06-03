@@ -687,6 +687,62 @@ class MarketCycler:
             and not getattr(self, "_has_done_pre_expiry_merge", False)
         )
 
+    async def _maybe_pre_expiry_auto_merge(self, market: MarketInfo, pos, remaining: float, wallet_truth=None) -> dict:
+        wallet_pairs = 0
+        if wallet_truth is not None:
+            wallet_pairs = int(min(float(wallet_truth[0] or 0), float(wallet_truth[1] or 0)))
+        matched_pairs = max(int(pos.matched_pairs() or 0), wallet_pairs)
+        if not self._should_pre_expiry_auto_merge(remaining, matched_pairs):
+            return {"checked": False, "merged": False, "pairs_merged": 0, "reason": "not_due"}
+
+        self._has_done_pre_expiry_merge = True
+        log.info(
+            "pre_expiry_auto_merge_triggered",
+            asset=self.asset,
+            remaining=round(remaining, 1),
+            local_pairs=int(pos.matched_pairs() or 0),
+            wallet_pairs=wallet_pairs,
+            matched_pairs=matched_pairs,
+        )
+        if not self.balance_monitor:
+            log.warning("pre_expiry_auto_merge_unavailable", asset=self.asset, reason="no_balance_monitor")
+            return {"checked": False, "merged": False, "pairs_merged": 0, "reason": "no_balance_monitor"}
+
+        merge_result = await self.balance_monitor.check_and_merge(
+            inventory_mgr=self.inventory,
+            gasless_merger=self.gasless_merger,
+            ctf_ops=self.ctf,
+            pnl_tracker=self.pnl,
+            force=True,
+            balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
+        )
+        if merge_result.get("merged"):
+            log.info(
+                "auto_merge_pre_expiry",
+                asset=self.asset,
+                reason="pre_expiry_2m",
+                pairs=merge_result.get("pairs_merged", 0),
+                usdc=f"${float(merge_result.get('usdc_recovered', 0) or 0):.2f}",
+            )
+            self._set_dashboard_event(
+                "info",
+                "PRE_EXPIRY_AUTO_MERGE",
+                f"merged {merge_result.get('pairs_merged', 0)} pairs; synced tradeable balance",
+            )
+            if self.inventory.capital_arbiter:
+                self.inventory.capital_arbiter.record_recovery(
+                    self.asset, float(merge_result.get("usdc_recovered", 0) or 0)
+                )
+        else:
+            log.warning(
+                "pre_expiry_auto_merge_noop",
+                asset=self.asset,
+                local_pairs=int(pos.matched_pairs() or 0),
+                wallet_pairs=wallet_pairs,
+                result=merge_result,
+            )
+        return merge_result
+
     def _small_capital_balancing_side(self, market_id: str, pos, wallet_imbalance: float | None = None) -> str:
         """Return the only side small-capital mode may quote after first fill.
 
@@ -784,6 +840,21 @@ class MarketCycler:
         sm = getattr(self.inventory, "state_manager", None)
         if sm and hasattr(sm, "update_small_capital_window"):
             sm.update_small_capital_window(market_id, state)
+
+    def _repair_small_capital_unfilled_opening_state(self, market_id: str, state: dict, has_resting_opening_quote: bool, matched_pairs: int) -> bool:
+        if (
+            state.get("quote_cycle_started")
+            and not has_resting_opening_quote
+            and not state.get("initial_filled")
+            and int(matched_pairs or 0) == 0
+        ):
+            state["quote_cycle_started"] = False
+            state["stale_quote_cycle_repaired"] = True
+            state["initial_order_id"] = ""
+            state["initial_side"] = ""
+            self._save_small_capital_state(market_id, state)
+            return True
+        return False
 
     def _mark_small_capital_quote_started(self, market: MarketInfo, quotes, repair_mode: str):
         """Persist that this window has spent its one opening quote cycle."""
@@ -1662,6 +1733,9 @@ class MarketCycler:
                 remaining,
             )
             return
+
+        if (getattr(self, "_dashboard_event", {}) or {}).get("event_reason") == "STALE_SPOT":
+            self._clear_dashboard_event()
             
         spot = raw_spot
         log.info(
@@ -1870,6 +1944,8 @@ class MarketCycler:
                     wallet_no=round(wallet_no, 4),
                     msg="using wallet truth for quote side selection",
                 )
+
+        await self._maybe_pre_expiry_auto_merge(market, pos, remaining, wallet_truth=wallet_truth)
 
         if has_negative_matched_pair_edge(pos):
             pairs = int(pos.matched_pairs())
@@ -2591,15 +2667,17 @@ class MarketCycler:
             if sct_state.get("quote_cycle_started") and repair_mode == "normal" and abs_imbalance < min_order_size:
                 active = self.order_mgr.get_active(market.market_id)
                 has_resting_opening_quote = bool(active.yes_order_id or active.no_order_id)
-                if not has_resting_opening_quote and not sct_state.get("initial_order_id") and int(pos.matched_pairs() or 0) == 0:
-                    sct_state["quote_cycle_started"] = False
-                    sct_state["stale_quote_cycle_repaired"] = True
-                    self._save_small_capital_state(market.market_id, sct_state)
+                if self._repair_small_capital_unfilled_opening_state(
+                    market.market_id,
+                    sct_state,
+                    has_resting_opening_quote,
+                    int(pos.matched_pairs() or 0),
+                ):
                     log.warning(
                         "small_capital_stale_quote_cycle_repaired",
                         asset=self.asset,
                         market=market.market_id[:8],
-                        msg="cleared quote-cycle state because no opening order id exists",
+                        msg="cleared quote-cycle state because opening order was canceled before fill",
                     )
                 elif int(pos.matched_pairs() or 0) > 0:
                     await self._small_capital_maybe_stop_completed(market, pos, "normal_quote_balanced")
@@ -2809,21 +2887,11 @@ class MarketCycler:
             self._running = False
             return
 
-        # 15.5. Auto-merge check: dollar-based threshold OR low balance OR near expiry
+        # 15.5. Auto-merge check: dollar-based threshold OR low balance. The
+        # 2-minute pre-expiry force merge runs earlier so it is not skipped by
+        # quote/order early returns.
         force_merge = False
         merge_reason = "routine"
-        matched_pairs_for_merge = int(pos.matched_pairs() or 0)
-        if self._should_pre_expiry_auto_merge(remaining, matched_pairs_for_merge):
-            force_merge = True
-            merge_reason = "pre_expiry_2m"
-            self._has_done_pre_expiry_merge = True
-            log.info(
-                "pre_expiry_auto_merge_triggered",
-                asset=self.asset,
-                remaining=round(remaining, 1),
-                matched_pairs=matched_pairs_for_merge,
-            )
-
         # Dollar-based mid-market merge trigger
         if not force_merge and self.inventory.should_merge(market.market_id):
             force_merge = True
@@ -2843,18 +2911,11 @@ class MarketCycler:
                 balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
             )
             if merge_result.get("merged"):
-                msg = "auto_merge_pre_expiry" if merge_reason == "pre_expiry_2m" else "auto_merge_during_trading"
-                log.info(msg,
+                log.info("auto_merge_during_trading",
                          asset=self.asset,
                          reason=merge_reason,
                          pairs=merge_result["pairs_merged"],
                          usdc=f"${merge_result['usdc_recovered']:.2f}")
-                if merge_reason == "pre_expiry_2m":
-                    self._set_dashboard_event(
-                        "info",
-                        "PRE_EXPIRY_AUTO_MERGE",
-                        f"merged {merge_result['pairs_merged']} pairs; synced tradeable balance",
-                    )
                 # Update capital arbiter on recovery
                 if self.inventory.capital_arbiter:
                     self.inventory.capital_arbiter.record_recovery(
