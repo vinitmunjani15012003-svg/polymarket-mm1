@@ -7,12 +7,13 @@ and maintains latest price + rolling data for each subscribed symbol.
 
 import asyncio
 import json
+import os
 import time
 import math
 import numpy as np
 from collections import deque
 from typing import Dict, Optional, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import websockets
 
@@ -42,7 +43,7 @@ class PriceFeed:
         """
         self.ws_url = ws_url
         self.rest_url = rest_url
-        self.mt5_bridge_url = (mt5_bridge_url or "").rstrip("/")
+        self.mt5_bridge_url = self._normalize_mt5_bridge_url(mt5_bridge_url or "")
         self.mt5_bridge_api_key = mt5_bridge_api_key or ""
         self.mt5_bridge_stale_seconds = float(mt5_bridge_stale_seconds or 5.0)
         self.symbols = [s.lower() for s in symbols]
@@ -328,6 +329,36 @@ class PriceFeed:
             return sym[:-1]  # BTCUSDT -> BTCUSD
         return sym
 
+    @staticmethod
+    def _running_in_container() -> bool:
+        if os.path.exists("/.dockerenv"):
+            return True
+        try:
+            with open("/proc/1/cgroup", "r") as f:
+                return any(marker in f.read() for marker in ("docker", "kubepods", "containerd"))
+        except OSError:
+            return False
+
+    @classmethod
+    def _normalize_mt5_bridge_url(cls, url: str) -> str:
+        """Make localhost MT5 bridge URLs reachable from Docker containers.
+
+        MT5 usually runs on the host/Windows side, while the bot may run in a
+        container. In that topology, http://localhost:8765 points at the bot
+        container itself, not the MT5 bridge. Docker's host-gateway alias fixes
+        that when docker-compose provides host.docker.internal.
+        """
+        clean = (url or "").rstrip("/")
+        if not clean:
+            return ""
+        parsed = urlparse(clean)
+        if cls._running_in_container() and parsed.hostname in {"localhost", "127.0.0.1", "0.0.0.0"}:
+            netloc = "host.docker.internal"
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            return urlunparse(parsed._replace(netloc=netloc))
+        return clean
+
     def _store_mt5_bridge_price(self, symbol: str, price: float, ts: float) -> None:
         """Store an MT5 bridge price, even when stale, as the active MT5 source."""
         sym = symbol.upper()
@@ -411,7 +442,7 @@ class PriceFeed:
         except httpx.ConnectTimeout as e:
             self._mt5_bridge_unavailable_until = time.time() + self._mt5_bridge_unreachable_backoff_seconds
             log.warning(
-                "mt5_bridge_unreachable",
+                "mt5_bridge_price_error",
                 symbol=bridge_symbol,
                 host=host,
                 error=self._exception_detail(e),

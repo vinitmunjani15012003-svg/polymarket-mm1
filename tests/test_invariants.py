@@ -335,6 +335,15 @@ def test_price_feed_mt5_bridge_host_is_redacted_to_host_only():
     assert PriceFeed._url_host("http://bridge.local:8765/path") == "bridge.local:8765"
 
 
+def test_price_feed_rewrites_local_mt5_bridge_url_inside_container(monkeypatch):
+    monkeypatch.setattr(PriceFeed, "_running_in_container", staticmethod(lambda: True))
+
+    assert PriceFeed._normalize_mt5_bridge_url("http://localhost:8765") == "http://host.docker.internal:8765"
+    assert PriceFeed._normalize_mt5_bridge_url("http://127.0.0.1:8765") == "http://host.docker.internal:8765"
+    assert PriceFeed._normalize_mt5_bridge_url("http://0.0.0.0:8765") == "http://host.docker.internal:8765"
+    assert PriceFeed._normalize_mt5_bridge_url("http://192.168.1.10:8765") == "http://192.168.1.10:8765"
+
+
 def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     feed = PriceFeed("wss://stream.binance.com:9443/ws", ["BTCUSDT"])
 
