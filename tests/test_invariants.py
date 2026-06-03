@@ -606,6 +606,17 @@ def test_small_capital_state_reconciles_from_wallet_truth():
     assert state["wallet_truth_reconciled"] is True
 
 
+def test_small_capital_opening_spent_uses_strict_repair_for_sub_minimum_reverse_move():
+    # Regression for sudden reverse move: generic dust/FV logic might otherwise
+    # hold or quote normal/top-up. Small-cap after opening spent must only buy
+    # the opposite/light side.
+    up_size, down_size, mode = compute_inventory_repair_sizes(-2.0, 5, 5)
+
+    assert mode == "repair_up"
+    assert up_size == 5
+    assert down_size == 0
+
+
 def test_small_capital_fail_closed_blocks_pre_generation_after_opening_spent_flat():
     import asyncio
 

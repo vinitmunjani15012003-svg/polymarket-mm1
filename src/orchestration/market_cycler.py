@@ -2309,13 +2309,38 @@ class MarketCycler:
         up_size, down_size = self.inventory.compute_size_adjustment(
             market.market_id, fv, self.quote_engine.max_order_size, t_norm
         )
+        sct_opening_spent = False
+        if self._small_capital_enabled():
+            sct_opening_spent = self._small_capital_opening_spent(
+                self._small_capital_state(market.market_id)
+            )
 
         # 10.25 Inventory repair / dust-normalization overrides normal quoting.
         # Guardrails:
         # - no unrelated normal two-sided quoting while carrying a tail
         # - dust mode is capped at 2x min size by compute_inventory_repair_sizes()
         # - do not open a two-sided dust plan during halts or close-only phases
-        if dust_normalization and not is_halted and not close_only_phase:
+        if sct_opening_spent and abs_imbalance > 0:
+            # Small-capital mode is fail-closed after the opening attempt. Any
+            # nonzero wallet/local inventory must be handled as strict
+            # opposite-side repair. Do not use FV-aware dust/top-up logic during
+            # sudden moves; it can resume normal-style quoting and deepen the
+            # wrong-side inventory.
+            up_size, down_size, repair_mode = compute_inventory_repair_sizes(
+                imbalance,
+                min_order_size,
+                self.quote_engine.max_order_size,
+            )
+            log.warning(
+                "small_capital_strict_repair_after_opening_spent",
+                asset=self.asset,
+                market=market.market_id[:8],
+                imbalance=round(imbalance, 4),
+                up_size=up_size,
+                down_size=down_size,
+                mode=repair_mode,
+            )
+        elif dust_normalization and not is_halted and not close_only_phase:
             up_size, down_size, repair_mode = compute_fv_aware_dust_repair_sizes(
                 imbalance,
                 fv,
