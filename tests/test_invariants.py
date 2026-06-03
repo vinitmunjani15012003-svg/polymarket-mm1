@@ -330,6 +330,11 @@ def test_price_feed_mt5_exception_detail_is_never_empty():
     assert PriceFeed._exception_detail(ValueError("bad tick")) == "bad tick"
 
 
+def test_price_feed_mt5_bridge_host_is_redacted_to_host_only():
+    assert PriceFeed._url_host("http://192.168.1.10:8765") == "192.168.1.10:8765"
+    assert PriceFeed._url_host("http://bridge.local:8765/path") == "bridge.local:8765"
+
+
 def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     feed = PriceFeed("wss://stream.binance.com:9443/ws", ["BTCUSDT"])
 

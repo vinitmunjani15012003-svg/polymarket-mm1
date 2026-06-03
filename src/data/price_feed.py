@@ -12,6 +12,7 @@ import math
 import numpy as np
 from collections import deque
 from typing import Dict, Optional, Callable
+from urllib.parse import urlparse
 
 import websockets
 
@@ -71,6 +72,8 @@ class PriceFeed:
         self._reconnect_delay = 1
         self._last_message_ts: float = 0.0
         self._message_timeout: float = 15.0
+        self._mt5_bridge_unavailable_until: float = 0.0
+        self._mt5_bridge_unreachable_backoff_seconds: float = max(5.0, self.mt5_bridge_stale_seconds)
         # Throttle: only record one price sample per second for vol calculation
         self._last_history_ts: Dict[str, float] = {}
 
@@ -338,6 +341,11 @@ class PriceFeed:
         detail = str(exc).strip()
         return detail or exc.__class__.__name__
 
+    @staticmethod
+    def _url_host(url: str) -> str:
+        parsed = urlparse(url)
+        return parsed.netloc or parsed.path or "unknown"
+
     async def fetch_mt5_bridge_price(self, symbol: str) -> Optional[float]:
         """Fetch primary Exness/MT5 spot from local/remote bridge if configured."""
         if not self.mt5_bridge_url:
@@ -347,6 +355,16 @@ class PriceFeed:
         sym = symbol.upper()
         bridge_symbol = self._mt5_symbol_for(sym)
         url = f"{self.mt5_bridge_url}/price/{bridge_symbol}"
+        host = self._url_host(self.mt5_bridge_url)
+        now = time.time()
+        if now < self._mt5_bridge_unavailable_until:
+            log.debug(
+                "mt5_bridge_unreachable_backoff",
+                symbol=bridge_symbol,
+                host=host,
+                retry_in=round(self._mt5_bridge_unavailable_until - now, 3),
+            )
+            return None
         try:
             headers = {}
             if self.mt5_bridge_api_key:
@@ -390,13 +408,26 @@ class PriceFeed:
                 except Exception as e:
                     log.debug("mt5_price_callback_error", error=str(e))
             return price
+        except httpx.ConnectTimeout as e:
+            self._mt5_bridge_unavailable_until = time.time() + self._mt5_bridge_unreachable_backoff_seconds
+            log.warning(
+                "mt5_bridge_unreachable",
+                symbol=bridge_symbol,
+                host=host,
+                error=self._exception_detail(e),
+                error_type=e.__class__.__name__,
+                connect_timeout_seconds=1.5,
+                retry_in=self._mt5_bridge_unreachable_backoff_seconds,
+            )
+            return None
         except httpx.TimeoutException as e:
             log.warning(
                 "mt5_bridge_price_timeout",
                 symbol=bridge_symbol,
+                host=host,
                 error=self._exception_detail(e),
+                error_type=e.__class__.__name__,
                 timeout_seconds=1.5,
-                url=url,
             )
             return None
         except httpx.HTTPError as e:
@@ -405,7 +436,7 @@ class PriceFeed:
                 symbol=bridge_symbol,
                 error=self._exception_detail(e),
                 error_type=e.__class__.__name__,
-                url=url,
+                host=host,
             )
             return None
         except Exception as e:
@@ -703,4 +734,3 @@ class PriceFeed:
         except Exception as e:
             log.error("chainlink_error", symbol=symbol, error=str(e))
             return None
-
