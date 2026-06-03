@@ -687,6 +687,58 @@ class MarketCycler:
             and not getattr(self, "_has_done_pre_expiry_merge", False)
         )
 
+    def _small_capital_balancing_side(self, market_id: str, pos) -> str:
+        """Return the only side small-capital mode may quote after first fill.
+
+        Normal sizing can briefly see stale/flat inventory while the lifecycle
+        state already knows the opening side. In one-cycle mode, once the first
+        side is filled, every follow-up quote must be the opposite side; placing
+        the same opening side again duplicates exposure.
+        """
+        if not self._small_capital_enabled():
+            return ""
+        state = self._small_capital_state(market_id)
+        imbalance = float(pos.share_imbalance() or 0)
+        if imbalance > 0:
+            return "no"
+        if imbalance < 0:
+            return "yes"
+        if state.get("initial_filled") and not state.get("balancing_filled"):
+            initial_side = str(state.get("initial_side") or "").lower()
+            if initial_side in ("no", "down"):
+                return "yes"
+            if initial_side in ("yes", "up"):
+                return "no"
+        return ""
+
+    def _apply_small_capital_balancing_override(self, market_id: str, pos, quotes, repair_mode: str, min_order_size: int) -> str:
+        balancing_side = self._small_capital_balancing_side(market_id, pos)
+        if balancing_side == "yes":
+            quotes.no_buy_size = 0
+            quotes.yes_buy_size = max(int(quotes.yes_buy_size or 0), int(min_order_size or 0))
+            log.warning(
+                "small_capital_balancing_quote_forced",
+                asset=self.asset,
+                market=market_id[:8],
+                side="yes",
+                imbalance=round(float(pos.share_imbalance() or 0), 4),
+                msg="forcing opposite side after initial small-capital fill",
+            )
+            return "repair_up"
+        if balancing_side == "no":
+            quotes.yes_buy_size = 0
+            quotes.no_buy_size = max(int(quotes.no_buy_size or 0), int(min_order_size or 0))
+            log.warning(
+                "small_capital_balancing_quote_forced",
+                asset=self.asset,
+                market=market_id[:8],
+                side="no",
+                imbalance=round(float(pos.share_imbalance() or 0), 4),
+                msg="forcing opposite side after initial small-capital fill",
+            )
+            return "repair_down"
+        return repair_mode
+
     def _small_capital_state(self, market_id: str) -> dict:
         sm = getattr(self.inventory, "state_manager", None)
         if sm and hasattr(sm, "get_small_capital_window"):
@@ -2292,6 +2344,17 @@ class MarketCycler:
                     best_ask_no=best_ask_no,
                     threshold=FV_FAVORED_ENTRY_THRESHOLD,
                 )
+
+        # Small-capital one-cycle mode: after the first side fills, never allow
+        # normal/FV-entry logic to place the same opening side again. Force the
+        # opposite side until the pair is balanced/mergeable.
+        repair_mode = self._apply_small_capital_balancing_override(
+            market.market_id,
+            pos,
+            quotes,
+            repair_mode,
+            min_order_size,
+        )
 
         # 12.5 Capital guardrail (prevents negative capital in dry-run and
         # keeps live sizing within available funds).
