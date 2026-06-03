@@ -692,7 +692,6 @@ class MarketCycler:
     def _should_pre_expiry_auto_merge(self, remaining: float, matched_pairs: int) -> bool:
         return (
             remaining <= PRE_EXPIRY_AUTO_MERGE_SECONDS
-            and int(matched_pairs or 0) > 0
             and not getattr(self, "_has_done_pre_expiry_merge", False)
         )
 
@@ -764,20 +763,24 @@ class MarketCycler:
             wallet_pairs=wallet_pairs,
             matched_pairs=matched_pairs,
         )
-        if wallet_pairs > 0:
-            merge_result = await self._merge_current_market_wallet_pairs(market, wallet_pairs)
-        elif self.balance_monitor:
-            merge_result = await self.balance_monitor.check_and_merge(
-                inventory_mgr=self.inventory,
-                gasless_merger=self.gasless_merger,
-                ctf_ops=self.ctf,
-                pnl_tracker=self.pnl,
-                force=True,
-                balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
-            )
-        else:
+        if not self.balance_monitor:
             log.warning("pre_expiry_auto_merge_unavailable", asset=self.asset, reason="no_balance_monitor")
             return {"checked": False, "merged": False, "pairs_merged": 0, "reason": "no_balance_monitor"}
+
+        # Always use the BalanceMonitor path. It performs the authoritative
+        # on-chain YES/NO balance preflight, expands stale local inventory to
+        # chain-confirmed pairs, handles deposit-wallet relayer approvals, then
+        # retries CLOB balance/allowance sync after merge. Direct merge calls
+        # bypassed too much of that machinery and could leave recovered pUSD
+        # invisible to trading.
+        merge_result = await self.balance_monitor.check_and_merge(
+            inventory_mgr=self.inventory,
+            gasless_merger=self.gasless_merger,
+            ctf_ops=self.ctf,
+            pnl_tracker=self.pnl,
+            force=True,
+            balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
+        )
         if merge_result.get("merged"):
             self._has_done_pre_expiry_merge = True
             log.info(
@@ -797,8 +800,6 @@ class MarketCycler:
                     self.asset, float(merge_result.get("usdc_recovered", 0) or 0)
                 )
         else:
-            if wallet_pairs <= 0:
-                self._has_done_pre_expiry_merge = True
             log.warning(
                 "pre_expiry_auto_merge_noop",
                 asset=self.asset,
@@ -807,65 +808,6 @@ class MarketCycler:
                 result=merge_result,
             )
         return merge_result
-
-    async def _merge_current_market_wallet_pairs(self, market: MarketInfo, wallet_pairs: int) -> dict:
-        result = {
-            "checked": True,
-            "merged": False,
-            "pairs_merged": 0,
-            "usdc_recovered": 0.0,
-            "source": "wallet",
-        }
-        amount_pairs = int(wallet_pairs or 0)
-        if amount_pairs <= 0:
-            return result
-        condition_id = getattr(market, "condition_id", None) or getattr(market, "market_id", "")
-        if not condition_id:
-            result["reason"] = "missing_condition_id"
-            return result
-
-        amount = int(amount_pairs * 1_000_000)
-        collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
-        if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
-            try:
-                collateral_token = infer_collateral_token_for_market(
-                    self.balance_monitor._w3,
-                    self.balance_monitor._ctf,
-                    condition_id,
-                    str(getattr(market, "token_id_up", "") or ""),
-                    str(getattr(market, "token_id_down", "") or ""),
-                    collateral_token,
-                )
-            except Exception as e:
-                log.warning("wallet_pair_merge_collateral_infer_failed", asset=self.asset, error=str(e))
-
-        tx = None
-        if self.gasless_merger and getattr(self.gasless_merger, "is_available", False):
-            tx = await self.gasless_merger.merge_positions(condition_id, amount, collateral_token=collateral_token)
-        if not tx and self.ctf:
-            tx = await self.ctf.merge_positions(condition_id, amount, collateral_token=collateral_token)
-
-        if not tx:
-            result["reason"] = "merge_failed"
-            return result
-
-        result.update({"merged": True, "pairs_merged": amount_pairs, "usdc_recovered": float(amount_pairs)})
-        balance_sync = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
-        if balance_sync:
-            try:
-                maybe = balance_sync()
-                if hasattr(maybe, "__await__"):
-                    await maybe
-                result["balance_synced"] = True
-            except Exception as e:
-                result["balance_synced"] = False
-                log.warning("post_wallet_pair_merge_balance_sync_failed", asset=self.asset, error=str(e))
-        if self.balance_monitor and hasattr(self.balance_monitor, "get_usdc_balance"):
-            try:
-                result["balance"] = await self.balance_monitor.get_usdc_balance()
-            except Exception as e:
-                log.warning("post_wallet_pair_merge_balance_refresh_failed", asset=self.asset, error=str(e))
-        return result
 
     def _small_capital_balancing_side(self, market_id: str, pos, wallet_imbalance: float | None = None) -> str:
         """Return the only side small-capital mode may quote after first fill.

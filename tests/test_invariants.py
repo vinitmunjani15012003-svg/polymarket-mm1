@@ -425,35 +425,55 @@ def test_small_capital_balancing_override_uses_inventory_imbalance_even_without_
     assert quotes.no_buy_size == 0
 
 
-def test_pre_expiry_auto_merge_uses_wallet_pairs_when_local_inventory_lags():
+def test_pre_expiry_auto_merge_forces_balance_monitor_preflight_even_when_pairs_unknown():
     import asyncio
 
-    class FakeGaslessMerger:
-        is_available = True
-        _collateral_token = "0xCOLLATERAL"
-
+    class FakeBalanceMonitor:
         def __init__(self):
             self.calls = []
 
-        async def merge_positions(self, condition_id, amount, collateral_token=""):
-            self.calls.append((condition_id, amount, collateral_token))
-            return "0xMERGE"
+        async def check_and_merge(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"checked": True, "merged": False, "pairs_merged": 0, "usdc_recovered": 0.0}
 
-    class FakeBalanceMonitor:
-        async def get_usdc_balance(self):
-            return 1.0
-
-    sync_calls = []
     cycler = MarketCycler.__new__(MarketCycler)
     cycler.asset = "BTC"
     cycler._has_done_pre_expiry_merge = False
     cycler._last_pre_expiry_merge_attempt_ts = 0.0
     cycler.balance_monitor = FakeBalanceMonitor()
-    cycler.gasless_merger = FakeGaslessMerger()
+    cycler.gasless_merger = SimpleNamespace(is_available=True)
     cycler.ctf = None
     cycler.pnl = PnLTracker()
     cycler.inventory = InventoryManager()
-    cycler.order_mgr = SimpleNamespace(executor=SimpleNamespace(sync_balance_allowance=lambda: sync_calls.append(True)))
+    cycler.order_mgr = SimpleNamespace(executor=SimpleNamespace(sync_balance_allowance=lambda: True))
+    market = SimpleNamespace(market_id="M1", condition_id="0xCOND", token_id_up="1", token_id_down="2")
+    pos = SimpleNamespace(matched_pairs=lambda: 0)
+
+    result = asyncio.run(cycler._maybe_pre_expiry_auto_merge(market, pos, 120, wallet_truth=None))
+
+    assert result["checked"] is True
+    assert cycler.balance_monitor.calls
+    assert cycler.balance_monitor.calls[0]["force"] is True
+    assert cycler._has_done_pre_expiry_merge is False  # retry later if no merge yet
+
+
+def test_pre_expiry_auto_merge_marks_done_after_balance_monitor_success():
+    import asyncio
+
+    class FakeBalanceMonitor:
+        async def check_and_merge(self, **kwargs):
+            return {"checked": True, "merged": True, "pairs_merged": 5, "usdc_recovered": 5.0}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler._has_done_pre_expiry_merge = False
+    cycler._last_pre_expiry_merge_attempt_ts = 0.0
+    cycler.balance_monitor = FakeBalanceMonitor()
+    cycler.gasless_merger = SimpleNamespace(is_available=True)
+    cycler.ctf = None
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.order_mgr = SimpleNamespace(executor=SimpleNamespace(sync_balance_allowance=lambda: True))
     market = SimpleNamespace(market_id="M1", condition_id="0xCOND", token_id_up="1", token_id_down="2")
     pos = SimpleNamespace(matched_pairs=lambda: 0)
 
@@ -461,9 +481,6 @@ def test_pre_expiry_auto_merge_uses_wallet_pairs_when_local_inventory_lags():
 
     assert result["merged"] is True
     assert result["pairs_merged"] == 5
-    assert result["balance_synced"] is True
-    assert cycler.gasless_merger.calls == [("0xCOND", 5_000_000, "0xCOLLATERAL")]
-    assert sync_calls == [True]
     assert cycler._has_done_pre_expiry_merge is True
     assert cycler._dashboard_event["event_reason"] == "PRE_EXPIRY_AUTO_MERGE"
 
@@ -473,7 +490,7 @@ def test_pre_expiry_auto_merge_triggers_only_within_two_minutes_and_pairs():
     cycler._has_done_pre_expiry_merge = False
 
     assert cycler._should_pre_expiry_auto_merge(121, 10) is False
-    assert cycler._should_pre_expiry_auto_merge(120, 0) is False
+    assert cycler._should_pre_expiry_auto_merge(120, 0) is True
     assert cycler._should_pre_expiry_auto_merge(120, 1) is True
     assert cycler._should_pre_expiry_auto_merge(30, 1) is True
 
