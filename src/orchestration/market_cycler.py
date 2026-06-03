@@ -653,10 +653,22 @@ class MarketCycler:
         self._last_close_only_repair_mode: str | None = None
         self._last_toxicity_repair_override_log: float = 0.0
         self._merge_unavailable_until: float = 0.0
+        self._dashboard_event: dict = {}
 
         self._running = False
         self._last_market_slug = None  # Track to detect new market
         self._quote_event = asyncio.Event()
+
+    def _set_dashboard_event(self, level: str, reason: str, detail: str = "") -> None:
+        self._dashboard_event = {
+            "event_level": level,
+            "event_reason": reason,
+            "event_detail": detail,
+            "event_ts": time.time(),
+        }
+
+    def _clear_dashboard_event(self) -> None:
+        self._dashboard_event = {}
 
     def notify_price_update(self):
         """Wake the quote loop on a fresh price tick, with rate limit in loop."""
@@ -1526,7 +1538,9 @@ class MarketCycler:
 
         if not raw_spot:
             log.warning("no_spot_price", symbol=self.ac.symbol)
+            self._set_dashboard_event("skip", "NO_SPOT_PRICE", f"{self.ac.symbol} unavailable")
             await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, 0, self.last_fair_value or 0, self._dashboard_sigma_for_stale_spot(), "NO_SPOT", remaining)
             return
 
         if price_age > max_spot_age:
@@ -1537,6 +1551,11 @@ class MarketCycler:
                 raw_binance_spot=round(raw_spot, 4),
                 price_age=round(price_age, 3),
                 max_age=max_spot_age,
+            )
+            self._set_dashboard_event(
+                "skip",
+                "STALE_SPOT",
+                f"age {price_age:.2f}s > max {max_spot_age:.2f}s",
             )
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(
@@ -1589,6 +1608,7 @@ class MarketCycler:
         # strike must come from Vatic/Chainlink initialization or retry above.
         if self.fair_value_model and not self.fair_value_model.start_price:
             log.warning("missing_authoritative_start_price", asset=self.asset)
+            self._set_dashboard_event("skip", "NO_STRIKE", "missing authoritative Vatic/Chainlink start price")
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, 0, 0, "NO_STRIKE", remaining)
             return
@@ -2431,6 +2451,7 @@ class MarketCycler:
                 quotes.no_buy_size = 0
 
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
+            self._set_dashboard_event("skip", "NO_QUOTES", halt_reason if is_halted else phase)
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
             return
@@ -2464,6 +2485,11 @@ class MarketCycler:
                         asset=self.asset,
                         market=market.market_id[:8],
                         msg="one opening quote cycle already used; not opening again this window",
+                    )
+                    self._set_dashboard_event(
+                        "skip",
+                        "SMALL_CAP_WAIT_FILL",
+                        "opening quote cycle already used for this window",
                     )
                     await self.order_mgr.cancel_market_quotes(market.market_id)
                     self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_WAIT_FILL", remaining)
@@ -2549,6 +2575,7 @@ class MarketCycler:
         quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
 
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
+            self._set_dashboard_event("skip", "NO_QUOTES", halt_reason if is_halted else phase)
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
             return
@@ -2559,6 +2586,7 @@ class MarketCycler:
                                       fv_fresh, phase)
         if not passed:
             log.warning("pre_trade_failed", market=market.market_id, reasons=failed_reasons)
+            self._set_dashboard_event("skip", "PRE_TRADE_FAILED", ", ".join(map(str, failed_reasons))[:160])
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
             return
@@ -2576,6 +2604,8 @@ class MarketCycler:
         )
         if getattr(self.order_mgr, "last_order_error", None):
             self.stop_reason = f"order_update_failed:{self.order_mgr.last_order_error}"
+            self._set_dashboard_event("error", "ORDER_UPDATE_FAILED", str(self.order_mgr.last_order_error))
+            self._update_dashboard(market, spot, fv, sigma, "ORDER_ERROR", remaining, quotes=quotes, pos=pos)
             self._running = False
             return
 
@@ -2650,6 +2680,7 @@ class MarketCycler:
                             pass
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self.stop_reason = "negative_pair_edge_halt"
+            self._set_dashboard_event("error", "NEGATIVE_PAIR_EDGE", "matched pair cost exceeded 1")
             self._running = False
             return
 
@@ -2692,6 +2723,7 @@ class MarketCycler:
                         self.asset, merge_result['usdc_recovered'])
 
         # 16. Update dashboard
+        self._clear_dashboard_event()
         self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining,
                                 quotes, pos, imbalance, inv_state.value)
 
@@ -2858,6 +2890,8 @@ class MarketCycler:
             "starting_capital": getattr(self.pnl, "starting_capital", 0),
             "current_capital": getattr(self.pnl, "current_capital", 0),
         }
+        if getattr(self, "_dashboard_event", None):
+            state.update(self._dashboard_event)
 
         # Add balance monitor stats (live mode only)
         if self.balance_monitor:
