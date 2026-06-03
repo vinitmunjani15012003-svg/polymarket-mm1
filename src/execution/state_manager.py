@@ -74,6 +74,7 @@ class StateManager:
             state = {
                 "quote_cycles_started": 0,
                 "quote_cycle_started": False,
+                "opening_attempt_spent": False,
                 "initial_filled": False,
                 "balancing_filled": False,
                 "stopped_for_window": False,

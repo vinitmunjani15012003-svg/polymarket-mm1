@@ -720,6 +720,7 @@ class MarketCycler:
             if not state.get("quote_cycle_started"):
                 state["quote_cycle_started"] = True
                 state["quote_cycles_started"] = int(state.get("quote_cycles_started", 0) or 0) + 1
+                state["opening_attempt_spent"] = True
                 changed = True
             if not state.get("initial_filled"):
                 state["initial_filled"] = True
@@ -922,7 +923,6 @@ class MarketCycler:
             and not state.get("initial_filled")
             and int(matched_pairs or 0) == 0
         ):
-            state["quote_cycle_started"] = False
             state["stale_quote_cycle_repaired"] = True
             state["initial_order_id"] = ""
             state["initial_side"] = ""
@@ -932,11 +932,14 @@ class MarketCycler:
 
     def _small_capital_should_hold_opening_quote(self, state: dict, has_resting_opening_quote: bool, matched_pairs: int) -> bool:
         return bool(
-            state.get("quote_cycle_started")
+            self._small_capital_opening_spent(state)
             and has_resting_opening_quote
             and not state.get("initial_filled")
             and int(matched_pairs or 0) == 0
         )
+
+    def _small_capital_opening_spent(self, state: dict) -> bool:
+        return bool(state.get("opening_attempt_spent") or state.get("quote_cycle_started"))
 
     def _mark_small_capital_quote_started(self, market: MarketInfo, quotes, repair_mode: str):
         """Persist that this window has spent its one opening quote cycle."""
@@ -959,6 +962,7 @@ class MarketCycler:
             return
         state.update({
             "quote_cycle_started": True,
+            "opening_attempt_spent": True,
             "quote_cycles_started": int(state.get("quote_cycles_started", 0) or 0) + 1,
             "initial_order_id": initial_order_id,
             "initial_side": "yes" if (quotes.yes_buy_size or 0) > 0 else "no",
@@ -2755,7 +2759,7 @@ class MarketCycler:
                 quotes.no_buy_size = min(int(quotes.no_buy_size or 0), max_sct_size)
 
             sct_state = self._small_capital_state(market.market_id)
-            if sct_state.get("quote_cycle_started") and repair_mode == "normal" and abs_imbalance < min_order_size:
+            if self._small_capital_opening_spent(sct_state) and repair_mode == "normal" and abs_imbalance < min_order_size:
                 active = self.order_mgr.get_active(market.market_id)
                 has_resting_opening_quote = bool(active.yes_order_id or active.no_order_id)
                 if self._repair_small_capital_unfilled_opening_state(
@@ -2768,8 +2772,16 @@ class MarketCycler:
                         "small_capital_stale_quote_cycle_repaired",
                         asset=self.asset,
                         market=market.market_id[:8],
-                        msg="cleared quote-cycle state because opening order was canceled before fill",
+                        msg="opening order was canceled before fill; preserving one-cycle spent state",
                     )
+                    self._set_dashboard_event(
+                        "skip",
+                        "SMALL_CAP_OPENING_SPENT",
+                        "opening quote was already attempted this window",
+                    )
+                    await self.order_mgr.cancel_market_quotes(market.market_id)
+                    self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_WAIT_NEXT", remaining)
+                    return
                 elif int(pos.matched_pairs() or 0) > 0:
                     await self._small_capital_maybe_stop_completed(market, pos, "normal_quote_balanced")
                     return

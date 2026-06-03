@@ -614,9 +614,10 @@ def test_small_capital_holds_active_unfilled_opening_quote_without_repricing():
     assert cycler._small_capital_should_hold_opening_quote(state, False, 0) is False
     assert cycler._small_capital_should_hold_opening_quote({**state, "initial_filled": True}, True, 0) is False
     assert cycler._small_capital_should_hold_opening_quote(state, True, 1) is False
+    assert cycler._small_capital_opening_spent({"opening_attempt_spent": True, "quote_cycle_started": False}) is True
 
 
-def test_small_capital_repairs_canceled_unfilled_opening_quote_state():
+def test_small_capital_canceled_unfilled_opening_stays_spent_for_window():
     class StateManager:
         def __init__(self):
             self.saved = None
@@ -636,7 +637,8 @@ def test_small_capital_repairs_canceled_unfilled_opening_quote_state():
     repaired = cycler._repair_small_capital_unfilled_opening_state("M1", state, False, 0)
 
     assert repaired is True
-    assert state["quote_cycle_started"] is False
+    assert state["quote_cycle_started"] is True
+    assert cycler._small_capital_opening_spent(state) is True
     assert state["initial_order_id"] == ""
     assert state["initial_side"] == ""
     assert cycler.inventory.state_manager.saved["stale_quote_cycle_repaired"] is True
