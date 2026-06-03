@@ -369,6 +369,27 @@ def test_small_capital_balancing_override_blocks_duplicate_down_quote_after_down
     assert quotes.no_buy_size == 0
 
 
+def test_small_capital_balancing_override_uses_wallet_imbalance_over_local_lag():
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return {"quote_cycle_started": True, "initial_filled": False}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    pos = SimpleNamespace(share_imbalance=lambda: 0.0)  # local fill accounting is lagging/flat
+    quotes = SimpleNamespace(yes_buy_size=0, no_buy_size=5)
+
+    mode = cycler._apply_small_capital_balancing_override(
+        "0xmarket", pos, quotes, "normal", 5, wallet_imbalance=-5.0
+    )
+
+    assert mode == "repair_up"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
 def test_small_capital_balancing_override_uses_inventory_imbalance_even_without_fill_state():
     class StateManager:
         def get_small_capital_window(self, market_id):

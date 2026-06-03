@@ -687,7 +687,7 @@ class MarketCycler:
             and not getattr(self, "_has_done_pre_expiry_merge", False)
         )
 
-    def _small_capital_balancing_side(self, market_id: str, pos) -> str:
+    def _small_capital_balancing_side(self, market_id: str, pos, wallet_imbalance: float | None = None) -> str:
         """Return the only side small-capital mode may quote after first fill.
 
         Normal sizing can briefly see stale/flat inventory while the lifecycle
@@ -698,7 +698,7 @@ class MarketCycler:
         if not self._small_capital_enabled():
             return ""
         state = self._small_capital_state(market_id)
-        imbalance = float(pos.share_imbalance() or 0)
+        imbalance = float(wallet_imbalance if wallet_imbalance is not None else (pos.share_imbalance() or 0))
         if imbalance > 0:
             return "no"
         if imbalance < 0:
@@ -711,8 +711,9 @@ class MarketCycler:
                 return "no"
         return ""
 
-    def _apply_small_capital_balancing_override(self, market_id: str, pos, quotes, repair_mode: str, min_order_size: int) -> str:
-        balancing_side = self._small_capital_balancing_side(market_id, pos)
+    def _apply_small_capital_balancing_override(self, market_id: str, pos, quotes, repair_mode: str, min_order_size: int, wallet_imbalance: float | None = None) -> str:
+        balancing_side = self._small_capital_balancing_side(market_id, pos, wallet_imbalance)
+        effective_imbalance = float(wallet_imbalance if wallet_imbalance is not None else (pos.share_imbalance() or 0))
         if balancing_side == "yes":
             quotes.no_buy_size = 0
             quotes.yes_buy_size = max(int(quotes.yes_buy_size or 0), int(min_order_size or 0))
@@ -721,7 +722,8 @@ class MarketCycler:
                 asset=self.asset,
                 market=market_id[:8],
                 side="yes",
-                imbalance=round(float(pos.share_imbalance() or 0), 4),
+                imbalance=round(effective_imbalance, 4),
+                source="wallet" if wallet_imbalance is not None else "local",
                 msg="forcing opposite side after initial small-capital fill",
             )
             return "repair_up"
@@ -733,11 +735,44 @@ class MarketCycler:
                 asset=self.asset,
                 market=market_id[:8],
                 side="no",
-                imbalance=round(float(pos.share_imbalance() or 0), 4),
+                imbalance=round(effective_imbalance, 4),
+                source="wallet" if wallet_imbalance is not None else "local",
                 msg="forcing opposite side after initial small-capital fill",
             )
             return "repair_down"
         return repair_mode
+
+    async def _wallet_position_truth(self, market: MarketInfo) -> tuple[float, float] | None:
+        """Return authoritative YES/NO wallet balances for the current market.
+
+        Local fills are still used for cost basis/P&L, but quote side selection
+        should use wallet/ERC1155 balances when available because CLOB trade
+        history can lag immediately after a fill.
+        """
+        yes_token_id = str(getattr(market, "token_id_up", "") or "")
+        no_token_id = str(getattr(market, "token_id_down", "") or "")
+        if not yes_token_id or not no_token_id:
+            return None
+
+        ctf_contract = None
+        address = ""
+        bm = getattr(self, "balance_monitor", None)
+        if bm and getattr(bm, "_ctf", None) is not None and getattr(bm, "_address", ""):
+            ctf_contract = bm._ctf
+            address = bm._address
+        elif self.ctf and getattr(self.ctf, "_ctf", None) is not None and getattr(self.ctf, "_account", None):
+            ctf_contract = self.ctf._ctf
+            address = self.ctf._account.address
+        if ctf_contract is None or not address:
+            return None
+
+        try:
+            yes_raw = int(ctf_contract.functions.balanceOf(address, int(yes_token_id)).call())
+            no_raw = int(ctf_contract.functions.balanceOf(address, int(no_token_id)).call())
+            return yes_raw / 1e6, no_raw / 1e6
+        except Exception as e:
+            log.warning("wallet_position_truth_error", asset=self.asset, error=str(e))
+            return None
 
     def _small_capital_state(self, market_id: str) -> dict:
         sm = getattr(self.inventory, "state_manager", None)
@@ -1818,6 +1853,24 @@ class MarketCycler:
         if await self._small_capital_maybe_stop_completed(market, pos, "pre_quote_balanced"):
             return
 
+        wallet_truth = await self._wallet_position_truth(market)
+        wallet_imbalance: float | None = None
+        if wallet_truth is not None:
+            wallet_yes, wallet_no = wallet_truth
+            wallet_imbalance = wallet_yes - wallet_no
+            local_imbalance = float(pos.share_imbalance() or 0)
+            if abs(wallet_imbalance - local_imbalance) >= 0.5:
+                log.warning(
+                    "wallet_inventory_truth_diverged",
+                    asset=self.asset,
+                    market=market.market_id[:8],
+                    local_imbalance=round(local_imbalance, 4),
+                    wallet_imbalance=round(wallet_imbalance, 4),
+                    wallet_yes=round(wallet_yes, 4),
+                    wallet_no=round(wallet_no, 4),
+                    msg="using wallet truth for quote side selection",
+                )
+
         if has_negative_matched_pair_edge(pos):
             pairs = int(pos.matched_pairs())
             pair_pnl = round(pos.matched_pair_profit(), 4)
@@ -1908,7 +1961,7 @@ class MarketCycler:
                     msg="Cleared stale inventory; on-chain pairs may need manual redemption",
                 )
 
-        if phase == "DEAD_ZONE" and pos.share_imbalance() == 0:
+        if phase == "DEAD_ZONE" and float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance()) == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, phase, remaining)
             return
@@ -1973,7 +2026,7 @@ class MarketCycler:
         # leaves us imbalanced, the safest response is not a full quoting freeze;
         # it is close-only repair on the light side with conservative sizing.
         # Uses SHARE COUNT imbalance (Up - Down), not dollar delta.
-        imbalance = pos.share_imbalance()
+        imbalance = float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance())
         abs_imbalance = abs(imbalance)
         # Treat any leftover as actionable inventory risk. If one side filled and
         # the other did not, quote ONLY the light side until balanced again.
@@ -2354,6 +2407,7 @@ class MarketCycler:
             quotes,
             repair_mode,
             min_order_size,
+            wallet_imbalance=wallet_imbalance,
         )
 
         # 12.5 Capital guardrail (prevents negative capital in dry-run and
