@@ -697,7 +697,49 @@ def test_small_capital_opening_spent_uses_strict_repair_for_sub_minimum_reverse_
     assert down_size == 0
 
 
-def test_small_capital_fail_closed_blocks_pre_generation_after_opening_spent_flat():
+def test_small_capital_pre_generation_allows_retry_after_unfilled_flat_spent_state():
+    import asyncio
+
+    class StateManager:
+        def __init__(self):
+            self.state = {"quote_cycle_started": True, "opening_attempt_spent": True, "initial_filled": False}
+
+        def get_small_capital_window(self, market_id):
+            return self.state
+
+        def update_small_capital_window(self, market_id, state):
+            self.state = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.inventory = InventoryManager()
+    cycler.inventory.state_manager = StateManager()
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True, retry_unfilled_opening=True)
+    cycler.order_mgr = OrderManager(DummyExecutor())
+    cycler._dashboard_cb = lambda *_: None
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {}
+    cycler.fair_value_model = None
+    cycler.last_fair_value = 0.7
+    cycler.last_sigma = 0.2
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.balance_monitor = None
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC?", time_remaining=500)
+    pos = cycler.inventory.get_or_create("M1", "BTC")
+
+    blocked = asyncio.run(cycler._small_capital_fail_closed_before_quotes(market, pos, None, 0.7, 0.2, 500))
+
+    assert blocked is False
+    state = cycler.inventory.state_manager.state
+    assert state["quote_cycle_started"] is False
+    assert state["opening_attempt_spent"] is False
+    assert state["stale_quote_cycle_repaired"] is True
+
+
+def test_small_capital_pre_generation_can_preserve_strict_wait_next_when_configured():
     import asyncio
 
     states = []
@@ -717,7 +759,7 @@ def test_small_capital_fail_closed_blocks_pre_generation_after_opening_spent_fla
     cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
     cycler.inventory = InventoryManager()
     cycler.inventory.state_manager = StateManager()
-    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True, retry_unfilled_opening=False)
     cycler.order_mgr = OrderManager(DummyExecutor())
     cycler._dashboard_cb = states.append
     cycler._dashboard_event = {}

@@ -136,6 +136,10 @@ async def run_bot(
         max_shares_per_order=int(getattr(config.small_capital_test, "max_shares_per_order", 0) or 0),
         stop_after_balanced_fill=bool(getattr(config.small_capital_test, "stop_after_balanced_fill", True)),
         cancel_remaining_orders_on_stop=bool(getattr(config.small_capital_test, "cancel_remaining_orders_on_stop", True)),
+        retry_unfilled_opening=bool(getattr(config.small_capital_test, "retry_unfilled_opening", True)),
+        emergency_hedge_enabled=bool(getattr(config.small_capital_test, "emergency_hedge_enabled", True)),
+        emergency_hedge_after_seconds=float(getattr(config.small_capital_test, "emergency_hedge_after_seconds", 20.0)),
+        emergency_hedge_max_pair_loss=float(getattr(config.small_capital_test, "emergency_hedge_max_pair_loss", 0.20)),
     )
 
     # --- Initialize shared components ---

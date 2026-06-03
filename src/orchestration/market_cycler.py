@@ -1074,6 +1074,33 @@ class MarketCycler:
                                    "SMALL_CAP_HOLD_OPENING", remaining)
             return True
 
+        if not state.get("initial_filled") and bool(getattr(getattr(self, "small_capital_config", None), "retry_unfilled_opening", True)):
+            # Compatibility/workflow restore: an opening order that was canceled
+            # before any fill did not create market risk. Do not let stale
+            # opening_attempt_spent state freeze the whole window before the
+            # later quote-generation path can repair it.
+            state["quote_cycle_started"] = False
+            state["opening_attempt_spent"] = False
+            state["initial_order_id"] = ""
+            state["initial_side"] = ""
+            state["initial_price"] = 0.0
+            state["initial_yes_price"] = 0.0
+            state["initial_no_price"] = 0.0
+            state["stale_quote_cycle_repaired"] = True
+            self._save_small_capital_state(market.market_id, state)
+            log.warning(
+                "small_capital_pre_generation_unfilled_retry_enabled",
+                asset=self.asset,
+                market=market.market_id[:8],
+                msg="cleared stale opening-spent state with no fill/inventory; allowing opening quote retry",
+            )
+            self._set_dashboard_event(
+                "info",
+                "SMALL_CAP_RETRY_UNFILLED_OPENING",
+                "cleared stale unfilled opening state; retrying",
+            )
+            return False
+
         log.warning(
             "small_capital_opening_spent_pre_generation",
             asset=self.asset,
