@@ -344,6 +344,62 @@ def test_price_feed_rewrites_local_mt5_bridge_url_inside_container(monkeypatch):
     assert PriceFeed._normalize_mt5_bridge_url("http://192.168.1.10:8765") == "http://192.168.1.10:8765"
 
 
+def test_small_capital_does_not_mark_opening_cycle_without_order_id():
+    class StateManager:
+        def __init__(self):
+            self.state = {}
+
+        def get_small_capital_window(self, market_id):
+            return self.state.setdefault(market_id, {"quote_cycle_started": False, "quote_cycles_started": 0})
+
+        def update_small_capital_window(self, market_id, state):
+            self.state[market_id] = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    cycler.order_mgr = OrderManager(DummyExecutor())
+    market = SimpleNamespace(market_id="M1", slug="btc-window")
+    quotes = SimpleNamespace(yes_buy_size=5, no_buy_size=0)
+
+    cycler._mark_small_capital_quote_started(market, quotes, "normal")
+
+    state = cycler.inventory.state_manager.get_small_capital_window("M1")
+    assert state["quote_cycle_started"] is False
+    assert state["quote_cycles_started"] == 0
+    assert state.get("initial_order_id", "") == ""
+
+
+def test_small_capital_marks_opening_cycle_only_after_order_id_exists():
+    class StateManager:
+        def __init__(self):
+            self.state = {}
+
+        def get_small_capital_window(self, market_id):
+            return self.state.setdefault(market_id, {"quote_cycle_started": False, "quote_cycles_started": 0})
+
+        def update_small_capital_window(self, market_id, state):
+            self.state[market_id] = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    cycler.order_mgr = OrderManager(DummyExecutor())
+    active = cycler.order_mgr.get_active("M1")
+    active.yes_order_id = "OID-YES"
+    market = SimpleNamespace(market_id="M1", slug="btc-window")
+    quotes = SimpleNamespace(yes_buy_size=5, no_buy_size=0)
+
+    cycler._mark_small_capital_quote_started(market, quotes, "normal")
+
+    state = cycler.inventory.state_manager.get_small_capital_window("M1")
+    assert state["quote_cycle_started"] is True
+    assert state["quote_cycles_started"] == 1
+    assert state["initial_order_id"] == "OID-YES"
+
+
 def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     feed = PriceFeed("wss://stream.binance.com:9443/ws", ["BTCUSDT"])
 

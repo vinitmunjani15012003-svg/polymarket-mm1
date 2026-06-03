@@ -688,10 +688,19 @@ class MarketCycler:
         if state.get("quote_cycle_started"):
             return
         active = self.order_mgr.get_active(market.market_id)
+        initial_order_id = active.yes_order_id or active.no_order_id or ""
+        if not initial_order_id:
+            log.warning(
+                "small_capital_quote_cycle_not_marked",
+                asset=self.asset,
+                market=market.market_id[:8],
+                msg="opening quote was generated but no live order id exists",
+            )
+            return
         state.update({
             "quote_cycle_started": True,
             "quote_cycles_started": int(state.get("quote_cycles_started", 0) or 0) + 1,
-            "initial_order_id": active.yes_order_id or active.no_order_id or "",
+            "initial_order_id": initial_order_id,
             "initial_side": "yes" if (quotes.yes_buy_size or 0) > 0 else "no",
             "slug": market.slug,
             "asset": self.asset,
@@ -2436,10 +2445,20 @@ class MarketCycler:
             if sct_state.get("quote_cycle_started") and repair_mode == "normal" and abs_imbalance < min_order_size:
                 active = self.order_mgr.get_active(market.market_id)
                 has_resting_opening_quote = bool(active.yes_order_id or active.no_order_id)
-                if int(pos.matched_pairs() or 0) > 0:
+                if not has_resting_opening_quote and not sct_state.get("initial_order_id") and int(pos.matched_pairs() or 0) == 0:
+                    sct_state["quote_cycle_started"] = False
+                    sct_state["stale_quote_cycle_repaired"] = True
+                    self._save_small_capital_state(market.market_id, sct_state)
+                    log.warning(
+                        "small_capital_stale_quote_cycle_repaired",
+                        asset=self.asset,
+                        market=market.market_id[:8],
+                        msg="cleared quote-cycle state because no opening order id exists",
+                    )
+                elif int(pos.matched_pairs() or 0) > 0:
                     await self._small_capital_maybe_stop_completed(market, pos, "normal_quote_balanced")
                     return
-                if not has_resting_opening_quote:
+                elif not has_resting_opening_quote:
                     log.warning(
                         "small_capital_no_second_opening_quote",
                         asset=self.asset,
