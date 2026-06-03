@@ -425,6 +425,40 @@ def test_small_capital_balancing_override_uses_inventory_imbalance_even_without_
     assert quotes.no_buy_size == 0
 
 
+def test_small_capital_marks_opening_limit_price_for_pair_cost_fallback():
+    saved = {}
+
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return saved
+
+        def update_small_capital_window(self, market_id, state):
+            saved.update(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    cycler.order_mgr = SimpleNamespace(get_active=lambda market_id: SimpleNamespace(yes_order_id="OID-UP", no_order_id=""))
+    market = SimpleNamespace(market_id="0xmarket", slug="btc-window")
+    quotes = SimpleNamespace(yes_buy_size=5, no_buy_size=0, yes_buy_price=0.51, no_buy_price=0.48)
+
+    cycler._mark_small_capital_quote_started(market, quotes, "normal")
+
+    assert saved["initial_side"] == "yes"
+    assert saved["initial_yes_price"] == 0.51
+    assert saved["initial_price"] == 0.51
+
+
+def test_small_capital_saved_repair_cap_blocks_pair_cost_over_one_when_fifo_lags():
+    cycler = MarketCycler.__new__(MarketCycler)
+    state = {"initial_side": "yes", "initial_yes_price": 0.51}
+
+    assert cycler._small_capital_saved_repair_cap(state, "no", 0.01) == 0.48
+    assert cycler._small_capital_saved_repair_cap(state, "yes", 0.01) is None
+    assert cycler._small_capital_saved_repair_cap({"initial_side": "yes"}, "no", 0.01) is None
+
+
 def test_pre_expiry_auto_merge_forces_balance_monitor_preflight_even_when_pairs_unknown():
     import asyncio
 
