@@ -166,6 +166,7 @@ small_capital_test:
   emergency_hedge_enabled: true
   emergency_hedge_after_seconds: 20.0
   emergency_hedge_max_pair_loss: 0.20
+  retry_unfilled_opening: true
 
 # --- Balance Monitor (live mode only) ---
 # Auto-merges matched pairs when USDC wallet balance drops low.

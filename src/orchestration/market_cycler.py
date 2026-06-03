@@ -999,9 +999,16 @@ class MarketCycler:
             and not state.get("initial_filled")
             and int(matched_pairs or 0) == 0
         ):
+            retry_unfilled = bool(getattr(getattr(self, "small_capital_config", None), "retry_unfilled_opening", True))
             state["stale_quote_cycle_repaired"] = True
             state["initial_order_id"] = ""
             state["initial_side"] = ""
+            if retry_unfilled:
+                state["quote_cycle_started"] = False
+                state["opening_attempt_spent"] = False
+                state["initial_price"] = 0.0
+                state["initial_yes_price"] = 0.0
+                state["initial_no_price"] = 0.0
             self._save_small_capital_state(market_id, state)
             return True
         return False
@@ -2950,20 +2957,36 @@ class MarketCycler:
                     has_resting_opening_quote,
                     int(pos.matched_pairs() or 0),
                 ):
-                    log.warning(
-                        "small_capital_stale_quote_cycle_repaired",
-                        asset=self.asset,
-                        market=market.market_id[:8],
-                        msg="opening order was canceled before fill; preserving one-cycle spent state",
-                    )
-                    self._set_dashboard_event(
-                        "skip",
-                        "SMALL_CAP_OPENING_SPENT",
-                        "opening quote was already attempted this window",
-                    )
-                    await self.order_mgr.cancel_market_quotes(market.market_id)
-                    self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_WAIT_NEXT", remaining)
-                    return
+                    sct_state = self._small_capital_state(market.market_id)
+                    if not self._small_capital_opening_spent(sct_state):
+                        log.info(
+                            "small_capital_unfilled_opening_retry_enabled",
+                            asset=self.asset,
+                            market=market.market_id[:8],
+                            msg="opening order was canceled before fill; allowing retry",
+                        )
+                        self._set_dashboard_event(
+                            "info",
+                            "SMALL_CAP_RETRY_UNFILLED_OPENING",
+                            "previous opening canceled before fill; retrying",
+                        )
+                        # Continue to update_quotes below with the freshly
+                        # computed normal quote. No inventory was ever opened.
+                    else:
+                        log.warning(
+                            "small_capital_stale_quote_cycle_repaired",
+                            asset=self.asset,
+                            market=market.market_id[:8],
+                            msg="opening order was canceled before fill; preserving one-cycle spent state",
+                        )
+                        self._set_dashboard_event(
+                            "skip",
+                            "SMALL_CAP_OPENING_SPENT",
+                            "opening quote was already attempted this window",
+                        )
+                        await self.order_mgr.cancel_market_quotes(market.market_id)
+                        self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_WAIT_NEXT", remaining)
+                        return
                 elif int(pos.matched_pairs() or 0) > 0:
                     await self._small_capital_maybe_stop_completed(market, pos, "normal_quote_balanced")
                     return

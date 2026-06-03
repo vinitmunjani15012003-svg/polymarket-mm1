@@ -153,6 +153,7 @@ class SmallCapitalTestConfig:
     emergency_hedge_after_seconds: float = 20.0
     emergency_hedge_max_pair_loss: float = 0.20
     emergency_hedge_enabled: bool = True
+    retry_unfilled_opening: bool = True
 
 
 @dataclass
@@ -476,6 +477,7 @@ def load_config(config_path: str = "config/default.yaml",
         emergency_hedge_after_seconds=float(sct.get("emergency_hedge_after_seconds", 20.0)),
         emergency_hedge_max_pair_loss=float(sct.get("emergency_hedge_max_pair_loss", 0.20)),
         emergency_hedge_enabled=bool(sct.get("emergency_hedge_enabled", True)),
+        retry_unfilled_opening=bool(sct.get("retry_unfilled_opening", True)),
     )
 
     # Validate config invariants
