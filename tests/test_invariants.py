@@ -459,6 +459,52 @@ def test_small_capital_saved_repair_cap_blocks_pair_cost_over_one_when_fifo_lags
     assert cycler._small_capital_saved_repair_cap({"initial_side": "yes"}, "no", 0.01) is None
 
 
+def test_small_capital_emergency_hedge_waits_then_allows_bounded_pair_loss():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.small_capital_config = SimpleNamespace(
+        emergency_hedge_enabled=True,
+        emergency_hedge_after_seconds=20.0,
+        emergency_hedge_max_pair_loss=0.20,
+    )
+    waiting_state = {
+        "initial_filled": True,
+        "balancing_filled": False,
+        "initial_side": "yes",
+        "initial_yes_price": 0.51,
+        "initial_fill_ts": time.time() - 19.0,
+    }
+    cap, active, elapsed = cycler._small_capital_emergency_hedge_cap(waiting_state, "no")
+    assert cap is None
+    assert active is False
+    assert elapsed >= 18.0
+
+    expired_state = {**waiting_state, "initial_fill_ts": time.time() - 21.0}
+    cap, active, elapsed = cycler._small_capital_emergency_hedge_cap(expired_state, "no")
+    assert active is True
+    assert elapsed >= 20.0
+    assert cap == 0.69  # 1.00 + max_loss 0.20 - opening 0.51
+
+
+def test_small_capital_emergency_hedge_blocks_when_entry_price_unknown():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.small_capital_config = SimpleNamespace(
+        emergency_hedge_enabled=True,
+        emergency_hedge_after_seconds=20.0,
+        emergency_hedge_max_pair_loss=0.20,
+    )
+    state = {
+        "initial_filled": True,
+        "balancing_filled": False,
+        "initial_side": "yes",
+        "initial_fill_ts": time.time() - 21.0,
+    }
+
+    cap, active, elapsed = cycler._small_capital_emergency_hedge_cap(state, "no")
+    assert cap is None
+    assert active is True
+    assert elapsed >= 20.0
+
+
 def test_pre_expiry_auto_merge_forces_balance_monitor_preflight_even_when_pairs_unknown():
     import asyncio
 

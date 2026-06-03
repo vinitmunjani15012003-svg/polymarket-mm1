@@ -726,6 +726,7 @@ class MarketCycler:
                 state["initial_filled"] = True
                 state["initial_side"] = "yes" if yes > 0 and yes >= no else "no"
                 state.setdefault("initial_order_id", "wallet_truth")
+                state.setdefault("initial_fill_ts", _time.time())
                 changed = True
         if yes > 0 and no > 0 and not state.get("balancing_filled"):
             state["balancing_filled"] = True
@@ -894,6 +895,51 @@ class MarketCycler:
         if initial_price <= 0:
             return None
         return max(0.0, round(1.0 - initial_price - float(min_edge or 0), 4))
+
+    def _small_capital_emergency_hedge_cap(self, state: dict, repair_side: str) -> tuple[float | None, bool, float]:
+        """Return bounded-loss hedge cap after the emergency timer expires.
+
+        Small-cap buy-only mode cannot sell wrong-side inventory. After waiting
+        for the profitable balancing leg, this allows completing the pair at a
+        bounded loss instead of risking the entire naked leg going to zero.
+        """
+        cfg = getattr(self, "small_capital_config", None)
+        if not getattr(cfg, "emergency_hedge_enabled", True):
+            return None, False, 0.0
+        if not state.get("initial_filled") or state.get("balancing_filled"):
+            return None, False, 0.0
+        try:
+            fill_ts = float(state.get("initial_fill_ts") or 0)
+        except Exception:
+            fill_ts = 0.0
+        if fill_ts <= 0:
+            return None, False, 0.0
+        elapsed = max(0.0, _time.time() - fill_ts)
+        wait_s = max(0.0, float(getattr(cfg, "emergency_hedge_after_seconds", 20.0) or 20.0))
+        if elapsed < wait_s:
+            return None, False, elapsed
+
+        repair_side = (repair_side or "").lower()
+        initial_side = str(state.get("initial_side") or "").lower()
+        if initial_side in ("up", "yes"):
+            initial_side = "yes"
+        elif initial_side in ("down", "no"):
+            initial_side = "no"
+        else:
+            return None, True, elapsed
+        if repair_side == initial_side:
+            return None, True, elapsed
+
+        try:
+            initial_price = float(state.get("initial_yes_price" if initial_side == "yes" else "initial_no_price")
+                                  or state.get("initial_price") or 0)
+        except Exception:
+            initial_price = 0.0
+        if initial_price <= 0:
+            return None, True, elapsed
+        max_pair_loss = max(0.0, float(getattr(cfg, "emergency_hedge_max_pair_loss", 0.20) or 0.0))
+        cap = max(0.0, min(0.99, 1.0 + max_pair_loss - initial_price))
+        return round(cap, 4), True, elapsed
 
     async def _wallet_position_truth(self, market: MarketInfo) -> tuple[float, float] | None:
         """Return authoritative YES/NO wallet balances for the current market.
@@ -1095,6 +1141,14 @@ class MarketCycler:
                 state["initial_filled"] = True
                 state["initial_side"] = side
                 state["initial_order_id"] = order_id
+                state["initial_fill_ts"] = _time.time()
+                fill_price = float(fill.get("price") or 0)
+                if fill_price > 0:
+                    if side == "yes":
+                        state["initial_yes_price"] = fill_price
+                    else:
+                        state["initial_no_price"] = fill_price
+                    state["initial_price"] = fill_price
             elif side and side != state.get("initial_side"):
                 state["balancing_filled"] = True
                 state["balancing_side"] = side
@@ -2982,30 +3036,66 @@ class MarketCycler:
                 side_label, size_val, min_edge=pair_edge))
 
             sct_saved_cap = None
+            sct_guard_source = "fifo"
             if sct_opening_spent:
                 is_sct_repair_side = (repair_mode == f"repair_{side_label}"
                                       or (side_label == "yes" and repair_mode == "repair_up")
                                       or (side_label == "no" and repair_mode == "repair_down"))
-                if is_sct_repair_side and cap >= 0.99:
+                if is_sct_repair_side:
                     sct_state_for_cap = self._small_capital_state(market.market_id)
-                    sct_saved_cap = self._small_capital_saved_repair_cap(
+                    emergency_cap, emergency_active, emergency_elapsed = self._small_capital_emergency_hedge_cap(
                         sct_state_for_cap,
                         side_label,
-                        pair_edge,
                     )
-                    if sct_saved_cap is None and abs_imbalance > 0:
-                        log.warning(
-                            "small_capital_repair_blocked_missing_entry_price",
-                            market=market.market_id[:8],
-                            side=side_label,
-                            quoted=price_val,
-                            mode=repair_mode,
-                            imbalance=round(imbalance, 4),
+                    if emergency_active:
+                        if emergency_cap is None and abs_imbalance > 0:
+                            log.warning(
+                                "small_capital_emergency_hedge_blocked_missing_entry_price",
+                                market=market.market_id[:8],
+                                side=side_label,
+                                quoted=price_val,
+                                mode=repair_mode,
+                                elapsed=round(emergency_elapsed, 2),
+                            )
+                            setattr(quotes, buy_size_attr, 0)
+                            continue
+                        if emergency_cap is not None:
+                            cap = float(emergency_cap)
+                            sct_guard_source = "small_capital_emergency_hedge"
+                            self._set_dashboard_event(
+                                "warn",
+                                "SMALL_CAP_EMERGENCY_HEDGE",
+                                f"{side_label} cap {cap:.2f} after {emergency_elapsed:.0f}s",
+                            )
+                            log.warning(
+                                "small_capital_emergency_hedge_active",
+                                market=market.market_id[:8],
+                                side=side_label,
+                                cap=round(cap, 4),
+                                elapsed=round(emergency_elapsed, 2),
+                                quoted=price_val,
+                                mode=repair_mode,
+                            )
+                    elif cap >= 0.99:
+                        sct_saved_cap = self._small_capital_saved_repair_cap(
+                            sct_state_for_cap,
+                            side_label,
+                            pair_edge,
                         )
-                        setattr(quotes, buy_size_attr, 0)
-                        continue
-                    if sct_saved_cap is not None:
-                        cap = min(cap, float(sct_saved_cap))
+                        if sct_saved_cap is None and abs_imbalance > 0:
+                            log.warning(
+                                "small_capital_repair_blocked_missing_entry_price",
+                                market=market.market_id[:8],
+                                side=side_label,
+                                quoted=price_val,
+                                mode=repair_mode,
+                                imbalance=round(imbalance, 4),
+                            )
+                            setattr(quotes, buy_size_attr, 0)
+                            continue
+                        if sct_saved_cap is not None:
+                            cap = min(cap, float(sct_saved_cap))
+                            sct_guard_source = "small_capital_saved_entry"
 
             # No unmatched fills on opposite → cap is 0.99, no constraint
             if cap >= 0.99:
@@ -3034,7 +3124,7 @@ class MarketCycler:
                                     market=market.market_id[:8], side=side_label,
                                     quoted=old_price, cap=round(cap, 4),
                                     min_edge=pair_edge,
-                                    source="small_capital_saved_entry" if sct_saved_cap is not None else "fifo")
+                                    source=sct_guard_source)
                     elif new_price > float(old_price or 0):
                         log.info("repair_quote_aggressed_to_cap",
                                  market=market.market_id[:8], side=side_label,

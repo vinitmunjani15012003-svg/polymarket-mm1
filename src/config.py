@@ -150,6 +150,9 @@ class SmallCapitalTestConfig:
     cancel_remaining_orders_on_stop: bool = True
     max_quote_cycles_per_window: int = 1
     max_shares_per_order: int = 0
+    emergency_hedge_after_seconds: float = 20.0
+    emergency_hedge_max_pair_loss: float = 0.20
+    emergency_hedge_enabled: bool = True
 
 
 @dataclass
@@ -470,6 +473,9 @@ def load_config(config_path: str = "config/default.yaml",
         cancel_remaining_orders_on_stop=bool(sct.get("cancel_remaining_orders_on_stop", True)),
         max_quote_cycles_per_window=int(sct.get("max_quote_cycles_per_window", 1)),
         max_shares_per_order=int(sct.get("max_shares_per_order", 0) or 0),
+        emergency_hedge_after_seconds=float(sct.get("emergency_hedge_after_seconds", 20.0)),
+        emergency_hedge_max_pair_loss=float(sct.get("emergency_hedge_max_pair_loss", 0.20)),
+        emergency_hedge_enabled=bool(sct.get("emergency_hedge_enabled", True)),
     )
 
     # Validate config invariants
