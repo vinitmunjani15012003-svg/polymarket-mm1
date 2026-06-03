@@ -655,6 +655,7 @@ class MarketCycler:
         self._last_toxicity_repair_override_log: float = 0.0
         self._merge_unavailable_until: float = 0.0
         self._dashboard_event: dict = {}
+        self._wallet_truth_by_market: dict[str, dict] = {}
 
         self._running = False
         self._last_market_slug = None  # Track to detect new market
@@ -687,6 +688,53 @@ class MarketCycler:
             and not getattr(self, "_has_done_pre_expiry_merge", False)
         )
 
+    def _wallet_truth_snapshot(self, wallet_truth) -> dict | None:
+        if wallet_truth is None:
+            return None
+        yes = float(wallet_truth[0] or 0)
+        no = float(wallet_truth[1] or 0)
+        return {
+            "yes_shares": yes,
+            "no_shares": no,
+            "matched_pairs": min(yes, no),
+            "share_imbalance": yes - no,
+            "source": "wallet",
+            "updated_ts": _time.time(),
+        }
+
+    def _apply_wallet_truth_to_small_capital_state(self, market_id: str, wallet_snapshot: dict | None) -> None:
+        if not self._small_capital_enabled() or not wallet_snapshot:
+            return
+        yes = float(wallet_snapshot.get("yes_shares", 0) or 0)
+        no = float(wallet_snapshot.get("no_shares", 0) or 0)
+        state = self._small_capital_state(market_id)
+        changed = False
+        if yes > 0 or no > 0:
+            if not state.get("quote_cycle_started"):
+                state["quote_cycle_started"] = True
+                state["quote_cycles_started"] = int(state.get("quote_cycles_started", 0) or 0) + 1
+                changed = True
+            if not state.get("initial_filled"):
+                state["initial_filled"] = True
+                state["initial_side"] = "yes" if yes > 0 and yes >= no else "no"
+                state.setdefault("initial_order_id", "wallet_truth")
+                changed = True
+        if yes > 0 and no > 0 and not state.get("balancing_filled"):
+            state["balancing_filled"] = True
+            state["balancing_side"] = "yes" if yes < no else "no"
+            state.setdefault("balancing_order_id", "wallet_truth")
+            changed = True
+        if changed:
+            state["wallet_truth_reconciled"] = True
+            self._save_small_capital_state(market_id, state)
+            log.warning(
+                "small_capital_state_reconciled_from_wallet",
+                asset=self.asset,
+                market=market_id[:8],
+                yes=round(yes, 4),
+                no=round(no, 4),
+            )
+
     async def _maybe_pre_expiry_auto_merge(self, market: MarketInfo, pos, remaining: float, wallet_truth=None) -> dict:
         wallet_pairs = 0
         if wallet_truth is not None:
@@ -694,8 +742,12 @@ class MarketCycler:
         matched_pairs = max(int(pos.matched_pairs() or 0), wallet_pairs)
         if not self._should_pre_expiry_auto_merge(remaining, matched_pairs):
             return {"checked": False, "merged": False, "pairs_merged": 0, "reason": "not_due"}
+        last_attempt = float(getattr(self, "_last_pre_expiry_merge_attempt_ts", 0.0) or 0.0)
+        now = _time.time()
+        if now - last_attempt < 10.0:
+            return {"checked": False, "merged": False, "pairs_merged": 0, "reason": "retry_throttled"}
+        self._last_pre_expiry_merge_attempt_ts = now
 
-        self._has_done_pre_expiry_merge = True
         log.info(
             "pre_expiry_auto_merge_triggered",
             asset=self.asset,
@@ -704,19 +756,22 @@ class MarketCycler:
             wallet_pairs=wallet_pairs,
             matched_pairs=matched_pairs,
         )
-        if not self.balance_monitor:
+        if wallet_pairs > 0:
+            merge_result = await self._merge_current_market_wallet_pairs(market, wallet_pairs)
+        elif self.balance_monitor:
+            merge_result = await self.balance_monitor.check_and_merge(
+                inventory_mgr=self.inventory,
+                gasless_merger=self.gasless_merger,
+                ctf_ops=self.ctf,
+                pnl_tracker=self.pnl,
+                force=True,
+                balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
+            )
+        else:
             log.warning("pre_expiry_auto_merge_unavailable", asset=self.asset, reason="no_balance_monitor")
             return {"checked": False, "merged": False, "pairs_merged": 0, "reason": "no_balance_monitor"}
-
-        merge_result = await self.balance_monitor.check_and_merge(
-            inventory_mgr=self.inventory,
-            gasless_merger=self.gasless_merger,
-            ctf_ops=self.ctf,
-            pnl_tracker=self.pnl,
-            force=True,
-            balance_sync=getattr(self.order_mgr.executor, "sync_balance_allowance", None),
-        )
         if merge_result.get("merged"):
+            self._has_done_pre_expiry_merge = True
             log.info(
                 "auto_merge_pre_expiry",
                 asset=self.asset,
@@ -734,6 +789,8 @@ class MarketCycler:
                     self.asset, float(merge_result.get("usdc_recovered", 0) or 0)
                 )
         else:
+            if wallet_pairs <= 0:
+                self._has_done_pre_expiry_merge = True
             log.warning(
                 "pre_expiry_auto_merge_noop",
                 asset=self.asset,
@@ -742,6 +799,65 @@ class MarketCycler:
                 result=merge_result,
             )
         return merge_result
+
+    async def _merge_current_market_wallet_pairs(self, market: MarketInfo, wallet_pairs: int) -> dict:
+        result = {
+            "checked": True,
+            "merged": False,
+            "pairs_merged": 0,
+            "usdc_recovered": 0.0,
+            "source": "wallet",
+        }
+        amount_pairs = int(wallet_pairs or 0)
+        if amount_pairs <= 0:
+            return result
+        condition_id = getattr(market, "condition_id", None) or getattr(market, "market_id", "")
+        if not condition_id:
+            result["reason"] = "missing_condition_id"
+            return result
+
+        amount = int(amount_pairs * 1_000_000)
+        collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
+        if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
+            try:
+                collateral_token = infer_collateral_token_for_market(
+                    self.balance_monitor._w3,
+                    self.balance_monitor._ctf,
+                    condition_id,
+                    str(getattr(market, "token_id_up", "") or ""),
+                    str(getattr(market, "token_id_down", "") or ""),
+                    collateral_token,
+                )
+            except Exception as e:
+                log.warning("wallet_pair_merge_collateral_infer_failed", asset=self.asset, error=str(e))
+
+        tx = None
+        if self.gasless_merger and getattr(self.gasless_merger, "is_available", False):
+            tx = await self.gasless_merger.merge_positions(condition_id, amount, collateral_token=collateral_token)
+        if not tx and self.ctf:
+            tx = await self.ctf.merge_positions(condition_id, amount, collateral_token=collateral_token)
+
+        if not tx:
+            result["reason"] = "merge_failed"
+            return result
+
+        result.update({"merged": True, "pairs_merged": amount_pairs, "usdc_recovered": float(amount_pairs)})
+        balance_sync = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
+        if balance_sync:
+            try:
+                maybe = balance_sync()
+                if hasattr(maybe, "__await__"):
+                    await maybe
+                result["balance_synced"] = True
+            except Exception as e:
+                result["balance_synced"] = False
+                log.warning("post_wallet_pair_merge_balance_sync_failed", asset=self.asset, error=str(e))
+        if self.balance_monitor and hasattr(self.balance_monitor, "get_usdc_balance"):
+            try:
+                result["balance"] = await self.balance_monitor.get_usdc_balance()
+            except Exception as e:
+                log.warning("post_wallet_pair_merge_balance_refresh_failed", asset=self.asset, error=str(e))
+        return result
 
     def _small_capital_balancing_side(self, market_id: str, pos, wallet_imbalance: float | None = None) -> str:
         """Return the only side small-capital mode may quote after first fill.
@@ -1368,6 +1484,7 @@ class MarketCycler:
     async def _run_market(self, market: MarketInfo):
         """Run the quote loop for a single 15-minute market."""
         self._has_done_pre_expiry_merge = False
+        self._last_pre_expiry_merge_attempt_ts = 0.0
         self._repair_mode_started_at = None
         start_price = None
         start_price_source = "unknown"
@@ -1929,6 +2046,10 @@ class MarketCycler:
 
         wallet_truth = await self._wallet_position_truth(market)
         wallet_imbalance: float | None = None
+        wallet_snapshot = self._wallet_truth_snapshot(wallet_truth)
+        if wallet_snapshot is not None:
+            self._wallet_truth_by_market[market.market_id] = wallet_snapshot
+            self._apply_wallet_truth_to_small_capital_state(market.market_id, wallet_snapshot)
         if wallet_truth is not None:
             wallet_yes, wallet_no = wallet_truth
             wallet_imbalance = wallet_yes - wallet_no
@@ -3030,10 +3151,25 @@ class MarketCycler:
         start_price = (self.fair_value_model.start_price
                        if self.fair_value_model else 0)
 
-        # Always get the REAL position from inventory
+        # Local inventory keeps cost basis/P&L. In live mode, wallet/ERC1155
+        # balances are the display/position truth because CLOB fills can lag.
         real_pos = self.inventory.get_or_create(market.market_id, self.asset)
         real_delta = real_pos.dollar_delta(fv) if fv else 0
         real_state = self.inventory.get_state(market.market_id, fv)
+        wallet_snapshot = getattr(self, "_wallet_truth_by_market", {}).get(market.market_id)
+        display_up_shares = real_pos.yes_shares
+        display_down_shares = real_pos.no_shares
+        display_imbalance = real_pos.share_imbalance()
+        display_matched_pairs = real_pos.matched_pairs()
+        display_delta = real_delta
+        inventory_source = "local"
+        if wallet_snapshot:
+            display_up_shares = float(wallet_snapshot.get("yes_shares", 0) or 0)
+            display_down_shares = float(wallet_snapshot.get("no_shares", 0) or 0)
+            display_imbalance = float(wallet_snapshot.get("share_imbalance", display_up_shares - display_down_shares) or 0)
+            display_matched_pairs = float(wallet_snapshot.get("matched_pairs", min(display_up_shares, display_down_shares)) or 0)
+            display_delta = (display_up_shares * fv - display_down_shares * (1 - fv)) if fv else 0
+            inventory_source = "wallet"
 
         raw_spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, spot)
         price_age = (self.price_feed.get_price_age(self.ac.symbol)
@@ -3064,17 +3200,18 @@ class MarketCycler:
             "down_size": quotes.no_buy_size if quotes else 0,
             "combined_cost": quotes.combined_cost if quotes else 0,
             "edge": quotes.edge_per_pair if quotes else 0,
-            # Always use real inventory data (share-based)
-            "up_shares": real_pos.yes_shares,
-            "down_shares": real_pos.no_shares,
+            # Display live wallet truth when available; keep local averages/P&L.
+            "up_shares": display_up_shares,
+            "down_shares": display_down_shares,
             "up_avg": real_pos.yes_avg_entry,
             "down_avg": real_pos.no_avg_entry,
-            "share_imbalance": real_pos.share_imbalance(),
-            "dollar_delta": real_pos.dollar_delta(fv) if fv else 0,
-            "matched_pairs": real_pos.matched_pairs(),
+            "share_imbalance": display_imbalance,
+            "dollar_delta": display_delta,
+            "matched_pairs": display_matched_pairs,
             "avg_pair_cost": real_pos.avg_matched_pair_cost(),
             "matched_pair_pnl": real_pos.matched_pair_profit(),
             "negative_pair_edge": has_negative_matched_pair_edge(real_pos),
+            "inventory_source": inventory_source,
             "inv_state": real_state.value,
             # P&L with rebates and outcomes
             "net_trading_pnl": self.pnl.net_trading_pnl,

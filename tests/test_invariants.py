@@ -428,27 +428,42 @@ def test_small_capital_balancing_override_uses_inventory_imbalance_even_without_
 def test_pre_expiry_auto_merge_uses_wallet_pairs_when_local_inventory_lags():
     import asyncio
 
-    class FakeBalanceMonitor:
-        async def check_and_merge(self, **kwargs):
-            self.kwargs = kwargs
-            return {"checked": True, "merged": True, "pairs_merged": 1, "usdc_recovered": 1.0}
+    class FakeGaslessMerger:
+        is_available = True
+        _collateral_token = "0xCOLLATERAL"
 
+        def __init__(self):
+            self.calls = []
+
+        async def merge_positions(self, condition_id, amount, collateral_token=""):
+            self.calls.append((condition_id, amount, collateral_token))
+            return "0xMERGE"
+
+    class FakeBalanceMonitor:
+        async def get_usdc_balance(self):
+            return 1.0
+
+    sync_calls = []
     cycler = MarketCycler.__new__(MarketCycler)
     cycler.asset = "BTC"
     cycler._has_done_pre_expiry_merge = False
+    cycler._last_pre_expiry_merge_attempt_ts = 0.0
     cycler.balance_monitor = FakeBalanceMonitor()
-    cycler.gasless_merger = None
+    cycler.gasless_merger = FakeGaslessMerger()
     cycler.ctf = None
     cycler.pnl = PnLTracker()
     cycler.inventory = InventoryManager()
-    cycler.order_mgr = SimpleNamespace(executor=SimpleNamespace(sync_balance_allowance=lambda: True))
-    market = SimpleNamespace(market_id="M1")
+    cycler.order_mgr = SimpleNamespace(executor=SimpleNamespace(sync_balance_allowance=lambda: sync_calls.append(True)))
+    market = SimpleNamespace(market_id="M1", condition_id="0xCOND", token_id_up="1", token_id_down="2")
     pos = SimpleNamespace(matched_pairs=lambda: 0)
 
-    result = asyncio.run(cycler._maybe_pre_expiry_auto_merge(market, pos, 120, wallet_truth=(1.0, 1.0)))
+    result = asyncio.run(cycler._maybe_pre_expiry_auto_merge(market, pos, 120, wallet_truth=(5.0, 5.0)))
 
     assert result["merged"] is True
-    assert result["pairs_merged"] == 1
+    assert result["pairs_merged"] == 5
+    assert result["balance_synced"] is True
+    assert cycler.gasless_merger.calls == [("0xCOND", 5_000_000, "0xCOLLATERAL")]
+    assert sync_calls == [True]
     assert cycler._has_done_pre_expiry_merge is True
     assert cycler._dashboard_event["event_reason"] == "PRE_EXPIRY_AUTO_MERGE"
 
@@ -475,6 +490,57 @@ def test_dashboard_event_helper_uses_market_cycler_time_alias():
     assert cycler._dashboard_event["event_reason"] == "PRE_TRADE_FAILED"
     assert cycler._dashboard_event["event_detail"] == "risk check"
     assert cycler._dashboard_event["event_ts"] > 0
+
+
+def test_dashboard_uses_wallet_truth_for_live_inventory_display():
+    states = []
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.fair_value_model = None
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.balance_monitor = None
+    cycler._dashboard_cb = states.append
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {
+        "M1": {"yes_shares": 5.0, "no_shares": 5.0, "matched_pairs": 5.0, "share_imbalance": 0.0}
+    }
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC up?")
+
+    cycler._update_dashboard(market, 100.0, 0.5, 0.2, "ACTIVE", 100)
+
+    assert states[-1]["up_shares"] == 5.0
+    assert states[-1]["down_shares"] == 5.0
+    assert states[-1]["matched_pairs"] == 5.0
+    assert states[-1]["inventory_source"] == "wallet"
+
+
+def test_small_capital_state_reconciles_from_wallet_truth():
+    class StateManager:
+        def __init__(self):
+            self.state = {"quote_cycle_started": False, "initial_filled": False, "balancing_filled": False}
+
+        def get_small_capital_window(self, market_id):
+            return self.state
+
+        def update_small_capital_window(self, market_id, state):
+            self.state = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+
+    cycler._apply_wallet_truth_to_small_capital_state("M1", {"yes_shares": 5.0, "no_shares": 5.0})
+
+    state = cycler.inventory.state_manager.state
+    assert state["quote_cycle_started"] is True
+    assert state["initial_filled"] is True
+    assert state["balancing_filled"] is True
+    assert state["wallet_truth_reconciled"] is True
 
 
 def test_small_capital_repairs_canceled_unfilled_opening_quote_state():
