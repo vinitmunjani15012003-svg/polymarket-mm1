@@ -324,6 +324,12 @@ def test_price_feed_records_stale_mt5_tick_instead_of_showing_unavailable():
     assert pf.get_price_source("BTCUSDT") == "exness_mt5_stale"
 
 
+def test_price_feed_mt5_exception_detail_is_never_empty():
+    assert PriceFeed._exception_detail(Exception()) == "Exception"
+    assert PriceFeed._exception_detail(TimeoutError()) == "TimeoutError"
+    assert PriceFeed._exception_detail(ValueError("bad tick")) == "bad tick"
+
+
 def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     feed = PriceFeed("wss://stream.binance.com:9443/ws", ["BTCUSDT"])
 

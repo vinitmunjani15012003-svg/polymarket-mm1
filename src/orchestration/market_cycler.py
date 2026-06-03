@@ -664,7 +664,7 @@ class MarketCycler:
             self._quote_event.set()
 
     def _small_capital_enabled(self) -> bool:
-        cfg = self.small_capital_config
+        cfg = getattr(self, "small_capital_config", None)
         return bool(cfg and getattr(cfg, "enabled", False) and getattr(cfg, "one_cycle_per_window", False))
 
     def _small_capital_state(self, market_id: str) -> dict:
@@ -2427,7 +2427,7 @@ class MarketCycler:
             return
 
         if self._small_capital_enabled():
-            max_sct_size = int(getattr(self.small_capital_config, "max_shares_per_order", 0) or 0)
+            max_sct_size = int(getattr(getattr(self, "small_capital_config", None), "max_shares_per_order", 0) or 0)
             if max_sct_size > 0:
                 quotes.yes_buy_size = min(int(quotes.yes_buy_size or 0), max_sct_size)
                 quotes.no_buy_size = min(int(quotes.no_buy_size or 0), max_sct_size)

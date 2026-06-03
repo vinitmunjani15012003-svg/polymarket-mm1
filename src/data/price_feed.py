@@ -332,6 +332,12 @@ class PriceFeed:
         self.timestamps[sym] = ts or time.time()
         self.price_sources[sym] = "exness_mt5"
 
+    @staticmethod
+    def _exception_detail(exc: Exception) -> str:
+        """Return a non-empty, actionable exception detail for structured logs."""
+        detail = str(exc).strip()
+        return detail or exc.__class__.__name__
+
     async def fetch_mt5_bridge_price(self, symbol: str) -> Optional[float]:
         """Fetch primary Exness/MT5 spot from local/remote bridge if configured."""
         if not self.mt5_bridge_url:
@@ -340,17 +346,27 @@ class PriceFeed:
         import httpx
         sym = symbol.upper()
         bridge_symbol = self._mt5_symbol_for(sym)
+        url = f"{self.mt5_bridge_url}/price/{bridge_symbol}"
         try:
             headers = {}
             if self.mt5_bridge_api_key:
                 headers["X-API-Key"] = self.mt5_bridge_api_key
             async with httpx.AsyncClient(timeout=1.5) as client:
-                resp = await client.get(
-                    f"{self.mt5_bridge_url}/price/{bridge_symbol}",
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+                resp = await client.get(url, headers=headers)
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                if resp.status_code >= 400:
+                    bridge_error = str(data.get("error") or "").strip()
+                    detail = bridge_error or f"HTTP {resp.status_code}"
+                    log.warning(
+                        "mt5_bridge_price_error",
+                        symbol=bridge_symbol,
+                        error=detail,
+                        status_code=resp.status_code,
+                    )
+                    return None
             price = float(data.get("mid") or data.get("price") or 0)
             ts = float(data.get("ts") or 0)
             now = time.time()
@@ -374,8 +390,31 @@ class PriceFeed:
                 except Exception as e:
                     log.debug("mt5_price_callback_error", error=str(e))
             return price
+        except httpx.TimeoutException as e:
+            log.warning(
+                "mt5_bridge_price_timeout",
+                symbol=bridge_symbol,
+                error=self._exception_detail(e),
+                timeout_seconds=1.5,
+                url=url,
+            )
+            return None
+        except httpx.HTTPError as e:
+            log.warning(
+                "mt5_bridge_price_error",
+                symbol=bridge_symbol,
+                error=self._exception_detail(e),
+                error_type=e.__class__.__name__,
+                url=url,
+            )
+            return None
         except Exception as e:
-            log.warning("mt5_bridge_price_error", symbol=bridge_symbol, error=str(e))
+            log.warning(
+                "mt5_bridge_price_error",
+                symbol=bridge_symbol,
+                error=self._exception_detail(e),
+                error_type=e.__class__.__name__,
+            )
             return None
 
     async def fetch_price_rest(self, symbol: str,

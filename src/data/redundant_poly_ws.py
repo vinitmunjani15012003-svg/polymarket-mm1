@@ -123,7 +123,12 @@ class _Connection:
         self._dropped_first_book: set[str] = set()
 
     async def start(self) -> None:
+        if self.parent._closing:
+            return
         await self.connect()
+        if self.parent._closing:
+            await self.close()
+            return
         if self.parent.subscribed:
             await self.subscribe(sorted(self.parent.subscribed), initial_dump=True)
         self._tasks = [
@@ -132,6 +137,8 @@ class _Connection:
         ]
 
     async def connect(self) -> None:
+        if self.parent._closing:
+            return
         self._ws = await websockets.connect(
             WS_URL,
             ping_interval=None,
@@ -145,9 +152,12 @@ class _Connection:
         self._dropped_first_book.clear()
 
     async def close(self) -> None:
-        for task in self._tasks:
+        tasks = list(self._tasks)
+        for task in tasks:
             task.cancel()
         self._tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self.health.connected = False
         if self._ws:
             try:
@@ -157,7 +167,11 @@ class _Connection:
         self._ws = None
 
     async def reconnect(self) -> None:
+        if self.parent._closing:
+            return
         await self.close()
+        if self.parent._closing:
+            return
         self.health.reconnect_count += 1
         await self.start()
 
@@ -197,9 +211,12 @@ class _Connection:
                 events = msg if isinstance(msg, list) else [msg]
                 for event in events:
                     await self._handle_event(event)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             self.health.connected = False
-            log.warning("poly_ws_connection_closed", conn=self.connection_id, error=str(exc))
+            if not self.parent._closing:
+                log.warning("poly_ws_connection_closed", conn=self.connection_id, error=str(exc))
 
     def _record_msg_time(self) -> None:
         now = time.time()
@@ -302,14 +319,19 @@ class RedundantPolymarketWS:
         self.token_health: dict[str, TokenHealth] = {}
         self.subscribed: set[str] = set()
         self._started = False
+        self._closing = False
         self._health_task: Optional[asyncio.Task] = None
         self._reconnect_times: deque[float] = deque()
+        self._last_stale_log_ts: dict[str, float] = {}
 
     async def ensure_started(self) -> None:
         if self._started:
             return
+        self._closing = False
         for conn in self.connections:
             await conn.start()
+            if self._closing:
+                return
             if self.stagger_seconds > 0:
                 await asyncio.sleep(self.stagger_seconds)
         self._health_task = asyncio.create_task(self._health_loop())
@@ -331,7 +353,11 @@ class RedundantPolymarketWS:
         if health and health.is_stale:
             age = health.age_seconds
             age_ms = None if age == float("inf") else round(age * 1000)
-            log.warning("poly_ws_stale", token_id=token_id, age_ms=age_ms, source=health.source_connection_id)
+            now = time.time()
+            last_log_ts = self._last_stale_log_ts.get(token_id, 0.0)
+            if now - last_log_ts >= max(1.0, self.stale_seconds):
+                self._last_stale_log_ts[token_id] = now
+                log.warning("poly_ws_stale", token_id=token_id, age_ms=age_ms, source=health.source_connection_id)
             return None
         return self.books.get(token_id)
 
@@ -362,15 +388,22 @@ class RedundantPolymarketWS:
         health.rejected_updates += 1
 
     async def close(self) -> None:
+        self._closing = True
         if self._health_task:
             self._health_task.cancel()
+            await asyncio.gather(self._health_task, return_exceptions=True)
+            self._health_task = None
         await asyncio.gather(*(conn.close() for conn in self.connections), return_exceptions=True)
         self._started = False
 
     async def _health_loop(self) -> None:
         while True:
             await asyncio.sleep(5)
+            if self._closing:
+                return
             await self._reconnect_unhealthy()
+            if self._closing:
+                return
             for h in self.connection_health():
                 log.info(
                     "poly_ws_health",
@@ -384,16 +417,22 @@ class RedundantPolymarketWS:
                 )
 
     async def _reconnect_unhealthy(self) -> None:
+        if self._closing:
+            return
         now = time.time()
         while self._reconnect_times and now - self._reconnect_times[0] > 60:
             self._reconnect_times.popleft()
         if len(self._reconnect_times) >= self.max_reconnects_per_minute:
             return
         for conn in self.connections:
+            if self._closing:
+                return
             h = conn.health
             if (not h.connected) or h.seconds_since_valid > self.reconnect_stale_seconds:
                 try:
                     await conn.reconnect()
+                    if self._closing:
+                        return
                     self._reconnect_times.append(time.time())
                     log.warning("poly_ws_reconnected", conn=conn.connection_id)
                 except Exception as exc:
