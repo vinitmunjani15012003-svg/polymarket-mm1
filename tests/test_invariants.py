@@ -344,6 +344,17 @@ def test_price_feed_rewrites_local_mt5_bridge_url_inside_container(monkeypatch):
     assert PriceFeed._normalize_mt5_bridge_url("http://192.168.1.10:8765") == "http://192.168.1.10:8765"
 
 
+def test_dashboard_event_helper_uses_market_cycler_time_alias():
+    cycler = MarketCycler.__new__(MarketCycler)
+
+    cycler._set_dashboard_event("skip", "PRE_TRADE_FAILED", "risk check")
+
+    assert cycler._dashboard_event["event_level"] == "skip"
+    assert cycler._dashboard_event["event_reason"] == "PRE_TRADE_FAILED"
+    assert cycler._dashboard_event["event_detail"] == "risk check"
+    assert cycler._dashboard_event["event_ts"] > 0
+
+
 def test_small_capital_does_not_mark_opening_cycle_without_order_id():
     class StateManager:
         def __init__(self):

@@ -664,7 +664,7 @@ class MarketCycler:
             "event_level": level,
             "event_reason": reason,
             "event_detail": detail,
-            "event_ts": time.time(),
+            "event_ts": _time.time(),
         }
 
     def _clear_dashboard_event(self) -> None:
