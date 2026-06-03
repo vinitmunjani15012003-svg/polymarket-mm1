@@ -980,6 +980,14 @@ class MarketCycler:
             return True
         return False
 
+    def _small_capital_should_hold_opening_quote(self, state: dict, has_resting_opening_quote: bool, matched_pairs: int) -> bool:
+        return bool(
+            state.get("quote_cycle_started")
+            and has_resting_opening_quote
+            and not state.get("initial_filled")
+            and int(matched_pairs or 0) == 0
+        )
+
     def _mark_small_capital_quote_started(self, market: MarketInfo, quotes, repair_mode: str):
         """Persist that this window has spent its one opening quote cycle."""
         if not self._small_capital_enabled() or repair_mode != "normal":
@@ -2810,6 +2818,24 @@ class MarketCycler:
                     )
                 elif int(pos.matched_pairs() or 0) > 0:
                     await self._small_capital_maybe_stop_completed(market, pos, "normal_quote_balanced")
+                    return
+                elif self._small_capital_should_hold_opening_quote(
+                    sct_state,
+                    has_resting_opening_quote,
+                    int(pos.matched_pairs() or 0),
+                ):
+                    log.info(
+                        "small_capital_holding_opening_quote",
+                        asset=self.asset,
+                        market=market.market_id[:8],
+                        msg="opening quote already placed; holding without normal repricing",
+                    )
+                    self._set_dashboard_event(
+                        "info",
+                        "SMALL_CAP_HOLD_OPENING",
+                        "opening quote already placed; waiting for fill/cancel",
+                    )
+                    self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_HOLD_OPENING", remaining)
                     return
                 elif not has_resting_opening_quote:
                     log.warning(

@@ -543,6 +543,16 @@ def test_small_capital_state_reconciles_from_wallet_truth():
     assert state["wallet_truth_reconciled"] is True
 
 
+def test_small_capital_holds_active_unfilled_opening_quote_without_repricing():
+    cycler = MarketCycler.__new__(MarketCycler)
+    state = {"quote_cycle_started": True, "initial_filled": False, "initial_order_id": "OID-OPEN"}
+
+    assert cycler._small_capital_should_hold_opening_quote(state, True, 0) is True
+    assert cycler._small_capital_should_hold_opening_quote(state, False, 0) is False
+    assert cycler._small_capital_should_hold_opening_quote({**state, "initial_filled": True}, True, 0) is False
+    assert cycler._small_capital_should_hold_opening_quote(state, True, 1) is False
+
+
 def test_small_capital_repairs_canceled_unfilled_opening_quote_state():
     class StateManager:
         def __init__(self):
