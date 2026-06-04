@@ -16,8 +16,12 @@ from src.core.models.inventory import InventorySnapshot
 from src.services.inventory import (
     InventoryBook,
     inventory_diverged,
+    matched_pair_edge_status,
     plan_inventory_repair,
+    plan_repair_price_cap,
     reconciliation_delta,
+    saved_repair_cap_from_state,
+    emergency_hedge_cap_from_state,
 )
 from src.services.risk import (
     RiskCoordinator,
@@ -268,6 +272,92 @@ def test_inventory_repair_planner_returns_explicit_subminimum_plan():
     assert plan.reason == "SUB_MINIMUM_TAIL"
 
 
+def test_repair_price_cap_planner_owns_fifo_and_saved_small_cap_caps():
+    class Position:
+        def max_profitable_repair_price(self, side, size, min_edge=0.01):
+            return 0.99
+
+    state = {"initial_side": "yes", "initial_yes_price": 0.51}
+
+    fifo = plan_repair_price_cap(Position(), "no", 5, 0.4, min_edge=0.02, repair_mode="repair_down")
+    saved = plan_repair_price_cap(
+        Position(),
+        "no",
+        5,
+        0.4,
+        min_edge=0.02,
+        repair_mode="repair_down",
+        small_capital_opening_spent=True,
+        small_capital_state=state,
+        abs_imbalance=5,
+    )
+
+    assert fifo.cap == 0.99
+    assert fifo.source == "fifo"
+    assert saved.cap == 0.47
+    assert saved.source == "small_capital_saved_entry"
+    assert saved_repair_cap_from_state(state, "no", 0.02) == 0.47
+
+
+def test_repair_price_cap_planner_blocks_saved_cap_when_entry_unknown():
+    class Position:
+        def max_profitable_repair_price(self, side, size, min_edge=0.01):
+            return 0.99
+
+    decision = plan_repair_price_cap(
+        Position(),
+        "no",
+        5,
+        0.4,
+        min_edge=0.02,
+        repair_mode="repair_down",
+        small_capital_opening_spent=True,
+        small_capital_state={"initial_side": "yes"},
+        abs_imbalance=5,
+    )
+
+    assert decision.blocked is True
+    assert decision.reason == "SMALL_CAPITAL_REPAIR_MISSING_ENTRY_PRICE"
+
+
+def test_repair_price_cap_planner_owns_emergency_hedge_caps():
+    class Position:
+        def max_profitable_repair_price(self, side, size, min_edge=0.01):
+            return 0.99
+
+    cfg = SimpleNamespace(
+        emergency_hedge_enabled=True,
+        emergency_hedge_after_seconds=20.0,
+        emergency_hedge_max_pair_loss=0.20,
+    )
+    state = {
+        "initial_filled": True,
+        "initial_fill_ts": 100.0,
+        "initial_side": "yes",
+        "initial_yes_price": 0.51,
+    }
+
+    waiting = emergency_hedge_cap_from_state(state, "no", config=cfg, now=110.0)
+    active_cap = plan_repair_price_cap(
+        Position(),
+        "no",
+        5,
+        0.4,
+        min_edge=0.02,
+        repair_mode="repair_down",
+        small_capital_opening_spent=True,
+        small_capital_state=state,
+        small_capital_config=cfg,
+        abs_imbalance=5,
+        now=130.0,
+    )
+
+    assert waiting == (None, False, 10.0)
+    assert active_cap.cap == 0.69
+    assert active_cap.source == "small_capital_emergency_hedge"
+    assert active_cap.metadata["emergency_elapsed"] == 30.0
+
+
 def test_inventory_book_repair_and_reconciliation_seams():
     class Position:
         yes_shares = 1
@@ -306,6 +396,10 @@ def test_negative_pair_edge_decision_halts_with_pair_metadata():
     assert decision.action == "HALT"
     assert decision.reason == "NEGATIVE_PAIR_EDGE"
     assert decision.metadata["matched_pairs"] == 3
+    assert decision.metadata["source"] == "pair_tracker"
+    status = matched_pair_edge_status(Position(), tolerance=0.005)
+    assert status.triggered is True
+    assert status.pair_pnl == -0.04
 
 
 def test_data_risk_and_feed_health_share_freshness_semantics():

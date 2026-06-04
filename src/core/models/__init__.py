@@ -1,7 +1,7 @@
 """Shared core value models."""
 
 from .decision import DecisionResult, QuotePlan, RiskDecision
-from .inventory import InventorySnapshot, RepairPlan
+from .inventory import InventorySnapshot, MatchedPairEdgeStatus, RepairPlan, RepairPriceCapDecision
 from .orders import OrderIntent, OrderState
 from .state import (
     BotRuntimeState,
@@ -17,7 +17,9 @@ __all__ = [
     "QuotePlan",
     "RiskDecision",
     "InventorySnapshot",
+    "MatchedPairEdgeStatus",
     "RepairPlan",
+    "RepairPriceCapDecision",
     "OrderIntent",
     "OrderState",
     "BotRuntimeState",

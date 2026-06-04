@@ -11,6 +11,7 @@ import time as _time
 from typing import TYPE_CHECKING
 
 from src.monitoring.logger import get_logger
+from src.services.inventory import emergency_hedge_cap_from_state, saved_repair_cap_from_state
 
 if TYPE_CHECKING:  # pragma: no cover
     from src.data.market_discovery import MarketInfo
@@ -188,26 +189,7 @@ class SmallCapitalLifecycle:
         limit is a conservative cost-basis upper bound: a buy fill cannot be
         worse than our own limit.
         """
-        repair_side = (repair_side or "").lower()
-        initial_side = str(state.get("initial_side") or "").lower()
-        if initial_side in ("up", "yes"):
-            initial_side = "yes"
-        elif initial_side in ("down", "no"):
-            initial_side = "no"
-        else:
-            return None
-
-        if repair_side == initial_side:
-            return None
-
-        price_key = "initial_yes_price" if initial_side == "yes" else "initial_no_price"
-        try:
-            initial_price = float(state.get(price_key) or state.get("initial_price") or 0)
-        except Exception:
-            initial_price = 0.0
-        if initial_price <= 0:
-            return None
-        return max(0.0, round(1.0 - initial_price - float(min_edge or 0), 4))
+        return saved_repair_cap_from_state(state, repair_side, min_edge)
 
     def _small_capital_emergency_hedge_cap(self, state: dict, repair_side: str) -> tuple[float | None, bool, float]:
         """Return bounded-loss hedge cap after the emergency timer expires.
@@ -216,43 +198,12 @@ class SmallCapitalLifecycle:
         for the profitable balancing leg, this allows completing the pair at a
         bounded loss instead of risking the entire naked leg going to zero.
         """
-        cfg = getattr(self, "small_capital_config", None)
-        if not getattr(cfg, "emergency_hedge_enabled", True):
-            return None, False, 0.0
-        if not state.get("initial_filled") or state.get("balancing_filled"):
-            return None, False, 0.0
-        try:
-            fill_ts = float(state.get("initial_fill_ts") or 0)
-        except Exception:
-            fill_ts = 0.0
-        if fill_ts <= 0:
-            return None, False, 0.0
-        elapsed = max(0.0, _time.time() - fill_ts)
-        wait_s = max(0.0, float(getattr(cfg, "emergency_hedge_after_seconds", 20.0) or 20.0))
-        if elapsed < wait_s:
-            return None, False, elapsed
-
-        repair_side = (repair_side or "").lower()
-        initial_side = str(state.get("initial_side") or "").lower()
-        if initial_side in ("up", "yes"):
-            initial_side = "yes"
-        elif initial_side in ("down", "no"):
-            initial_side = "no"
-        else:
-            return None, True, elapsed
-        if repair_side == initial_side:
-            return None, True, elapsed
-
-        try:
-            initial_price = float(state.get("initial_yes_price" if initial_side == "yes" else "initial_no_price")
-                                  or state.get("initial_price") or 0)
-        except Exception:
-            initial_price = 0.0
-        if initial_price <= 0:
-            return None, True, elapsed
-        max_pair_loss = max(0.0, float(getattr(cfg, "emergency_hedge_max_pair_loss", 0.20) or 0.0))
-        cap = max(0.0, min(0.99, 1.0 + max_pair_loss - initial_price))
-        return round(cap, 4), True, elapsed
+        return emergency_hedge_cap_from_state(
+            state,
+            repair_side,
+            config=getattr(self, "small_capital_config", None),
+            now=_time.time(),
+        )
 
     async def _wallet_position_truth(self, market: MarketInfo) -> tuple[float, float] | None:
         """Return authoritative YES/NO wallet balances for the current market.

@@ -81,6 +81,7 @@ from src.services.inventory import (
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     has_negative_matched_pair_edge,  # compatibility re-export; live cycler uses quote_cycle decisions
+    plan_repair_price_cap,
     repair_min_edge_for_remaining,
     repair_price_cap,  # compatibility re-export; live repair planning owns behavior
 )
@@ -2037,70 +2038,59 @@ class MarketCycler:
                 continue
 
             pair_edge = repair_min_edge_for_remaining(remaining, repair_mode)
-            cap = float(pos.max_profitable_repair_price(
-                side_label, size_val, min_edge=pair_edge))
+            cap_decision = plan_repair_price_cap(
+                pos,
+                side_label,
+                size_val,
+                fv,
+                min_edge=pair_edge,
+                repair_mode=repair_mode,
+                small_capital_opening_spent=sct_opening_spent,
+                small_capital_state=self._small_capital_state(market.market_id) if sct_opening_spent else None,
+                small_capital_config=getattr(self, "small_capital_config", None),
+                abs_imbalance=abs_imbalance,
+            )
+            cap = float(cap_decision.cap)
+            sct_guard_source = cap_decision.source
 
-            sct_saved_cap = None
-            sct_guard_source = "fifo"
-            if sct_opening_spent:
-                is_sct_repair_side = (repair_mode == f"repair_{side_label}"
-                                      or (side_label == "yes" and repair_mode == "repair_up")
-                                      or (side_label == "no" and repair_mode == "repair_down"))
-                if is_sct_repair_side:
-                    sct_state_for_cap = self._small_capital_state(market.market_id)
-                    emergency_cap, emergency_active, emergency_elapsed = self._small_capital_emergency_hedge_cap(
-                        sct_state_for_cap,
-                        side_label,
+            if cap_decision.blocked:
+                if cap_decision.reason == "SMALL_CAPITAL_EMERGENCY_HEDGE_MISSING_ENTRY_PRICE":
+                    log.warning(
+                        "small_capital_emergency_hedge_blocked_missing_entry_price",
+                        market=market.market_id[:8],
+                        side=side_label,
+                        quoted=price_val,
+                        mode=repair_mode,
+                        elapsed=round(float(cap_decision.metadata.get("emergency_elapsed", 0.0) or 0.0), 2),
                     )
-                    if emergency_active:
-                        if emergency_cap is None and abs_imbalance > 0:
-                            log.warning(
-                                "small_capital_emergency_hedge_blocked_missing_entry_price",
-                                market=market.market_id[:8],
-                                side=side_label,
-                                quoted=price_val,
-                                mode=repair_mode,
-                                elapsed=round(emergency_elapsed, 2),
-                            )
-                            setattr(quotes, buy_size_attr, 0)
-                            continue
-                        if emergency_cap is not None:
-                            cap = float(emergency_cap)
-                            sct_guard_source = "small_capital_emergency_hedge"
-                            self._set_dashboard_event(
-                                "warn",
-                                "SMALL_CAP_EMERGENCY_HEDGE",
-                                f"{side_label} cap {cap:.2f} after {emergency_elapsed:.0f}s",
-                            )
-                            log.warning(
-                                "small_capital_emergency_hedge_active",
-                                market=market.market_id[:8],
-                                side=side_label,
-                                cap=round(cap, 4),
-                                elapsed=round(emergency_elapsed, 2),
-                                quoted=price_val,
-                                mode=repair_mode,
-                            )
-                    elif cap >= 0.99:
-                        sct_saved_cap = self._small_capital_saved_repair_cap(
-                            sct_state_for_cap,
-                            side_label,
-                            pair_edge,
-                        )
-                        if sct_saved_cap is None and abs_imbalance > 0:
-                            log.warning(
-                                "small_capital_repair_blocked_missing_entry_price",
-                                market=market.market_id[:8],
-                                side=side_label,
-                                quoted=price_val,
-                                mode=repair_mode,
-                                imbalance=round(imbalance, 4),
-                            )
-                            setattr(quotes, buy_size_attr, 0)
-                            continue
-                        if sct_saved_cap is not None:
-                            cap = min(cap, float(sct_saved_cap))
-                            sct_guard_source = "small_capital_saved_entry"
+                else:
+                    log.warning(
+                        "small_capital_repair_blocked_missing_entry_price",
+                        market=market.market_id[:8],
+                        side=side_label,
+                        quoted=price_val,
+                        mode=repair_mode,
+                        imbalance=round(imbalance, 4),
+                    )
+                setattr(quotes, buy_size_attr, 0)
+                continue
+
+            if sct_guard_source == "small_capital_emergency_hedge":
+                emergency_elapsed = float(cap_decision.metadata.get("emergency_elapsed", 0.0) or 0.0)
+                self._set_dashboard_event(
+                    "warn",
+                    "SMALL_CAP_EMERGENCY_HEDGE",
+                    f"{side_label} cap {cap:.2f} after {emergency_elapsed:.0f}s",
+                )
+                log.warning(
+                    "small_capital_emergency_hedge_active",
+                    market=market.market_id[:8],
+                    side=side_label,
+                    cap=round(cap, 4),
+                    elapsed=round(emergency_elapsed, 2),
+                    quoted=price_val,
+                    mode=repair_mode,
+                )
 
             # No unmatched fills on opposite → cap is 0.99, no constraint
             if cap >= 0.99:
