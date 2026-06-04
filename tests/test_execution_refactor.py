@@ -214,6 +214,33 @@ def test_order_manager_allows_new_quote_version_after_duplicate_suppression():
     assert executor.batch_calls[-1][0]["price"] == 0.47
 
 
+def test_order_tracker_claims_duplicate_submit_slot_once_per_side_version():
+    tracker = OrderTracker()
+    base = {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"}
+    first = attach_place_intent(base, market_id="M1", quote_version=12)
+    duplicate = attach_place_intent({**base, "price": 0.46}, market_id="M1", quote_version=12)
+
+    filtered, skipped, intents_by_side = tracker.claim_place_orders([first, duplicate])
+
+    assert filtered == [first]
+    assert skipped == {"yes": None}
+    assert set(intents_by_side) == {"yes"}
+    assert len(tracker.pending) == 1
+
+
+def test_order_manager_private_execution_wrappers_are_pruned():
+    pruned = {
+        "_needs_reprice",
+        "_reprice_decision",
+        "_is_crossed_buy",
+        "_order_still_open",
+        "_maybe_defer_crossed_bid_cancel",
+        "_place_buy",
+    }
+
+    assert pruned.isdisjoint(vars(OrderManager))
+
+
 def test_order_tracker_reconstructs_states_from_active_quotes():
     active = ActiveQuotes(
         yes_order_id="yes-live",
@@ -249,16 +276,23 @@ def test_cancel_manager_uses_batch_when_available_and_single_fallback():
     assert legacy.cancelled == ["a", "b"]
 
 
-def test_crossed_bid_cancel_defers_when_fill_race_closes_order():
+def test_cancel_manager_crossed_bid_deferral_handles_fill_race_active_callback():
     active = ActiveQuotes(yes_order_id="yes-1", yes_price=0.51, yes_size=5)
     executor = OpenOrderExecutor(open_orders={"yes-1": SimpleNamespace(token_id="UP")})
-    manager = OrderManager(executor, crossed_bid_grace_seconds=0.0)
 
     # Simulate a fill/reconciliation race: by the time the crossed-cancel path
     # checks exchange-local state, the order has already disappeared.
     executor.open_orders.clear()
-    deferred = asyncio.run(manager._maybe_defer_crossed_bid_cancel(
-        "market-1", "yes", "yes-1", active, sticky_repair=False
+    deferred = asyncio.run(CancelManager(executor).crossed_bid_cancel_should_defer(
+        market_id="market-1",
+        side="yes",
+        order_id="yes-1",
+        grace_seconds=0.0,
+        clear_active_side=lambda: (
+            setattr(active, "yes_order_id", None),
+            setattr(active, "yes_price", None),
+            setattr(active, "yes_size", 0),
+        ),
     ))
 
     assert deferred is True

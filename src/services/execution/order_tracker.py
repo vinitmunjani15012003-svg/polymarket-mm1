@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 from src.core.models.orders import OrderIntent, OrderState
 from src.execution.order_state import ActiveQuotes
+from src.monitoring.logger import get_logger
+
+
+log = get_logger("order_tracker")
 
 
 class OrderTracker:
@@ -36,6 +41,77 @@ class OrderTracker:
         self._submitted_versions.add(key)
         self.add_intent(intent)
         return True
+
+    def claim_place_orders(
+        self,
+        orders: list[dict],
+    ) -> tuple[list[dict], dict[str, Optional[str]], dict[str, OrderIntent]]:
+        """Filter duplicate PLACE specs and claim submit slots.
+
+        Returns ``(filtered_orders, skipped_by_side, intents_by_side)`` so the
+        caller can submit only newly-claimed orders while preserving the
+        historical side->None result for duplicate suppressions.
+        """
+        filtered = []
+        skipped: dict[str, Optional[str]] = {}
+        intents_by_side: dict[str, OrderIntent] = {}
+        for order in orders:
+            intent = order.get("intent")
+            side = str(order.get("side", ""))
+            if intent is not None:
+                if not self.should_submit(intent):
+                    skipped[side] = None
+                    log.warning(
+                        "duplicate_order_intent_suppressed",
+                        market=intent.market_id[:8],
+                        side=intent.side,
+                        quote_version=intent.quote_version,
+                    )
+                    continue
+                intents_by_side[side] = intent
+            filtered.append(order)
+        return filtered, skipped, intents_by_side
+
+    def mark_submission_exception(self, intents_by_side: dict[str, OrderIntent]) -> dict[str, Optional[str]]:
+        """Release claimed submit slots after a placement exception."""
+        for intent in intents_by_side.values():
+            self.mark_rejected(intent)
+        return {side: None for side in intents_by_side}
+
+    def record_submission_results(
+        self,
+        placed: dict[str, Optional[str]],
+        intents_by_side: dict[str, OrderIntent],
+    ) -> bool:
+        """Persist successful orders and release failed intents.
+
+        Returns True when any submitted side failed placement.
+        """
+        failed = False
+        for side in intents_by_side:
+            if side not in placed:
+                placed[side] = None
+
+        for side, order_id in placed.items():
+            intent = intents_by_side.get(side)
+            if intent is None:
+                continue
+            if order_id:
+                self.mark_order(OrderState(
+                    order_id=order_id,
+                    intent_id=intent.intent_id,
+                    market_id=intent.market_id,
+                    side=intent.side,
+                    price=intent.price,
+                    size=intent.size,
+                    status="open",
+                    updated_ts=time.time(),
+                    metadata={"quote_version": intent.quote_version, "token_id": intent.token_id},
+                ))
+            else:
+                self.mark_rejected(intent)
+                failed = True
+        return failed
 
     def mark_order(self, state: OrderState):
         self.orders[state.order_id] = state
