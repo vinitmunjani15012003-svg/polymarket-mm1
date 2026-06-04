@@ -425,6 +425,47 @@ def test_small_capital_balancing_override_uses_inventory_imbalance_even_without_
     assert quotes.no_buy_size == 0
 
 
+def test_small_capital_opening_forces_one_side_when_normal_quote_is_two_sided():
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return {"quote_cycle_started": False, "opening_attempt_spent": False}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    quotes = SimpleNamespace(
+        yes_buy_size=5,
+        no_buy_size=5,
+        yes_buy_price=0.49,
+        no_buy_price=0.47,
+    )
+
+    side = cycler._apply_small_capital_opening_one_side("0xmarket", quotes, "normal", 0.52)
+
+    assert side == "yes"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
+def test_small_capital_opening_does_not_touch_repair_or_spent_state():
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return {"quote_cycle_started": True, "opening_attempt_spent": True}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    quotes = SimpleNamespace(yes_buy_size=5, no_buy_size=5, yes_buy_price=0.49, no_buy_price=0.47)
+
+    side = cycler._apply_small_capital_opening_one_side("0xmarket", quotes, "normal", 0.52)
+
+    assert side is None
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 5
+
+
 def test_small_capital_marks_opening_limit_price_for_pair_cost_fallback():
     saved = {}
 
@@ -633,6 +674,53 @@ def test_small_capital_done_uses_wallet_truth_even_when_local_inventory_lags():
     assert states[-1]["share_imbalance"] == 0.0
     assert states[-1]["matched_pairs"] == 5.0
     assert states[-1]["inventory_source"] == "wallet"
+
+
+def test_small_capital_done_uses_completed_state_even_when_inventory_lags():
+    import asyncio
+
+    class StateManager:
+        def __init__(self):
+            self.state = {
+                "quote_cycle_started": True,
+                "opening_attempt_spent": True,
+                "initial_filled": True,
+                "balancing_filled": True,
+                "stopped_for_window": False,
+            }
+
+        def get_small_capital_window(self, market_id):
+            return self.state
+
+        def update_small_capital_window(self, market_id, state):
+            self.state = dict(state)
+
+    states = []
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.fair_value_model = None
+    cycler.last_fair_value = 0.5
+    cycler.last_sigma = 0.2
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.inventory.state_manager = StateManager()
+    cycler.balance_monitor = None
+    cycler._dashboard_cb = states.append
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {}
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True, stop_after_balanced_fill=True, cancel_remaining_orders_on_stop=True)
+    cycler.order_mgr = SimpleNamespace(cancel_market_quotes=AsyncMock(return_value=True))
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC up?", time_remaining=600)
+    pos = cycler.inventory.get_or_create("M1", "BTC")  # local fill accounting can lag at zero briefly
+
+    ok = asyncio.run(cycler._small_capital_maybe_stop_completed(market, pos, "state_completed"))
+
+    assert ok is True
+    assert cycler.inventory.state_manager.state["stopped_for_window"] is True
+    assert states[-1]["phase"] == "SMALL_CAP_DONE"
 
 
 def test_dashboard_uses_wallet_truth_for_live_inventory_display():

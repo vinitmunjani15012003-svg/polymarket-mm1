@@ -866,6 +866,50 @@ class MarketCycler:
             return "repair_down"
         return repair_mode
 
+    def _apply_small_capital_opening_one_side(self, market_id: str, quotes, repair_mode: str, fair_value: float) -> str | None:
+        """In small-capital mode, the opening attempt may place only one side.
+
+        The normal strategy can be atomic/two-sided while flat. That is correct
+        for normal capital, but it violates one-cycle small-capital semantics by
+        spending two opening orders before the state can mark the cycle started.
+        Pick the better model-edge side and let the existing close-only repair
+        path quote the complement after a fill.
+        """
+        if not self._small_capital_enabled() or repair_mode != "normal":
+            return None
+        state = self._small_capital_state(market_id)
+        if self._small_capital_opening_spent(state):
+            return None
+        yes_size = int(getattr(quotes, "yes_buy_size", 0) or 0)
+        no_size = int(getattr(quotes, "no_buy_size", 0) or 0)
+        if yes_size <= 0 or no_size <= 0:
+            return None
+
+        fv = max(0.0, min(1.0, float(fair_value or 0.5)))
+        yes_price = float(getattr(quotes, "yes_buy_price", 0) or 0)
+        no_price = float(getattr(quotes, "no_buy_price", 0) or 0)
+        yes_edge = fv - yes_price
+        no_edge = (1.0 - fv) - no_price
+
+        # Deterministic tie-breaker: favor the side indicated by FV. At exactly
+        # neutral, YES is arbitrary but stable; only one order is the invariant.
+        side = "yes" if yes_edge >= no_edge else "no"
+        if side == "yes":
+            quotes.no_buy_size = 0
+        else:
+            quotes.yes_buy_size = 0
+        log.warning(
+            "small_capital_opening_forced_one_side",
+            asset=self.asset,
+            market=market_id[:8],
+            side=side,
+            fair_value=round(fv, 4),
+            yes_edge=round(yes_edge, 4),
+            no_edge=round(no_edge, 4),
+            msg="small-capital opening cannot rest both YES and NO",
+        )
+        return side
+
     def _small_capital_saved_repair_cap(self, state: dict, repair_side: str, min_edge: float) -> float | None:
         """Return max balancing bid from saved opening limit price, if known.
 
@@ -1205,13 +1249,18 @@ class MarketCycler:
         if wallet_snapshot:
             matched_pairs = int(float(wallet_snapshot.get("matched_pairs", matched_pairs) or 0))
             imbalance = float(wallet_snapshot.get("share_imbalance", imbalance) or 0)
+        state_completed = bool(
+            state.get("quote_cycle_started")
+            and state.get("initial_filled")
+            and state.get("balancing_filled")
+        )
+        inventory_completed = bool(matched_pairs > 0 and abs(imbalance) < 0.0001)
         if (state.get("quote_cycle_started")
                 and getattr(self.small_capital_config, "stop_after_balanced_fill", True)
-                and matched_pairs > 0
-                and abs(imbalance) < 0.0001):
+                and (state_completed or inventory_completed)):
             state["balancing_filled"] = True
             state["stopped_for_window"] = True
-            state["stop_reason"] = reason or "balanced_fill_complete"
+            state["stop_reason"] = reason or ("state_balanced_fill_complete" if state_completed else "balanced_fill_complete")
             self._save_small_capital_state(market.market_id, state)
             if getattr(self.small_capital_config, "cancel_remaining_orders_on_stop", True):
                 await self.order_mgr.cancel_market_quotes(market.market_id)
@@ -2785,9 +2834,15 @@ class MarketCycler:
                     threshold=FV_FAVORED_ENTRY_THRESHOLD,
                 )
 
-        # Small-capital one-cycle mode: after the first side fills, never allow
-        # normal/FV-entry logic to place the same opening side again. Force the
-        # opposite side until the pair is balanced/mergeable.
+        # Small-capital one-cycle mode: the first/opening attempt is one order
+        # only, then after that side fills we force the opposite side until the
+        # pair is balanced/mergeable.
+        sct_entry_side = self._apply_small_capital_opening_one_side(
+            market.market_id,
+            quotes,
+            repair_mode,
+            fv,
+        )
         repair_mode = self._apply_small_capital_balancing_override(
             market.market_id,
             pos,
@@ -2930,7 +2985,8 @@ class MarketCycler:
                 one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
                 merge_blocked = self._merge_unavailable_until > _time.time()
                 allowed_fv_entry = fv_entry_side in ("yes", "no") and one_sided_normal and not merge_blocked
-                if (one_sided_normal and not allowed_fv_entry) or merge_blocked:
+                allowed_sct_entry = sct_entry_side in ("yes", "no") and one_sided_normal and not merge_blocked
+                if (one_sided_normal and not (allowed_fv_entry or allowed_sct_entry)) or merge_blocked:
                     log.warning(
                         "normal_quote_blocked_not_atomic",
                         asset=self.asset,
@@ -2951,7 +3007,8 @@ class MarketCycler:
         if repair_mode == "normal" and abs_imbalance < min_order_size:
             one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
             allowed_fv_entry = fv_entry_side in ("yes", "no") and one_sided_normal
-            if one_sided_normal and not allowed_fv_entry:
+            allowed_sct_entry = sct_entry_side in ("yes", "no") and one_sided_normal
+            if one_sided_normal and not (allowed_fv_entry or allowed_sct_entry):
                 log.warning(
                     "normal_quote_blocked_not_atomic_final",
                     asset=self.asset,
