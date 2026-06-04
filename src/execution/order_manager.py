@@ -462,18 +462,6 @@ class OrderManager:
                 self.last_order_error = "order_placement_failed"
         return {**skipped, **placed}
 
-    def _needs_reprice(self, existing_price: Optional[float],
-                       new_price: Optional[float],
-                       existing_size: int,
-                       new_size: int) -> bool:
-        """Compatibility wrapper around RepricePolicy."""
-        return self.reprice_policy.needs_reprice(
-            existing_price,
-            new_price,
-            existing_size,
-            new_size,
-        )
-
     def _reprice_decision(self, existing_price: Optional[float],
                           new_price: Optional[float],
                           existing_size: int,

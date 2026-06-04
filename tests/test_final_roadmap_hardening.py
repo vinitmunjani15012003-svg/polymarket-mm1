@@ -48,11 +48,51 @@ def test_order_tracker_idempotency_survives_metadata_only_retry_then_clears_on_m
     assert tracker.orders["live-no"].intent_id == first.intent_id
 
 
-def test_clob_and_settlement_split_modules_preserve_legacy_import_boundaries():
+def test_public_service_packages_export_compatibility_names_without_star_import_gaps():
+    """Guard public package facades used by legacy imports and MarketCycler re-exports."""
+    packages = {
+        "src.services.fair_value": [
+            "BASIS_GUARD_MAX_FV_DEVIATION",
+            "FAST_ADVERSE_CANCEL_MIN_EDGE",
+            "MAX_EXNESS_PRICE_AGE_SECONDS",
+            "MAX_SPOT_PRICE_AGE_SECONDS",
+            "MAX_TRADING_FV_MARKET_DEVIATION",
+            "FairValueEngine",
+            "UpDownFairValue",
+            "apply_fast_feed_confidence_floor",
+            "basis_guard_triggered",
+            "cap_fair_value_to_market",
+            "fv_model_confidence",
+        ],
+        "src.services.inventory": [
+            "InventoryBook",
+            "compute_inventory_repair_sizes",
+            "has_negative_matched_pair_edge",
+            "repair_price_cap",
+        ],
+        "src.services.quoting": [
+            "QuotePolicy",
+            "apply_pair_cost_precheck",
+            "normalize_quote_sizes",
+            "repair_size_or_zero",
+        ],
+        "src.services.risk": ["RiskCoordinator", "feed_freshness_decision", "basis_gap_decision"],
+        "src.services.execution": ["CancelManager", "OrderSubmitter", "OrderTracker", "attach_place_intent"],
+    }
+
+    for module_name, names in packages.items():
+        module = importlib.import_module(module_name)
+        assert set(names).issubset(set(module.__all__))
+        for name in names:
+            assert getattr(module, name) is not None
+
+
+def test_legacy_execution_modules_preserve_public_import_boundaries():
     clob_client = importlib.import_module("src.execution.clob_client")
     clob_pkg = importlib.import_module("src.execution.clob")
     settlement_pkg = importlib.import_module("src.execution.settlement")
     ctf_ops = importlib.import_module("src.execution.ctf_ops")
+    order_manager = importlib.import_module("src.execution.order_manager")
 
     assert clob_client.ClobClientWrapper is not None
     assert clob_pkg.ClobOrders is importlib.import_module("src.execution.clob.orders").ClobOrders
@@ -60,6 +100,11 @@ def test_clob_and_settlement_split_modules_preserve_legacy_import_boundaries():
         "src.execution.settlement.settlement_manager"
     ).SettlementManager
     assert ctf_ops.BalanceMonitor is settlement_pkg.BalanceMonitor
+    assert ctf_ops.SimulatedBalanceMonitor is settlement_pkg.SimulatedBalanceMonitor
+    assert ctf_ops.infer_collateral_token_for_market is importlib.import_module(
+        "src.execution.settlement.collateral"
+    ).infer_collateral_token_for_market
+    assert not hasattr(order_manager.OrderManager, "_needs_reprice")
 
 
 def test_lifecycle_state_machine_allows_expected_happy_path_and_blocks_skip_to_settlement():
