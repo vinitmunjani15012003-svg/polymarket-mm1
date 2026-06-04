@@ -5,7 +5,13 @@ import pytest
 from src.core.lifecycle import LifecycleManager
 from src.core.models import DecisionResult, LifecycleState, OrderIntent
 from src.services.fair_value import FairValueEngine, FairValueInputs, UpDownFairValue
-from src.services.quoting import QuotePolicy
+from src.services.quoting import (
+    QuotePolicy,
+    apply_directional_market_guard,
+    apply_pair_cost_precheck,
+    normalize_quote_sizes,
+    repair_size_or_zero,
+)
 from src.services.inventory import InventoryBook, inventory_diverged
 from src.services.risk import feed_freshness_decision
 from src.market_data import freshness
@@ -62,6 +68,29 @@ def test_quote_policy_constructs_orders_from_quote_like_object():
     orders = QuotePolicy().construct_orders("M1", "UP", "DOWN", quotes)
 
     assert orders == [{"market_id": "M1", "token_id": "UP", "side": "yes", "price": 0.52, "size": 5}]
+
+
+def test_quote_policy_helpers_apply_directional_and_pair_cost_guards():
+    quotes = SimpleNamespace(yes_buy_price=0.78, yes_buy_size=10, no_buy_price=0.24, no_buy_size=10)
+
+    action = apply_directional_market_guard(quotes, fair_value=0.70, repair_mode="normal")
+
+    assert action == "halve_cheap_side"
+    assert quotes.yes_buy_size == 10
+    assert quotes.no_buy_size == 5
+
+    blocked = apply_pair_cost_precheck(quotes, fair_value=0.70, repair_mode="normal", max_combined_cost=0.99)
+
+    assert blocked is True
+    assert quotes.yes_buy_size == 10
+    assert quotes.no_buy_size == 0
+
+
+def test_quote_size_policy_normalizes_and_rejects_sub_min_repairs():
+    assert normalize_quote_sizes(2, 0, min_order_size=5, allow_round_up=True) == (5, 0)
+    assert normalize_quote_sizes(2, 7, min_order_size=5, allow_round_up=False) == (0, 7)
+    assert repair_size_or_zero(4, min_order_size=5) == 0
+    assert repair_size_or_zero(5, min_order_size=5) == 5
 
 
 def test_inventory_book_wraps_existing_inventory_manager():

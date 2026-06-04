@@ -71,7 +71,11 @@ from src.services.quoting import (
     FV_FAVORED_ENTRY_STOP_SECONDS,
     FV_FAVORED_ENTRY_THRESHOLD,
     MIN_LIVE_PAIR_EDGE,
+    apply_directional_market_guard,
     apply_fv_favored_entry_mode,
+    apply_pair_cost_precheck,
+    normalize_quote_sizes,
+    repair_size_or_zero,
 )
 
 
@@ -1823,25 +1827,6 @@ class MarketCycler:
         balance_only = remaining <= 240
         min_order_size = max(1, int(getattr(self.ac, "min_order_size", 5)))
 
-        def _repair_size(raw_size: int) -> int:
-            """Return a valid close-only repair size or 0 if below live minimum."""
-            raw_size = int(raw_size or 0)
-            if raw_size < min_order_size:
-                return 0
-            return raw_size
-
-        def _normalize_quote_sizes(yes_size: int, no_size: int, allow_round_up: bool = True) -> tuple[int, int]:
-            """Enforce Polymarket minimum order size on active quote sides."""
-            yes_size = int(yes_size or 0)
-            no_size = int(no_size or 0)
-            if allow_round_up:
-                yes_size = min_order_size if 0 < yes_size < min_order_size else yes_size
-                no_size = min_order_size if 0 < no_size < min_order_size else no_size
-            else:
-                yes_size = 0 if 0 < yes_size < min_order_size else yes_size
-                no_size = 0 if 0 < no_size < min_order_size else no_size
-            return yes_size, no_size
-
         # Get inventory position early for the DEAD_ZONE check. Attach live CTF
         # identifiers for mid-market merge calls; persisted inventory only stores
         # market_id, but live merge needs condition id and ERC1155 token ids.
@@ -2162,7 +2147,7 @@ class MarketCycler:
                         imbalance, fv, min_order_size, self.quote_engine.max_order_size)
                 else:
                     up_size = 0
-                    down_size = _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
+                    down_size = repair_size_or_zero(min(self.quote_engine.max_order_size, int(abs_imbalance)), min_order_size)
                     repair_mode = "repair_down"
             elif imbalance < 0:
                 if abs_imbalance < min_order_size:
@@ -2170,7 +2155,7 @@ class MarketCycler:
                         imbalance, fv, min_order_size, self.quote_engine.max_order_size)
                 else:
                     down_size = 0
-                    up_size = _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
+                    up_size = repair_size_or_zero(min(self.quote_engine.max_order_size, int(abs_imbalance)), min_order_size)
                     repair_mode = "repair_up"
             else:
                 # If we're flat near expiry, we intentionally do not quote.
@@ -2206,9 +2191,10 @@ class MarketCycler:
         # Enforce live minimum order size before quote generation. In normal quoting
         # modes, round active-but-small sides up to the minimum. In close-only modes,
         # avoid over-repairing small residual inventory (< min_order_size).
-        up_size, down_size = _normalize_quote_sizes(
+        up_size, down_size = normalize_quote_sizes(
             up_size,
             down_size,
+            min_order_size,
             allow_round_up=not (inventory_repair or balance_only or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"] or is_halted),
         )
 
@@ -2331,75 +2317,33 @@ class MarketCycler:
             best_ask_no=best_ask_no,
         )
 
-        # Directional market guard: graduated severity instead of binary block.
-        # At extreme FVs, the "cheap" side gets filled easily (adverse selection)
-        # while the expensive side doesn't fill, creating unmatched inventory.
-        #
-        # GRADUATED APPROACH (replaces the old binary FV >= 0.65 block):
-        #   FV 0.35-0.65: normal quoting (no change)
-        #   FV 0.65-0.80 or 0.20-0.35: reduce CHEAP side size by 50%
-        #   FV > 0.80 or FV < 0.20: block cheap side entirely (repair-only)
-        #
-        # This allows pair completion in moderate directional markets while
-        # protecting against extreme adverse selection.
-        if repair_mode == "normal":
-            if fv >= 0.80 or fv <= 0.20:
-                # Extreme: block the cheap/adverse side entirely
-                log.warning(
-                    "normal_quote_reduced_extreme_directional",
-                    asset=self.asset,
-                    fair_value=round(fv, 4),
-                    action="block_cheap_side",
-                )
-                if fv >= 0.80:
-                    # NO is cheap (adverse selection) → block NO
-                    quotes.no_buy_size = 0
-                else:
-                    # YES is cheap (adverse selection) → block YES
-                    quotes.yes_buy_size = 0
-            elif fv >= 0.65 or fv <= 0.35:
-                # Moderate: halve the cheap side to slow adverse fills
-                log.info(
-                    "normal_quote_reduced_moderate_directional",
-                    asset=self.asset,
-                    fair_value=round(fv, 4),
-                    action="halve_cheap_side",
-                )
-                if fv >= 0.65:
-                    # NO is cheap → halve NO size
-                    quotes.no_buy_size = max(0, int(quotes.no_buy_size * 0.5))
-                else:
-                    # YES is cheap → halve YES size
-                    quotes.yes_buy_size = max(0, int(quotes.yes_buy_size * 0.5))
+        directional_action = apply_directional_market_guard(quotes, fv, repair_mode)
+        if directional_action == "block_cheap_side":
+            log.warning(
+                "normal_quote_reduced_extreme_directional",
+                asset=self.asset,
+                fair_value=round(fv, 4),
+                action=directional_action,
+            )
+        elif directional_action == "halve_cheap_side":
+            log.info(
+                "normal_quote_reduced_moderate_directional",
+                asset=self.asset,
+                fair_value=round(fv, 4),
+                action=directional_action,
+            )
 
-        # 12.25 Pair-cost pre-check: block the adverse side if both-side
-        # fill would create negative-edge pairs. This is a HARD guard that
-        # catches scenarios like YES@$0.46 + NO@$0.71 = $1.17 before they
-        # happen. Unlike the post-generation combined-cost enforcement in
-        # quote_engine (which drops the heavy side price), this blocks the
-        # side that's LIKELY TO FILL FIRST (the cheap side in a directional
-        # market).
-        if (repair_mode == "normal"
-                and quotes.yes_buy_size > 0
-                and quotes.no_buy_size > 0):
-            proposed_combined = float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0)
-            if proposed_combined > MAX_COMBINED_COST:
-                log.warning(
-                    "pair_cost_precheck_blocking_adverse_side",
-                    asset=self.asset,
-                    combined=round(proposed_combined, 4),
-                    max_allowed=MAX_COMBINED_COST,
-                    yes_price=quotes.yes_buy_price,
-                    no_price=quotes.no_buy_price,
-                    fair_value=round(fv, 4),
-                )
-                # Block the CHEAP side (it fills first and creates the problem)
-                if fv >= 0.50:
-                    # YES is expensive, NO is cheap → block NO
-                    quotes.no_buy_size = 0
-                else:
-                    # NO is expensive, YES is cheap → block YES
-                    quotes.yes_buy_size = 0
+        proposed_combined = float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0)
+        if apply_pair_cost_precheck(quotes, fv, repair_mode, MAX_COMBINED_COST):
+            log.warning(
+                "pair_cost_precheck_blocking_adverse_side",
+                asset=self.asset,
+                combined=round(proposed_combined, 4),
+                max_allowed=MAX_COMBINED_COST,
+                yes_price=quotes.yes_buy_price,
+                no_price=quotes.no_buy_price,
+                fair_value=round(fv, 4),
+            )
 
         # 12.35 FV-favored entry mode: when flat, start by buying only the side
         # the model likes (e.g. FV=0.60 => YES first). Once that side fills,
@@ -2559,9 +2503,10 @@ class MarketCycler:
             # Polymarket's minimum order size. Dust-normalization is an atomic
             # paired plan: if either leg is no longer valid, cancel both rather
             # than leaving a one-sided top-up landmine.
-            quotes.yes_buy_size, quotes.no_buy_size = _normalize_quote_sizes(
+            quotes.yes_buy_size, quotes.no_buy_size = normalize_quote_sizes(
                 quotes.yes_buy_size,
                 quotes.no_buy_size,
+                min_order_size,
                 allow_round_up=False,
             )
             if repair_mode.startswith("dust_") and (
