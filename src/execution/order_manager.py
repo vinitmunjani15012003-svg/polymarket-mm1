@@ -16,6 +16,9 @@ from src.strategy.quote_engine import QuoteResult
 from src.execution.order_state import ActiveQuotes, order_token_id as _order_token_id
 from src.execution.repricing import RepricePolicy, is_crossed_buy
 from src.monitoring.logger import get_logger
+from src.services.execution.cancel_manager import CancelManager
+from src.services.execution.order_submitter import OrderSubmitter
+from src.services.execution.reconciliation import find_stray_order_ids
 
 log = get_logger("order_manager")
 
@@ -40,14 +43,8 @@ class OrderManager:
         self.executor = executor
         self.reprice_threshold = reprice_threshold
         self.min_update_interval = min_update_interval
-        # Cache whether executor.place_buy_order accepts a 'side' param
-        # (DryRunExecutor does, ClobClientWrapper also does now).
-        # Avoids calling inspect.signature on every order placement.
-        self._executor_accepts_side = False
-        if hasattr(executor, 'place_buy_order'):
-            import inspect
-            sig = inspect.signature(executor.place_buy_order)
-            self._executor_accepts_side = 'side' in sig.parameters
+        self.order_submitter = OrderSubmitter(executor)
+        self.cancel_manager = CancelManager(executor)
         # Repair quotes are intentionally sticky. The bot is buy-only/post-only,
         # so imbalance repair depends on resting the light-side bid long enough
         # to earn queue priority. Chasing every FV/book wiggle cancels exactly
@@ -194,12 +191,7 @@ class OrderManager:
 
         if cancel_ids:
             cancel_start = time.perf_counter()
-            cancel_ok = True
-            if hasattr(self.executor, 'cancel_orders'):
-                cancel_ok = await self.executor.cancel_orders(cancel_ids)
-            else:
-                for order_id in cancel_ids:
-                    cancel_ok = bool(await self.executor.cancel_order(order_id)) and cancel_ok
+            cancel_ok = await self.cancel_manager.cancel_orders(cancel_ids)
             cancel_ms = (time.perf_counter() - cancel_start) * 1000
             if not cancel_ok:
                 log.error("quote_cancel_failed_halt_reprice",
@@ -289,14 +281,11 @@ class OrderManager:
         if not isinstance(open_orders, dict):
             return True
 
-        tracked = {oid for oid in (active.yes_order_id, active.no_order_id) if oid}
-        token_ids = {str(token_id_yes), str(token_id_no)}
-        stray_ids = []
-        for oid, info in list(open_orders.items()):
-            if oid in tracked:
-                continue
-            if _order_token_id(info) in token_ids:
-                stray_ids.append(oid)
+        stray_ids = find_stray_order_ids(
+            active,
+            open_orders,
+            {str(token_id_yes), str(token_id_no)},
+        )
 
         if not stray_ids:
             return True
@@ -307,12 +296,7 @@ class OrderManager:
             count=len(stray_ids),
             order_ids=[oid[:8] for oid in stray_ids[:8]],
         )
-        ok = True
-        if hasattr(self.executor, "cancel_orders"):
-            ok = bool(await self.executor.cancel_orders(stray_ids))
-        else:
-            for oid in stray_ids:
-                ok = bool(await self.executor.cancel_order(oid)) and ok
+        ok = await self.cancel_manager.cancel_orders(stray_ids)
         if not ok:
             log.error(
                 "stray_live_order_cancel_failed",
@@ -340,12 +324,7 @@ class OrderManager:
         if not cancel_ids:
             return True
 
-        ok = True
-        if hasattr(self.executor, "cancel_orders"):
-            ok = bool(await self.executor.cancel_orders(cancel_ids))
-        else:
-            for oid in cancel_ids:
-                ok = bool(await self.executor.cancel_order(oid)) and ok
+        ok = await self.cancel_manager.cancel_orders(cancel_ids)
 
         if ok and active:
             if side in ("yes", "up"):
@@ -378,11 +357,9 @@ class OrderManager:
         if not active:
             return True
 
-        ok = True
-        if active.yes_order_id:
-            ok = bool(await self.executor.cancel_order(active.yes_order_id)) and ok
-        if active.no_order_id:
-            ok = bool(await self.executor.cancel_order(active.no_order_id)) and ok
+        ok = await self.cancel_manager.cancel_orders(
+            [oid for oid in (active.yes_order_id, active.no_order_id) if oid]
+        )
 
         if ok:
             self.active[market_id] = ActiveQuotes()
@@ -393,7 +370,7 @@ class OrderManager:
 
     async def cancel_all(self) -> bool:
         """Cancel all orders across all markets."""
-        ok = bool(await self.executor.cancel_all())
+        ok = bool(await self.cancel_manager.cancel_all())
         if ok:
             self.active.clear()
         else:
@@ -407,30 +384,13 @@ class OrderManager:
         """
         Place a BUY order. This is the single enforcement point.
         """
-        if hasattr(self.executor, 'place_buy_order'):
-            if self._executor_accepts_side:
-                return await self.executor.place_buy_order(
-                    token_id, price, size, side=side,
-                    book_snapshot=book_snapshot
-                )
-            else:
-                return await self.executor.place_buy_order(
-                    token_id, price, size
-                )
-        return None
+        return await self.order_submitter.place_buy(
+            token_id, price, size, side=side, book_snapshot=book_snapshot
+        )
 
     async def _place_buys(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Place one or more BUY orders, using executor batch API when available."""
-        if hasattr(self.executor, 'place_buy_orders'):
-            return await self.executor.place_buy_orders(orders)
-
-        placed = {}
-        for order in orders:
-            placed[order["side"]] = await self._place_buy(
-                order["token_id"], order["price"], order["size"],
-                order["side"], order.get("book_snapshot")
-            )
-        return placed
+        return await self.order_submitter.place_buys(orders)
 
     def _needs_reprice(self, existing_price: Optional[float],
                        new_price: Optional[float],
