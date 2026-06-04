@@ -6,10 +6,12 @@ All orders are BUY-only.
 """
 
 import asyncio
-import hashlib
-import json
 import time
 from typing import Optional
+from src.execution.clob.balances import zero_allowance_spenders
+from src.execution.clob.fill_ids import fill_dedupe_key
+from src.execution.clob.fills import maker_order_id, maker_orders_for_fill
+from src.execution.clob.sdk_compat import ensure_builder_code, normalize_post_orders_response
 from src.monitoring.logger import get_logger
 
 log = get_logger("clob_client")
@@ -56,21 +58,8 @@ class ClobClientWrapper:
 
     @staticmethod
     def _ensure_builder_code(order_args):
-        """SDK compatibility for py-clob-client-v2 builds.
-
-        Some Polymarket SDK builds expect OrderArgs.builder_code during
-        signing but ship an OrderArgs type that does not define it. A blank
-        builder code is the safe default: no builder attribution, same order.
-        """
-        if not hasattr(order_args, "builder_code"):
-            try:
-                setattr(order_args, "builder_code", "")
-            except Exception:
-                try:
-                    object.__setattr__(order_args, "builder_code", "")
-                except Exception:
-                    pass
-        return order_args
+        """SDK compatibility for py-clob-client-v2 builds."""
+        return ensure_builder_code(order_args)
 
     def _order_type_imports(self):
         """Return SDK types matching the initialized CLOB client version."""
@@ -265,10 +254,7 @@ class ClobClientWrapper:
                     if isinstance(result, dict):
                         allowances = result.get("allowances", {})
                         balance = result.get("balance", "0")
-                        zero_allowances = [
-                            addr for addr, val in allowances.items()
-                            if str(val) == "0"
-                        ]
+                        zero_allowances = zero_allowance_spenders(allowances)
                         if zero_allowances:
                             log.warning(
                                 "balance_allowance_zero_detected",
@@ -365,23 +351,7 @@ class ClobClientWrapper:
     @staticmethod
     def _normalize_post_orders_response(response, expected_count: int) -> list[dict]:
         """Normalize py-clob-client post_orders responses across SDK versions."""
-        if isinstance(response, list):
-            return [item if isinstance(item, dict) else {} for item in response[:expected_count]]
-        if isinstance(response, dict):
-            raw = (
-                response.get("orders")
-                or response.get("data")
-                or response.get("results")
-                or response.get("responses")
-            )
-            if isinstance(raw, list):
-                return [item if isinstance(item, dict) else {} for item in raw[:expected_count]]
-            # Some SDKs return a single-order response dict when len==1.
-            if expected_count == 1 and (response.get("orderID") or response.get("id")):
-                return [response]
-            if response.get("error") or response.get("status") in ("error", "failed", "rejected"):
-                return [response for _ in range(expected_count)]
-        return [{} for _ in range(expected_count)]
+        return normalize_post_orders_response(response, expected_count)
 
     async def place_buy_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Place multiple BUY orders in one CLOB post_orders request."""
@@ -756,18 +726,13 @@ class ClobClientWrapper:
             # trade. Book every matching maker leg independently; otherwise a
             # 2x5-share fill can appear as only +5 inventory, leaving the bot
             # thinking it is flatter than the wallet really is.
-            maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
-            if isinstance(maker_orders, list) and len(maker_orders) > 1:
+            maker_orders = maker_orders_for_fill(fill)
+            if len(maker_orders) > 1:
                 expanded = []
                 for mo in maker_orders:
                     if not isinstance(mo, dict):
                         continue
-                    mo_id = (
-                        mo.get("order_id")
-                        or mo.get("orderID")
-                        or mo.get("orderId")
-                        or mo.get("id")
-                    )
+                    mo_id = maker_order_id(mo)
                     if not self._order_context(mo_id):
                         continue
                     clone = dict(fill)
@@ -801,19 +766,14 @@ class ClobClientWrapper:
             # v2 trade objects can describe the whole trade and include our
             # contribution under maker_orders. Use the matching maker order so
             # we do not book someone else's size (e.g. 13 shares vs our 5 quote).
-            maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
+            maker_orders = maker_orders_for_fill(fill)
             matched_maker_token_id = ""
-            if isinstance(maker_orders, list) and maker_orders:
+            if maker_orders:
                 matched = None
                 for mo in maker_orders:
                     if not isinstance(mo, dict):
                         continue
-                    mo_id = (
-                        mo.get("order_id")
-                        or mo.get("orderID")
-                        or mo.get("orderId")
-                        or mo.get("id")
-                    )
+                    mo_id = maker_order_id(mo)
                     if self._order_context(mo_id):
                         matched = mo
                         order_id = mo_id
@@ -945,30 +905,5 @@ class ClobClientWrapper:
 
     @staticmethod
     def _fill_dedupe_key(fill: dict, market_id: str = "") -> str:
-        """Build a robust idempotency key for CLOB fills/trades.
-
-        Prefer provider IDs when available. If the SDK omits IDs, include enough
-        stable fields to distinguish partial fills on the same order.
-        """
-        for key in ("id", "trade_id", "transaction_hash", "tx_hash", "hash"):
-            value = fill.get(key)
-            if value:
-                return f"{key}:{value}"
-
-        material = {
-            "market": market_id,
-            "order_id": fill.get("order_id") or fill.get("orderID") or fill.get("maker_order_id") or "",
-            "asset_id": fill.get("asset_id") or fill.get("token_id") or fill.get("assetId") or "",
-            "price": str(fill.get("price", "")),
-            "size": str(fill.get("size", "")),
-            "side": str(fill.get("side", "")),
-            "timestamp": str(
-                fill.get("timestamp")
-                or fill.get("created_at")
-                or fill.get("match_time")
-                or fill.get("time")
-                or ""
-            ),
-        }
-        encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
-        return "synthetic:" + hashlib.sha256(encoded.encode()).hexdigest()
+        """Build a robust idempotency key for CLOB fills/trades."""
+        return fill_dedupe_key(fill, market_id)
