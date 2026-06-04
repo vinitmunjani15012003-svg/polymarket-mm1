@@ -32,6 +32,8 @@ from src.monitoring.logger import get_logger
 from src.orchestration.quote_cycle import (
     QuoteCycleContext,
     decide_basis_risk,
+    decide_inventory_risk,
+    decide_negative_pair_edge,
     decide_stale_spot,
     package_book_snapshot,
     package_fair_value_result,
@@ -1139,6 +1141,12 @@ class MarketCycler:
     def _decide_basis_risk(self, **kwargs):
         return decide_basis_risk(**kwargs)
 
+    def _decide_inventory_risk(self, imbalance: float, min_order_size: int):
+        return decide_inventory_risk(imbalance, min_order_size)
+
+    def _decide_negative_pair_edge(self, pos):
+        return decide_negative_pair_edge(pos)
+
     async def _quote_cycle(self, market: MarketInfo):
         """Single quote cycle iteration."""
         ctx = self._quote_cycle_context(market)
@@ -1438,9 +1446,10 @@ class MarketCycler:
 
         await self._maybe_pre_expiry_auto_merge(market, pos, remaining, wallet_truth=wallet_truth)
 
-        if has_negative_matched_pair_edge(pos):
-            pairs = int(pos.matched_pairs())
-            pair_pnl = round(pos.matched_pair_profit(), 4)
+        negative_pair_edge = self._decide_negative_pair_edge(pos)
+        if negative_pair_edge.triggered:
+            pairs = negative_pair_edge.matched_pairs
+            pair_pnl = round(negative_pair_edge.pair_pnl, 4)
             condition_id = getattr(pos, "condition_id", None) or market.market_id
             log.warning(
                 "negative_pair_edge_recovery",
@@ -1593,12 +1602,16 @@ class MarketCycler:
         # leaves us imbalanced, the safest response is not a full quoting freeze;
         # it is close-only repair on the light side with conservative sizing.
         # Uses SHARE COUNT imbalance (Up - Down), not dollar delta.
-        imbalance = float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance())
-        abs_imbalance = abs(imbalance)
+        inventory_plan = self._decide_inventory_risk(
+            float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance()),
+            min_order_size,
+        )
+        imbalance = inventory_plan.imbalance
+        abs_imbalance = inventory_plan.abs_imbalance
         # Treat any leftover as actionable inventory risk. If one side filled and
         # the other did not, quote ONLY the light side until balanced again.
-        inventory_repair = abs_imbalance >= min_order_size
-        dust_normalization = 0 < abs_imbalance < min_order_size
+        inventory_repair = inventory_plan.inventory_repair
+        dust_normalization = inventory_plan.dust_normalization
         close_only_phase = phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]
 
         # 10. Toxicity monitor
@@ -2443,14 +2456,15 @@ class MarketCycler:
             wallet_truth, wallet_snapshot = await self._refresh_wallet_truth_for_market(market)
         if fills and await self._small_capital_maybe_stop_completed(market, pos, "post_fill_balanced", wallet_snapshot=wallet_snapshot):
             return
-        if fills and has_negative_matched_pair_edge(pos):
-            pairs = int(pos.matched_pairs())
+        post_fill_negative_pair_edge = self._decide_negative_pair_edge(pos) if fills else None
+        if post_fill_negative_pair_edge and post_fill_negative_pair_edge.triggered:
+            pairs = post_fill_negative_pair_edge.matched_pairs
             log.critical(
                 "negative_pair_edge_halt",
                 asset=self.asset,
                 market=market.market_id[:8],
                 matched_pairs=pairs,
-                pair_pnl=round(pos.matched_pair_profit(), 4),
+                pair_pnl=round(post_fill_negative_pair_edge.pair_pnl, 4),
                 msg="Matched pair cost exceeded 1 after fill; merging and stopping this market",
             )
             # Merge the negative-edge pairs to recover capital before halting.
@@ -2691,7 +2705,7 @@ class MarketCycler:
             "matched_pairs": display_matched_pairs,
             "avg_pair_cost": real_pos.avg_matched_pair_cost(),
             "matched_pair_pnl": real_pos.matched_pair_profit(),
-            "negative_pair_edge": has_negative_matched_pair_edge(real_pos),
+            "negative_pair_edge": self._decide_negative_pair_edge(real_pos).triggered,
             "inventory_source": inventory_source,
             "inv_state": real_state.value,
             # P&L with rebates and outcomes

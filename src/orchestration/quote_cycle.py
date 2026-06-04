@@ -9,7 +9,20 @@ semantics.
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping
 
-from src.services.fair_value import basis_guard_triggered, polymarket_implied_up_mid
+from src.core.models.decision import RiskDecision
+from src.services.fair_value import (
+    BASIS_GUARD_MAX_FV_DEVIATION,
+    basis_guard_triggered,
+    clamp_probability,
+    polymarket_implied_up_mid,
+)
+from src.services.risk import (
+    RiskCoordinator,
+    basis_gap_decision,
+    feed_freshness_decision,
+    imbalance_decision,
+    negative_pair_edge_decision,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from src.data.market_discovery import MarketInfo
@@ -37,6 +50,7 @@ class StaleSpotDecision:
     event_reason: str | None = None
     event_message: str | None = None
     log_event: str | None = None
+    risk: RiskDecision | None = None
 
     @property
     def is_ok(self) -> bool:
@@ -73,6 +87,28 @@ class BasisRiskDecision:
 
     triggered: bool
     action: str | None = None  # close_only | stop_quoting | None
+    risk: RiskDecision | None = None
+
+
+@dataclass(frozen=True)
+class InventoryRiskPlan:
+    """Coordinator-backed inventory state used by quote sizing guards."""
+
+    imbalance: float
+    abs_imbalance: float
+    inventory_repair: bool
+    dust_normalization: bool
+    risk: RiskDecision
+
+
+@dataclass(frozen=True)
+class NegativePairEdgeDecision:
+    """Coordinator-backed negative FIFO pair edge decision."""
+
+    triggered: bool
+    matched_pairs: int = 0
+    pair_pnl: float = 0.0
+    risk: RiskDecision | None = None
 
 
 
@@ -83,6 +119,9 @@ def decide_stale_spot(raw_spot: float | None, price_age: float, max_spot_age: fl
     cancels, dashboard updates) remain in ``MarketCycler`` for compatibility.
     """
 
+    freshness = feed_freshness_decision(price_age, max_spot_age, source="spot")
+    risk = RiskCoordinator().evaluate(data=freshness)
+
     if not raw_spot:
         return StaleSpotDecision(
             should_stop=True,
@@ -90,16 +129,48 @@ def decide_stale_spot(raw_spot: float | None, price_age: float, max_spot_age: fl
             event_reason="NO_SPOT_PRICE",
             event_message="spot unavailable",
             log_event="no_spot_price",
+            risk=RiskDecision("CANCEL", "NO_SPOT", "critical", {"source": "spot"}),
         )
-    if price_age > max_spot_age:
+    if risk.action != "ALLOW":
         return StaleSpotDecision(
             should_stop=True,
             dashboard_reason="STALE_SPOT",
             event_reason="STALE_SPOT",
             event_message=f"age {price_age:.2f}s > max {max_spot_age:.2f}s",
             log_event="spot_price_stale_stop_quoting",
+            risk=risk,
         )
-    return StaleSpotDecision(should_stop=False)
+    return StaleSpotDecision(should_stop=False, risk=risk)
+
+
+def decide_inventory_risk(imbalance: float, min_order_size: int) -> InventoryRiskPlan:
+    """Return close-only/dust guard state through the risk coordinator."""
+
+    abs_imbalance = abs(float(imbalance or 0.0))
+    inventory = imbalance_decision(imbalance, hard_limit=min_order_size)
+    risk = RiskCoordinator().evaluate(inventory=inventory)
+    return InventoryRiskPlan(
+        imbalance=float(imbalance or 0.0),
+        abs_imbalance=abs_imbalance,
+        inventory_repair=risk.action == "REPAIR",
+        dust_normalization=0 < abs_imbalance < min_order_size,
+        risk=risk,
+    )
+
+
+def decide_negative_pair_edge(pos) -> NegativePairEdgeDecision:
+    """Return negative matched-pair risk through the risk coordinator."""
+
+    risk = RiskCoordinator().evaluate(inventory=negative_pair_edge_decision(pos))
+    if risk.reason != "NEGATIVE_PAIR_EDGE":
+        return NegativePairEdgeDecision(triggered=False, risk=risk)
+    metadata = dict(risk.metadata or {})
+    return NegativePairEdgeDecision(
+        triggered=True,
+        matched_pairs=int(float(metadata.get("matched_pairs", 0) or 0)),
+        pair_pnl=float(metadata.get("pair_pnl", 0.0) or 0.0),
+        risk=risk,
+    )
 
 
 
@@ -148,8 +219,13 @@ def decide_basis_risk(
     """Package the basis-guard branch selection used by ``MarketCycler``."""
 
     if repair_mode != "normal" or balance_only or is_halted:
-        return BasisRiskDecision(triggered=False)
-    if not basis_guard_triggered(model_fv, polymarket_mid_up):
-        return BasisRiskDecision(triggered=False)
+        return BasisRiskDecision(triggered=False, risk=RiskDecision("ALLOW", "SKIPPED", "info"))
+    basis_gap = None
+    if polymarket_mid_up is not None:
+        basis_gap = abs(clamp_probability(model_fv) - clamp_probability(polymarket_mid_up))
+    market = basis_gap_decision(basis_gap, threshold=BASIS_GUARD_MAX_FV_DEVIATION)
+    risk = RiskCoordinator().evaluate(market=market)
+    if risk.action == "ALLOW" or not basis_guard_triggered(model_fv, polymarket_mid_up):
+        return BasisRiskDecision(triggered=False, risk=risk)
     action = "close_only" if abs_imbalance >= min_order_size else "stop_quoting"
-    return BasisRiskDecision(triggered=True, action=action)
+    return BasisRiskDecision(triggered=True, action=action, risk=risk)

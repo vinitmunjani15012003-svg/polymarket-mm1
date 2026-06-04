@@ -3,10 +3,13 @@ from types import SimpleNamespace
 from src.orchestration.quote_cycle import (
     QuoteCycleContext,
     decide_basis_risk,
+    decide_inventory_risk,
+    decide_negative_pair_edge,
     decide_stale_spot,
     package_book_snapshot,
     package_fair_value_result,
 )
+from src.orchestration.market_cycler import MarketCycler
 
 
 def test_quote_cycle_context_captures_market_and_remaining():
@@ -30,7 +33,10 @@ def test_stale_spot_decision_packages_missing_and_stale_paths():
     assert stale.should_stop is True
     assert stale.dashboard_reason == "STALE_SPOT"
     assert stale.event_message == "age 2.50s > max 2.00s"
+    assert stale.risk.action == "CANCEL"
+    assert stale.risk.reason == "STALE_SPOT"
     assert fresh.is_ok is True
+    assert fresh.risk.action == "ALLOW"
 
 
 def test_book_snapshot_packages_books_and_polymarket_mid():
@@ -92,6 +98,52 @@ def test_basis_risk_decision_selects_close_only_or_stop_quoting():
 
     assert close_only.triggered is True
     assert close_only.action == "close_only"
+    assert close_only.risk.action == "CANCEL"
+    assert close_only.risk.reason == "BASIS_GAP"
     assert stop.triggered is True
     assert stop.action == "stop_quoting"
     assert skipped.triggered is False
+
+
+def test_inventory_and_negative_pair_decisions_use_coordinator_metadata():
+    repair = decide_inventory_risk(7, min_order_size=5)
+    dust = decide_inventory_risk(3, min_order_size=5)
+
+    assert repair.inventory_repair is True
+    assert repair.dust_normalization is False
+    assert repair.risk.action == "REPAIR"
+    assert repair.risk.metadata["blocking_reasons"] == ["HARD_INVENTORY_LIMIT"]
+    assert dust.inventory_repair is False
+    assert dust.dust_normalization is True
+
+    pos = SimpleNamespace(
+        matched_pairs=lambda: 2,
+        matched_pair_profit=lambda: -0.03,
+    )
+    negative = decide_negative_pair_edge(pos)
+
+    assert negative.triggered is True
+    assert negative.matched_pairs == 2
+    assert negative.pair_pnl == -0.03
+    assert negative.risk.reason == "NEGATIVE_PAIR_EDGE"
+
+
+def test_market_cycler_decision_wrappers_preserve_compatibility():
+    cycler = MarketCycler.__new__(MarketCycler)
+
+    stale = cycler._decide_stale_spot(50000.0, price_age=3.0, max_spot_age=2.0)
+    inv = cycler._decide_inventory_risk(-6, min_order_size=5)
+    basis = cycler._decide_basis_risk(
+        repair_mode="normal",
+        balance_only=False,
+        is_halted=False,
+        model_fv=0.80,
+        polymarket_mid_up=0.50,
+        abs_imbalance=0,
+        min_order_size=5,
+    )
+
+    assert stale.dashboard_reason == "STALE_SPOT"
+    assert inv.inventory_repair is True
+    assert basis.triggered is True
+    assert basis.action == "stop_quoting"
