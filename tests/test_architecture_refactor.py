@@ -157,6 +157,55 @@ def test_quote_policy_normal_atomicity_allows_explicit_entry_modes_only():
     assert quotes.no_buy_size == 0
 
 
+def test_quote_policy_post_capital_safety_enforces_repair_and_atomicity():
+    policy = QuotePolicy()
+    repair_quotes = SimpleNamespace(yes_buy_price=0.50, yes_buy_size=5, no_buy_price=0.45, no_buy_size=5)
+
+    repair_decision = policy.apply_post_capital_safety(
+        repair_quotes,
+        min_order_size=5,
+        allow_round_up=False,
+        repair_mode="repair_up",
+        abs_imbalance=10,
+    )
+
+    assert repair_decision.allowed is True
+    assert repair_quotes.yes_buy_size == 5
+    assert repair_quotes.no_buy_size == 0
+
+    normal_quotes = SimpleNamespace(yes_buy_price=0.50, yes_buy_size=5, no_buy_price=0.45, no_buy_size=0)
+    normal_decision = policy.apply_post_capital_safety(
+        normal_quotes,
+        min_order_size=5,
+        allow_round_up=False,
+        repair_mode="normal",
+        abs_imbalance=0,
+        atomic_reason="NORMAL_QUOTE_NOT_ATOMIC_FINAL",
+    )
+
+    assert normal_decision.allowed is False
+    assert normal_decision.reason == "NORMAL_QUOTE_NOT_ATOMIC_FINAL"
+    assert normal_quotes.yes_buy_size == 0
+    assert normal_quotes.no_buy_size == 0
+
+
+def test_quote_policy_final_inventory_safety_blocks_heavy_side_then_validates_active_sides():
+    quotes = SimpleNamespace(yes_buy_price=1.25, yes_buy_size=5, no_buy_price=0.40, no_buy_size=5)
+
+    decision = QuotePolicy().apply_final_inventory_safety(
+        quotes,
+        imbalance=10,
+        min_order_size=5,
+        repair_mode="normal",
+        max_combined_cost=0.99,
+    )
+
+    assert decision.allowed is True
+    assert decision.metadata["repair_mode"] == "repair_down"
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 5
+
+
 def test_quote_policy_pair_cost_guard_supports_quote_result_like_objects():
     class QuoteResultLike:
         yes_buy_price = 0.70

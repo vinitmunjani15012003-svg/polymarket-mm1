@@ -114,6 +114,98 @@ class QuotePolicy:
         quotes.no_buy_size = 0
         return DecisionResult.allow("QUOTE", "HEAVY_NO_BLOCKED", repair_mode="repair_up")
 
+    def apply_post_capital_safety(
+        self,
+        quotes,
+        *,
+        min_order_size: int,
+        allow_round_up: bool,
+        repair_mode: str,
+        abs_imbalance: float,
+        fv_entry_side: str | None = None,
+        sct_entry_side: str | None = None,
+        merge_blocked: bool = False,
+        atomic_reason: str = "NORMAL_QUOTE_NOT_ATOMIC",
+    ) -> DecisionResult:
+        """Apply pure quote-side invariants after capital/backoff transforms.
+
+        MarketCycler owns capital availability, logging, and dashboard effects;
+        QuotePolicy owns the resulting quote mutation/validation decisions.
+        """
+        decisions: list[DecisionResult] = []
+        decisions.append(self.normalize_sizes(
+            quotes,
+            min_order_size,
+            allow_round_up=allow_round_up,
+            repair_mode=repair_mode,
+        ))
+        decisions.append(self.enforce_repair_side(quotes, repair_mode))
+        atomic_decision = self.enforce_normal_atomicity(
+            quotes,
+            repair_mode=repair_mode,
+            abs_imbalance=abs_imbalance,
+            min_order_size=min_order_size,
+            fv_entry_side=fv_entry_side,
+            sct_entry_side=sct_entry_side,
+            merge_blocked=merge_blocked,
+            reason=atomic_reason,
+        )
+        decisions.append(atomic_decision)
+        if not atomic_decision.allowed:
+            return DecisionResult.block(
+                atomic_decision.action,
+                atomic_decision.reason,
+                decisions=decisions,
+                repair_mode=repair_mode,
+                **atomic_decision.metadata,
+            )
+        blocked = next((decision for decision in decisions if not decision.allowed), None)
+        if blocked:
+            return DecisionResult.block(
+                blocked.action,
+                blocked.reason,
+                decisions=decisions,
+                repair_mode=repair_mode,
+                **blocked.metadata,
+            )
+        return DecisionResult.allow("QUOTE", "POST_CAPITAL_SAFETY_OK", decisions=decisions, repair_mode=repair_mode)
+
+    def apply_final_inventory_safety(
+        self,
+        quotes,
+        *,
+        imbalance: float,
+        min_order_size: int,
+        repair_mode: str,
+        max_combined_cost: float = 0.99,
+    ) -> DecisionResult:
+        """Apply final inventory heavy-side backstop and active-side validation."""
+        heavy_decision = self.enforce_inventory_heavy_side(quotes, imbalance, min_order_size, repair_mode)
+        repair_mode = heavy_decision.metadata.get("repair_mode", repair_mode)
+        validation_decision = self.validate_final(quotes, max_combined_cost=max_combined_cost)
+        decisions = [heavy_decision, validation_decision]
+        if not validation_decision.allowed:
+            return DecisionResult.block(
+                validation_decision.action,
+                validation_decision.reason,
+                decisions=decisions,
+                repair_mode=repair_mode,
+                **validation_decision.metadata,
+            )
+        return DecisionResult.allow(
+            "QUOTE",
+            "FINAL_INVENTORY_SAFETY_OK",
+            decisions=decisions,
+            repair_mode=repair_mode,
+            validation_reason=validation_decision.reason,
+        )
+
+    @staticmethod
+    def is_repair_side(side_label: str, repair_mode: str) -> bool:
+        return (repair_mode == f"repair_{side_label}"
+                or (side_label == "yes" and repair_mode == "repair_up")
+                or (side_label == "no" and repair_mode == "repair_down"))
+
     def apply_pair_cost_side_guard(
         self,
         quotes,
@@ -136,9 +228,7 @@ class QuotePolicy:
         if cap >= 0.99:
             return DecisionResult.allow("QUOTE", "PAIR_COST_UNCONSTRAINED", side=side_label, cap=cap)
 
-        is_repair = (repair_mode == f"repair_{side_label}"
-                     or (side_label == "yes" and repair_mode == "repair_up")
-                     or (side_label == "no" and repair_mode == "repair_down"))
+        is_repair = self.is_repair_side(side_label, repair_mode)
 
         if cap < 0.01:
             setattr(quotes, buy_size_attr, 0)
