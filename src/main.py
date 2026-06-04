@@ -37,6 +37,17 @@ from src.execution.ctf_ops import (
 from src.risk.risk_engine import RiskEngine
 from src.orchestration.market_cycler import MarketCycler
 from src.monitoring.alerter import alerter
+from src.bootstrap.dependency_builder import (
+    active_symbols,
+    balance_monitor_address,
+    build_container,
+    mt5_bridge_log_fields,
+    select_active_assets,
+    should_disable_onchain_ctf_fallback,
+    symbol_to_asset as build_symbol_to_asset,
+)
+from src.bootstrap.recovery import run_live_recovery_sequence
+from src.bootstrap.startup_checks import validate_live_credentials
 
 
 log = None  # Initialized after logging setup
@@ -116,13 +127,7 @@ async def run_bot(
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
     # Determine which assets to trade
-    active_assets = {}
-    for name, ac in config.assets.items():
-        if not ac.enabled:
-            continue
-        if assets_filter and name not in assets_filter:
-            continue
-        active_assets[name] = ac
+    active_assets = select_active_assets(config, assets_filter)
 
     if not active_assets:
         log.error("no_active_assets")
@@ -145,16 +150,14 @@ async def run_bot(
     # --- Initialize shared components ---
 
     # Price feed (REAL for both dry-run and live)
-    symbols = [ac.symbol for ac in active_assets.values()]
+    symbols = active_symbols(active_assets)
     log.info(
         "mt5_bridge_config",
-        configured=bool(config.credentials.mt5_bridge_url),
-        url_host=(config.credentials.mt5_bridge_url.split('/')[2] if config.credentials.mt5_bridge_url.startswith('http') and len(config.credentials.mt5_bridge_url.split('/')) > 2 else ""),
-        has_api_key=bool(config.credentials.mt5_bridge_api_key),
-        stale_seconds=config.credentials.mt5_bridge_stale_seconds,
-        loaded_env_files=getattr(config_module, "_LOADED_ENV_FILES", []),
-        mt5_env_url_present=bool(os.environ.get("MT5_BRIDGE_URL")),
-        mt5_env_key_present=bool(os.environ.get("MT5_BRIDGE_API_KEY")),
+        **mt5_bridge_log_fields(
+            config,
+            os.environ,
+            loaded_env_files=getattr(config_module, "_LOADED_ENV_FILES", []),
+        ),
     )
     price_feed = PriceFeed(
         ws_url=config.credentials.binance_ws_url,
@@ -196,6 +199,15 @@ async def run_bot(
     # State Manager (Crash recovery)
     state_manager = StateManager()
 
+    startup_container = build_container(
+        active_assets=active_assets,
+        price_feed=price_feed,
+        market_discovery=discovery,
+        book_reader=book_reader,
+        dashboard=dashboard,
+        state_manager=state_manager,
+    )
+
     # --- Initialize executor (mode-dependent) ---
     gasless_merger = None
     balance_monitor = None
@@ -218,13 +230,8 @@ async def run_bot(
             log.info("simulated_balance_monitor_ready")
     else:
         # Live mode — validate required credentials before proceeding
-        required_creds = [
-            ("private_key", config.credentials.private_key),
-            ("api_key", config.credentials.api_key),
-            ("api_secret", config.credentials.api_secret),
-            ("api_passphrase", config.credentials.api_passphrase),
-        ]
-        missing = [name for name, val in required_creds if not val]
+        credential_validation = validate_live_credentials(config)
+        missing = list(credential_validation.missing)
         if missing:
             log.error("missing_live_credentials", fields=missing)
             print(f"\n[FATAL] Missing required live credentials: {', '.join(missing)}")
@@ -259,12 +266,9 @@ async def run_bot(
 
         # Reconcile exchange-side state before canceling stale orders. This keeps
         # restarts from blindly discarding order/fill context.
-        await executor.reconcile_on_startup()
-
         # Cancel all orders on startup after reconciliation. This prevents fake
         # state or duplicate exposure.
-        await executor.cancel_all()
-        log.info("startup_cleanup", msg="Cancelled all stale orders from previous session")
+        await run_live_recovery_sequence(executor, state_manager, log)
 
         # --- Initialize gasless merger (Builder Relayer) ---
         gasless_merger = GaslessMerger(
@@ -300,7 +304,7 @@ async def run_bot(
         # signer EOA. Direct on-chain fallback signs from the EOA, so it cannot
         # safely merge/redeem funder-held positions. Use gasless relayer only in
         # those modes and fail safe if gasless is unavailable.
-        if config.credentials.signature_type in (1, 2, 3) and config.credentials.funder:
+        if should_disable_onchain_ctf_fallback(config.credentials):
             ctf_ops = None
             log.warning("onchain_ctf_fallback_disabled",
                         reason="proxy/deposit wallet uses funder address; gasless relayer required")
@@ -323,11 +327,7 @@ async def run_bot(
                 merge_balance=config.balance_monitor.merge_balance,
                 min_merge_pairs=config.balance_monitor.min_merge_pairs,
                 check_interval=config.balance_monitor.check_interval,
-                balance_address=(
-                    config.credentials.funder
-                    if config.credentials.signature_type in (1, 2, 3)
-                    else ""
-                ),
+                balance_address=balance_monitor_address(config.credentials),
             )
             bal_ok = await balance_monitor.initialize()
             if bal_ok:
@@ -352,6 +352,11 @@ async def run_bot(
                 balance_monitor = None
 
     # --- Create per-asset market cyclers ---
+    startup_container.register("executor", executor)
+    startup_container.register("gasless_merger", gasless_merger)
+    startup_container.register("balance_monitor", balance_monitor)
+    startup_container.register("ctf_ops", ctf_ops)
+
     cyclers = []
     tasks = []
     shutdown_event = asyncio.Event()
@@ -511,7 +516,7 @@ async def run_bot(
                      price=round(p, 2))
 
     # Build symbol -> asset lookup and cycler lookup for live price piping
-    symbol_to_asset = {ac.symbol.upper(): name for name, ac in active_assets.items()}
+    symbol_to_asset = build_symbol_to_asset(active_assets)
     cycler_by_asset = {}
 
     # Market cycler tasks
