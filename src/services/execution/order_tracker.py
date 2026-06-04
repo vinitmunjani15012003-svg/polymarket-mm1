@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from src.core.models.orders import OrderIntent, OrderState
-from src.execution.order_manager import ActiveQuotes
+from src.execution.order_state import ActiveQuotes
 
 
 class OrderTracker:
