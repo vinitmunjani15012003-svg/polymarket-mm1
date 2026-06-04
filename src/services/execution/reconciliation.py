@@ -31,3 +31,14 @@ def find_stray_order_ids(active_quotes, open_orders: dict, token_ids: set[str]) 
         if order_token_id(info) in normalized_tokens:
             stray_ids.append(order_id)
     return stray_ids
+
+
+def find_token_order_ids(open_orders: dict, token_id: str, *, exclude: set[str] | None = None) -> list[str]:
+    """Return locally-known order ids for a token, excluding any tracked ids."""
+    excluded = exclude or set()
+    normalized_token = str(token_id)
+    return [
+        order_id
+        for order_id, info in list(open_orders.items())
+        if order_id not in excluded and order_token_id(info) == normalized_token
+    ]
