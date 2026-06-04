@@ -1,6 +1,6 @@
 # Refactor Status
 
-Final roadmap hardening snapshot for branch `refactor/agent-final-tests4`.
+Final roadmap hardening snapshot for branch `refactor/agent-smoke5`.
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -15,6 +15,14 @@ Final roadmap hardening snapshot for branch `refactor/agent-final-tests4`.
 | Risk coordinator | Complete for aggregation semantics | Coordinator ranking, audit trail, stale data, basis gap, inventory, capital, and stop/halt precedence are covered. |
 | Small-cap lifecycle | Complete for critical scenarios | Tests cover restart mid-cycle hold, partial-fill-after-cancel balancing, completed-window no-requote, stale opening repair, and done-state cancellation. |
 | Lifecycle state machine | Complete for current enum | Tests cover happy path, halt recovery through resetting, and invalid transition rejection. |
+
+## Final verification — 2026-06-04
+
+- Added deterministic service-wired dry-run smoke coverage in `tests/test_final_roadmap_hardening.py`: `QuoteEngine` → `RiskCoordinator` → `QuotePolicy` → `OrderManager` → `DryRunExecutor` with an instant local executor, no external network, and intent-tracked orders.
+- Added coordinator + `QuotePolicy` + `OrderIntent` integration coverage for both allowed placement intent creation and blocked stale/pair-cost gating.
+- Verification run: `/root/.openclaw/workspace/polymarket-mm/.venv/bin/python -m compileall -q src tests` passed.
+- Verification run: `/root/.openclaw/workspace/polymarket-mm/.venv/bin/python -m pytest -q` passed (`203 passed, 1 warning`).
+- Safe local dry-run command blocker: documented `python -m src.main --mode dry-run` and `scripts/run_two_window_dryrun_and_report.py` use real price feeds/market discovery or wait for live windows, so no non-network local dry-run command was run beyond the deterministic smoke probe.
 
 ## Remaining deletion list
 
