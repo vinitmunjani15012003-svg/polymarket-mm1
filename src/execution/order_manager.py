@@ -16,8 +16,11 @@ from src.strategy.quote_engine import QuoteResult
 from src.execution.order_state import ActiveQuotes, order_token_id as _order_token_id
 from src.execution.repricing import RepricePolicy, is_crossed_buy
 from src.monitoring.logger import get_logger
+from src.core.models.orders import OrderState
 from src.services.execution.cancel_manager import CancelManager
+from src.services.execution.order_intents import attach_place_intent, next_quote_version
 from src.services.execution.order_submitter import OrderSubmitter
+from src.services.execution.order_tracker import OrderTracker
 from src.services.execution.reconciliation import find_stray_order_ids
 
 log = get_logger("order_manager")
@@ -45,6 +48,8 @@ class OrderManager:
         self.min_update_interval = min_update_interval
         self.order_submitter = OrderSubmitter(executor)
         self.cancel_manager = CancelManager(executor)
+        self.order_tracker = OrderTracker()
+        self._quote_versions: dict[str, int] = {}
         # Repair quotes are intentionally sticky. The bot is buy-only/post-only,
         # so imbalance repair depends on resting the light-side bid long enough
         # to earn queue priority. Chasing every FV/book wiggle cancels exactly
@@ -208,28 +213,33 @@ class OrderManager:
                 active.no_price = None
                 active.no_size = 0
 
+        quote_version = None
         place_specs = []
         if yes_needs and quotes.yes_buy_price and quotes.yes_buy_size > 0:
-            place_specs.append({
+            if quote_version is None:
+                quote_version = self._advance_quote_version(market_id)
+            place_specs.append(attach_place_intent({
                 "token_id": token_id_yes,
                 "price": quotes.yes_buy_price,
                 "size": quotes.yes_buy_size,
                 "side": "yes",
                 "book_snapshot": yes_book_snapshot,
-            })
+            }, market_id=market_id, quote_version=quote_version))
         elif yes_needs:
             active.yes_order_id = None
             active.yes_price = None
             active.yes_size = 0
 
         if no_needs and quotes.no_buy_price and quotes.no_buy_size > 0:
-            place_specs.append({
+            if quote_version is None:
+                quote_version = self._advance_quote_version(market_id)
+            place_specs.append(attach_place_intent({
                 "token_id": token_id_no,
                 "price": quotes.no_buy_price,
                 "size": quotes.no_buy_size,
                 "side": "no",
                 "book_snapshot": no_book_snapshot,
-            })
+            }, market_id=market_id, quote_version=quote_version))
         elif no_needs:
             active.no_order_id = None
             active.no_price = None
@@ -388,9 +398,55 @@ class OrderManager:
             token_id, price, size, side=side, book_snapshot=book_snapshot
         )
 
+    def _advance_quote_version(self, market_id: str) -> int:
+        version = next_quote_version(self._quote_versions.get(market_id, 0))
+        self._quote_versions[market_id] = version
+        return version
+
     async def _place_buys(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Place one or more BUY orders, using executor batch API when available."""
-        return await self.order_submitter.place_buys(orders)
+        filtered = []
+        skipped: dict[str, Optional[str]] = {}
+        intents_by_side = {}
+        for order in orders:
+            intent = order.get("intent")
+            side = str(order.get("side", ""))
+            if intent is not None:
+                if not self.order_tracker.should_submit(intent):
+                    skipped[side] = None
+                    log.warning(
+                        "duplicate_order_intent_suppressed",
+                        market=intent.market_id[:8],
+                        side=intent.side,
+                        quote_version=intent.quote_version,
+                    )
+                    continue
+                intents_by_side[side] = intent
+            filtered.append(order)
+
+        if not filtered:
+            return skipped
+
+        placed = await self.order_submitter.place_buys(filtered)
+        for side, order_id in placed.items():
+            intent = intents_by_side.get(side)
+            if intent is None:
+                continue
+            if order_id:
+                self.order_tracker.mark_order(OrderState(
+                    order_id=order_id,
+                    intent_id=intent.intent_id,
+                    market_id=intent.market_id,
+                    side=intent.side,
+                    price=intent.price,
+                    size=intent.size,
+                    status="open",
+                    updated_ts=time.time(),
+                    metadata={"quote_version": intent.quote_version, "token_id": intent.token_id},
+                ))
+            else:
+                self.order_tracker.mark_rejected(intent)
+        return {**skipped, **placed}
 
     def _needs_reprice(self, existing_price: Optional[float],
                        new_price: Optional[float],
