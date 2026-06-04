@@ -8,6 +8,19 @@ def zero_allowance_spenders(allowances: dict) -> list:
     return [addr for addr, val in allowances.items() if str(val) == "0"]
 
 
+def parse_balance_allowance(result: dict) -> dict:
+    """Extract balance/allowance verification fields from a CLOB response."""
+    allowances = result.get("allowances", {}) if isinstance(result, dict) else {}
+    balance = result.get("balance", "0") if isinstance(result, dict) else "0"
+    zero_allowances = zero_allowance_spenders(allowances if isinstance(allowances, dict) else {})
+    return {
+        "balance": balance,
+        "allowances": allowances if isinstance(allowances, dict) else {},
+        "zero_allowances": zero_allowances,
+        "verified": not zero_allowances,
+    }
+
+
 class ClobBalances:
     def __init__(self, client):
         self.client = client

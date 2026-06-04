@@ -8,10 +8,18 @@ All orders are BUY-only.
 import asyncio
 import time
 from typing import Optional
-from src.execution.clob.balances import zero_allowance_spenders
+from src.execution.clob.balances import parse_balance_allowance
 from src.execution.clob.fill_ids import fill_dedupe_key
 from src.execution.clob.fills import maker_order_id, maker_orders_for_fill
-from src.execution.clob.sdk_compat import ensure_builder_code, normalize_post_orders_response
+from src.execution.clob.order_context import (
+    cache_open_order_context,
+    get_order_context,
+    normalize_open_orders,
+    normalize_orders_response,
+    order_id_from_record,
+    order_is_closed,
+)
+from src.execution.clob.sdk_compat import ensure_builder_code, normalize_post_orders_response, post_order_compat
 from src.monitoring.logger import get_logger
 
 log = get_logger("clob_client")
@@ -80,10 +88,7 @@ class ClobClientWrapper:
         v1 supports post_only as a request flag. Official v2 examples post the
         signed GTC order directly; if a build rejects post_only, retry without it.
         """
-        try:
-            return self._client.post_order(signed_order, order_type, post_only=True)
-        except TypeError:
-            return self._client.post_order(signed_order, order_type)
+        return post_order_compat(self._client, signed_order, order_type)
 
     def set_state_manager(self, state_manager):
         self.state_manager = state_manager
@@ -101,25 +106,14 @@ class ClobClientWrapper:
             log.info("loaded_processed_fills", count=len(self._processed_fills))
 
     def _remember_order_context(self, order_id: str):
-        ctx = self.open_orders.get(order_id)
-        if not ctx:
-            return
-        cached = dict(ctx)
-        cached["closed_at"] = time.time()
-        self._recent_order_context[order_id] = cached
-        # Keep cache bounded and fresh enough for delayed fill/trade events.
-        cutoff = time.time() - 900
-        if len(self._recent_order_context) > 500:
-            for oid, info in list(self._recent_order_context.items()):
-                if float(info.get("closed_at", 0) or 0) < cutoff:
-                    self._recent_order_context.pop(oid, None)
+        cache_open_order_context(self.open_orders, self._recent_order_context, order_id)
 
     def _pop_open_order(self, order_id: str):
         self._remember_order_context(order_id)
         self.open_orders.pop(order_id, None)
 
     def _order_context(self, order_id: str) -> dict:
-        return self.open_orders.get(order_id) or self._recent_order_context.get(order_id, {})
+        return get_order_context(self.open_orders, self._recent_order_context, order_id)
 
     def _save_orders_state(self):
         if self.state_manager:
@@ -252,9 +246,10 @@ class ClobClientWrapper:
                 try:
                     result = await self._run_client_call(get_fn, params) if params else await self._run_client_call(get_fn)
                     if isinstance(result, dict):
-                        allowances = result.get("allowances", {})
-                        balance = result.get("balance", "0")
-                        zero_allowances = zero_allowance_spenders(allowances)
+                        parsed = parse_balance_allowance(result)
+                        allowances = parsed["allowances"]
+                        balance = parsed["balance"]
+                        zero_allowances = parsed["zero_allowances"]
                         if zero_allowances:
                             log.warning(
                                 "balance_allowance_zero_detected",
@@ -533,19 +528,12 @@ class ClobClientWrapper:
                 resp = await self._run_client_call(get_orders)
             except TypeError:
                 resp = await self._run_client_call(get_orders, None)
-            orders = resp if isinstance(resp, list) else resp.get("data", []) if isinstance(resp, dict) else []
+            orders = normalize_orders_response(resp)
             for order in orders:
-                oid = order.get("id") or order.get("orderID") or order.get("order_id")
+                oid = order_id_from_record(order)
                 if oid != order_id:
                     continue
-                status = str(order.get("status") or order.get("state") or "").lower()
-                if status in ("cancelled", "canceled", "filled", "matched", "closed"):
-                    self._pop_open_order(order_id)
-                    self._save_orders_state()
-                    return False
-                original = float(order.get("original_size") or order.get("size") or 0)
-                matched = float(order.get("size_matched") or order.get("matched_size") or 0)
-                if original > 0 and matched >= original:
+                if order_is_closed(order):
                     self._pop_open_order(order_id)
                     self._save_orders_state()
                     return False
@@ -616,7 +604,7 @@ class ClobClientWrapper:
                     open_resp = await self._run_client_call(get_orders)
                 except TypeError:
                     open_resp = await self._run_client_call(get_orders, None)
-                open_orders = open_resp if isinstance(open_resp, list) else open_resp.get("data", []) if isinstance(open_resp, dict) else []
+                open_orders = normalize_orders_response(open_resp)
             else:
                 # SDK compatibility: some py-clob-client builds do not expose
                 # get_orders. Startup reconciliation is best-effort; do not
@@ -628,24 +616,7 @@ class ClobClientWrapper:
                     client_type=type(self._client).__name__,
                 )
 
-            refreshed = {}
-            for order in open_orders:
-                order_id = order.get("id") or order.get("orderID") or order.get("order_id")
-                if not order_id:
-                    continue
-                original = float(order.get("original_size") or order.get("size") or 0)
-                matched = float(order.get("size_matched") or order.get("matched_size") or 0)
-                remaining = max(0.0, original - matched)
-                outcome = str(order.get("outcome") or "").strip().lower()
-                token_side = "yes" if outcome in ("yes", "up") else "no" if outcome in ("no", "down") else None
-                refreshed[order_id] = {
-                    "token_id": str(order.get("asset_id") or order.get("token_id") or ""),
-                    "price": float(order.get("price") or 0),
-                    "size": remaining,
-                    "side": order.get("side", "BUY"),
-                    "token_side": token_side,
-                    "placed_at": float(order.get("created_at") or time.time()),
-                }
+            refreshed = normalize_open_orders(open_orders)
 
             if refreshed:
                 self.open_orders.update(refreshed)
@@ -655,7 +626,7 @@ class ClobClientWrapper:
             if callable(get_trades):
                 try:
                     trades_resp = await self._run_client_call(get_trades)
-                    trades = trades_resp if isinstance(trades_resp, list) else trades_resp.get("data", []) if isinstance(trades_resp, dict) else []
+                    trades = normalize_orders_response(trades_resp)
                 except Exception:
                     trades = []
             else:

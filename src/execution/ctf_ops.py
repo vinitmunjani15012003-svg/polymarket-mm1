@@ -39,6 +39,18 @@ from src.execution.settlement.contracts import (
     USDC_E_COLLATERAL_TOKEN,
 )
 from src.execution.settlement.balance_monitor import BalanceMonitor, SimulatedBalanceMonitor
+from src.execution.settlement.relayer import (
+    DEFAULT_PROXY_GAS_LIMIT,
+    DEPOSIT_WALLET_BATCH_TYPES,
+    DEPOSIT_WALLET_FACTORY,
+    PROXY_FACTORY,
+    RELAY_HUB,
+    compact_json,
+    deposit_wallet_domain,
+    deposit_wallet_message,
+    deposit_wallet_submit_payload,
+    normalize_relayer_call,
+)
 
 log = get_logger("ctf_ops")
 
@@ -103,10 +115,10 @@ class GaslessMerger:
     # chain config. Proxy wallets (signature_type=1) must be executed through
     # the proxy factory; sending those calls through the Safe path derives the
     # wrong wallet and auto-merge never reaches the tokens.
-    PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
-    RELAY_HUB = "0xD216153c06E857cD7f72665E0aF1d7D82172F494"
-    DEPOSIT_WALLET_FACTORY = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07"
-    DEFAULT_PROXY_GAS_LIMIT = 500_000
+    PROXY_FACTORY = PROXY_FACTORY
+    RELAY_HUB = RELAY_HUB
+    DEPOSIT_WALLET_FACTORY = DEPOSIT_WALLET_FACTORY
+    DEFAULT_PROXY_GAS_LIMIT = DEFAULT_PROXY_GAS_LIMIT
 
     def __init__(self, private_key: str,
                  builder_api_key: str = "",
@@ -337,57 +349,30 @@ class GaslessMerger:
         if not nonce or nonce == "None":
             raise RuntimeError(f"invalid deposit wallet nonce payload: {nonce_payload}")
 
-        calls = [{
-            "target": self._w3.to_checksum_address(target),
-            "value": "0",
-            "data": data,
-        }]
-        domain = {
-            "name": "DepositWallet",
-            "version": "1",
-            "chainId": self._chain_id,
-            "verifyingContract": wallet,
-        }
-        types = {
-            "Call": [
-                {"name": "target", "type": "address"},
-                {"name": "value", "type": "uint256"},
-                {"name": "data", "type": "bytes"},
-            ],
-            "Batch": [
-                {"name": "wallet", "type": "address"},
-                {"name": "nonce", "type": "uint256"},
-                {"name": "deadline", "type": "uint256"},
-                {"name": "calls", "type": "Call[]"},
-            ],
-        }
-        message = {
-            "wallet": wallet,
-            "nonce": int(nonce),
-            "deadline": int(deadline),
-            "calls": calls,
-        }
-        signable = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
+        calls = [normalize_relayer_call(
+            {"target": target, "value": "0", "data": data},
+            self._w3.to_checksum_address,
+        )]
+        signable = encode_typed_data(
+            domain_data=deposit_wallet_domain(self._chain_id, wallet),
+            message_types=DEPOSIT_WALLET_BATCH_TYPES,
+            message_data=deposit_wallet_message(wallet, nonce, deadline, calls),
+        )
         signature = Account.sign_message(signable, self._owner_key).signature.hex()
         if not signature.startswith("0x"):
             signature = "0x" + signature
 
-        payload = {
-            "type": "WALLET",
-            "from": from_address,
-            "to": self.DEPOSIT_WALLET_FACTORY,
-            "nonce": nonce,
-            "signature": signature,
-            "depositWalletParams": {
-                "depositWallet": wallet,
-                "deadline": deadline,
-                "calls": calls,
-            },
-        }
-        if metadata:
-            payload["metadata"] = metadata
-
-        body = json.dumps(payload, separators=(",", ":"))
+        payload = deposit_wallet_submit_payload(
+            from_address=from_address,
+            factory=self.DEPOSIT_WALLET_FACTORY,
+            wallet=wallet,
+            nonce=nonce,
+            deadline=deadline,
+            calls=calls,
+            signature=signature,
+            metadata=metadata,
+        )
+        body = compact_json(payload)
         headers = self._relayer_auth_headers(body)
 
         def _post():
@@ -521,59 +506,29 @@ class GaslessMerger:
             raise RuntimeError(f"invalid deposit wallet nonce payload: {nonce_payload}")
 
         normalized_calls = [
-            {
-                "target": self._w3.to_checksum_address(call["target"]),
-                "value": str(call.get("value", "0")),
-                "data": call["data"],
-            }
+            normalize_relayer_call(call, self._w3.to_checksum_address)
             for call in calls
         ]
-        domain = {
-            "name": "DepositWallet",
-            "version": "1",
-            "chainId": self._chain_id,
-            "verifyingContract": wallet,
-        }
-        types = {
-            "Call": [
-                {"name": "target", "type": "address"},
-                {"name": "value", "type": "uint256"},
-                {"name": "data", "type": "bytes"},
-            ],
-            "Batch": [
-                {"name": "wallet", "type": "address"},
-                {"name": "nonce", "type": "uint256"},
-                {"name": "deadline", "type": "uint256"},
-                {"name": "calls", "type": "Call[]"},
-            ],
-        }
-        message = {
-            "wallet": wallet,
-            "nonce": int(nonce),
-            "deadline": int(deadline),
-            "calls": normalized_calls,
-        }
-        signable = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
+        signable = encode_typed_data(
+            domain_data=deposit_wallet_domain(self._chain_id, wallet),
+            message_types=DEPOSIT_WALLET_BATCH_TYPES,
+            message_data=deposit_wallet_message(wallet, nonce, deadline, normalized_calls),
+        )
         signature = Account.sign_message(signable, self._owner_key).signature.hex()
         if not signature.startswith("0x"):
             signature = "0x" + signature
 
-        payload = {
-            "type": "WALLET",
-            "from": from_address,
-            "to": self.DEPOSIT_WALLET_FACTORY,
-            "nonce": nonce,
-            "signature": signature,
-            "depositWalletParams": {
-                "depositWallet": wallet,
-                "deadline": deadline,
-                "calls": normalized_calls,
-            },
-        }
-        if metadata:
-            payload["metadata"] = metadata
-
-        body = json.dumps(payload, separators=(",", ":"))
+        payload = deposit_wallet_submit_payload(
+            from_address=from_address,
+            factory=self.DEPOSIT_WALLET_FACTORY,
+            wallet=wallet,
+            nonce=nonce,
+            deadline=deadline,
+            calls=normalized_calls,
+            signature=signature,
+            metadata=metadata,
+        )
+        body = compact_json(payload)
         headers = self._relayer_auth_headers(body)
 
         def _post():
