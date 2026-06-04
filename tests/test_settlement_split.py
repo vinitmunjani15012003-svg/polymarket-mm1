@@ -4,6 +4,15 @@ import sys
 
 from src.execution.settlement.collateral import infer_collateral_token_for_market
 from src.execution.settlement.contracts import DEFAULT_COLLATERAL_TOKEN, USDC_E_COLLATERAL_TOKEN
+from src.execution.settlement.relayer import (
+    DEPOSIT_WALLET_BATCH_TYPES,
+    DEPOSIT_WALLET_FACTORY,
+    compact_json,
+    deposit_wallet_domain,
+    deposit_wallet_message,
+    deposit_wallet_submit_payload,
+    normalize_relayer_call,
+)
 from src.execution.settlement.settlement_manager import SettlementManager
 
 
@@ -101,6 +110,40 @@ def test_settlement_manager_falls_back_to_ctf_ops():
     import asyncio
 
     assert asyncio.run(SettlementManager(ctf_ops=CTF(), gasless_merger=Gasless()).merge("cond", 7, collateral_token="tok")) == "ctf:cond:7:tok"
+
+
+def test_relayer_helpers_build_deposit_wallet_request_shapes():
+    checksum = lambda addr: addr.upper()
+    call = normalize_relayer_call({"target": "0xabc", "data": "0x123"}, checksum)
+
+    assert call == {"target": "0XABC", "value": "0", "data": "0x123"}
+    assert deposit_wallet_domain(137, "0xwallet") == {
+        "name": "DepositWallet",
+        "version": "1",
+        "chainId": 137,
+        "verifyingContract": "0xwallet",
+    }
+    assert deposit_wallet_message("0xwallet", "7", "9", [call]) == {
+        "wallet": "0xwallet",
+        "nonce": 7,
+        "deadline": 9,
+        "calls": [call],
+    }
+    assert "Batch" in DEPOSIT_WALLET_BATCH_TYPES
+
+    payload = deposit_wallet_submit_payload(
+        from_address="0xowner",
+        factory=DEPOSIT_WALLET_FACTORY,
+        wallet="0xwallet",
+        nonce="7",
+        deadline="9",
+        calls=[call],
+        signature="0xsig",
+        metadata="Merge Positions",
+    )
+    assert payload["type"] == "WALLET"
+    assert payload["metadata"] == "Merge Positions"
+    assert compact_json({"b": 1, "a": 2}) == '{"b":1,"a":2}'
 
 
 def test_balance_monitor_exports_preserve_existing_imports():
