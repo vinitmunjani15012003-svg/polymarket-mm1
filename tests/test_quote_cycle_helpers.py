@@ -9,7 +9,7 @@ from src.orchestration.quote_cycle import (
     package_book_snapshot,
     package_fair_value_result,
 )
-from src.orchestration.market_cycler import MarketCycler
+from src.orchestration import market_cycler
 
 
 def test_quote_cycle_context_captures_market_and_remaining():
@@ -128,22 +128,16 @@ def test_inventory_and_negative_pair_decisions_use_coordinator_metadata():
     assert negative.risk.reason == "NEGATIVE_PAIR_EDGE"
 
 
-def test_market_cycler_decision_wrappers_preserve_compatibility():
-    cycler = MarketCycler.__new__(MarketCycler)
+def test_market_cycler_uses_quote_cycle_decision_helpers_directly():
+    quote_cycle_names = {
+        "decide_stale_spot",
+        "decide_inventory_risk",
+        "decide_basis_risk",
+        "decide_negative_pair_edge",
+    }
 
-    stale = cycler._decide_stale_spot(50000.0, price_age=3.0, max_spot_age=2.0)
-    inv = cycler._decide_inventory_risk(-6, min_order_size=5)
-    basis = cycler._decide_basis_risk(
-        repair_mode="normal",
-        balance_only=False,
-        is_halted=False,
-        model_fv=0.80,
-        polymarket_mid_up=0.50,
-        abs_imbalance=0,
-        min_order_size=5,
-    )
+    for name in quote_cycle_names:
+        assert getattr(market_cycler, name) is globals()[name]
 
-    assert stale.dashboard_reason == "STALE_SPOT"
-    assert inv.inventory_repair is True
-    assert basis.triggered is True
-    assert basis.action == "stop_quoting"
+    private_wrapper_names = {f"_{name}" for name in quote_cycle_names}
+    assert private_wrapper_names.isdisjoint(vars(market_cycler.MarketCycler))

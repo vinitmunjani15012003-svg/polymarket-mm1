@@ -80,9 +80,9 @@ from src.services.inventory import (
     apply_dust_price_guardrails,
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
-    has_negative_matched_pair_edge,
+    has_negative_matched_pair_edge,  # compatibility re-export; live cycler uses quote_cycle decisions
     repair_min_edge_for_remaining,
-    repair_price_cap,
+    repair_price_cap,  # compatibility re-export; live repair planning owns behavior
 )
 from src.services.quoting import (
     FV_FAVORED_ENTRY_MAX_SIZE,
@@ -904,23 +904,11 @@ class MarketCycler:
     def _quote_cycle_context(self, market: MarketInfo, now: float | None = None) -> QuoteCycleContext:
         return QuoteCycleContext.from_market(market, now=_time.time() if now is None else now)
 
-    def _decide_stale_spot(self, raw_spot, price_age: float, max_spot_age: float):
-        return decide_stale_spot(raw_spot, price_age, max_spot_age)
-
     def _package_book_snapshot(self, books, market: MarketInfo):
         return package_book_snapshot(books, market)
 
     def _package_fair_value_result(self, fv_result, polymarket_mid_up):
         return package_fair_value_result(fv_result, polymarket_mid_up)
-
-    def _decide_basis_risk(self, **kwargs):
-        return decide_basis_risk(**kwargs)
-
-    def _decide_inventory_risk(self, imbalance: float, min_order_size: int):
-        return decide_inventory_risk(imbalance, min_order_size)
-
-    def _decide_negative_pair_edge(self, pos):
-        return decide_negative_pair_edge(pos)
 
     async def _quote_cycle(self, market: MarketInfo):
         """Single quote cycle iteration."""
@@ -959,7 +947,7 @@ class MarketCycler:
                 price_source = (self.price_feed.get_price_source(self.ac.symbol)
                                 if hasattr(self.price_feed, "get_price_source") else "unknown")
 
-        stale_spot_decision = self._decide_stale_spot(raw_spot, price_age, max_spot_age)
+        stale_spot_decision = decide_stale_spot(raw_spot, price_age, max_spot_age)
         if stale_spot_decision.should_stop and stale_spot_decision.dashboard_reason == "NO_SPOT":
             log.warning("no_spot_price", symbol=self.ac.symbol)
             self._set_dashboard_event("skip", "NO_SPOT_PRICE", f"{self.ac.symbol} unavailable")
@@ -1221,7 +1209,7 @@ class MarketCycler:
 
         await self._maybe_pre_expiry_auto_merge(market, pos, remaining, wallet_truth=wallet_truth)
 
-        negative_pair_edge = self._decide_negative_pair_edge(pos)
+        negative_pair_edge = decide_negative_pair_edge(pos)
         if negative_pair_edge.triggered:
             pairs = negative_pair_edge.matched_pairs
             pair_pnl = round(negative_pair_edge.pair_pnl, 4)
@@ -1377,7 +1365,7 @@ class MarketCycler:
         # leaves us imbalanced, the safest response is not a full quoting freeze;
         # it is close-only repair on the light side with conservative sizing.
         # Uses SHARE COUNT imbalance (Up - Down), not dollar delta.
-        inventory_plan = self._decide_inventory_risk(
+        inventory_plan = decide_inventory_risk(
             float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance()),
             min_order_size,
         )
@@ -1616,7 +1604,7 @@ class MarketCycler:
 
         # Book snapshots/FV blend were already computed before any early-return
         # path so dashboard, risk, sizing, and quotes all use one FV source.
-        basis_risk_decision = self._decide_basis_risk(
+        basis_risk_decision = decide_basis_risk(
             repair_mode=repair_mode,
             balance_only=balance_only,
             is_halted=is_halted,
@@ -2231,7 +2219,7 @@ class MarketCycler:
             wallet_truth, wallet_snapshot = await self._refresh_wallet_truth_for_market(market)
         if fills and await self._small_capital_maybe_stop_completed(market, pos, "post_fill_balanced", wallet_snapshot=wallet_snapshot):
             return
-        post_fill_negative_pair_edge = self._decide_negative_pair_edge(pos) if fills else None
+        post_fill_negative_pair_edge = decide_negative_pair_edge(pos) if fills else None
         if post_fill_negative_pair_edge and post_fill_negative_pair_edge.triggered:
             pairs = post_fill_negative_pair_edge.matched_pairs
             log.critical(
