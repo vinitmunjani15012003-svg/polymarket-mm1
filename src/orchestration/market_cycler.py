@@ -19,10 +19,7 @@ from src.strategy.volatility import VolatilityEstimator
 from src.strategy.quote_engine import QuoteEngine, MAX_COMBINED_COST
 from src.strategy.inventory import InventoryManager
 from src.execution.order_manager import OrderManager
-from src.execution.ctf_ops import (
-    CTFOperations, GaslessMerger, BalanceMonitor,
-    infer_collateral_token_for_market,
-)
+from src.execution.ctf_ops import CTFOperations, GaslessMerger, BalanceMonitor
 from src.risk.regime_filter import RegimeFilter
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
 from src.risk.risk_engine import (RiskEngine, determine_phase,
@@ -37,6 +34,18 @@ from src.orchestration.quote_cycle import (
     package_fair_value_result,
 )
 from src.orchestration.small_capital import SmallCapitalLifecycle
+from src.orchestration.dashboard_state import (
+    clear_dashboard_event,
+    dashboard_sigma_for_stale_spot,
+    set_dashboard_event,
+    update_dashboard,
+    update_dashboard_waiting,
+)
+from src.orchestration.settlement import (
+    settle_market,
+    wait_and_settle_unmatched,
+    wait_and_settle_unmatched_by_fields,
+)
 
 log = get_logger("market_cycler")
 
@@ -198,15 +207,10 @@ class MarketCycler:
         self._quote_event = asyncio.Event()
 
     def _set_dashboard_event(self, level: str, reason: str, detail: str = "") -> None:
-        self._dashboard_event = {
-            "event_level": level,
-            "event_reason": reason,
-            "event_detail": detail,
-            "event_ts": _time.time(),
-        }
+        set_dashboard_event(self, level, reason, detail)
 
     def _clear_dashboard_event(self) -> None:
-        self._dashboard_event = {}
+        clear_dashboard_event(self)
 
     def notify_price_update(self):
         """Wake the quote loop on a fresh price tick, with rate limit in loop."""
@@ -509,247 +513,18 @@ class MarketCycler:
         log.info("cycler_stopped", asset=self.asset)
 
     async def _settle_market(self):
-        """Clean up after a market expires, merge pairs and redeem winnings."""
-        if self.current_market:
-            market = self.current_market
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-
-            # Get final position
-            pos = self.inventory.get_or_create(market.market_id, self.asset)
-            pairs = pos.matched_pairs()
-
-            log.info("market_settling",
-                     asset=self.asset,
-                     slug=market.slug,
-                     up_shares=pos.yes_shares,
-                     down_shares=pos.no_shares,
-                     matched_pairs=pairs)
-
-            # --- CTF Operations ---
-            if pairs > 0:
-                # Use gasless merger if available, else on-chain
-                condition_id = getattr(market, 'condition_id', None)
-                if condition_id:
-                    amount = int(pairs * 1e6)  # Convert to USDC base units
-                    tx = None
-                    collateral_token = getattr(self.gasless_merger, "_collateral_token", "")
-                    if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
-                        collateral_token = infer_collateral_token_for_market(
-                            self.balance_monitor._w3,
-                            self.balance_monitor._ctf,
-                            condition_id,
-                            getattr(market, "token_id_up", ""),
-                            getattr(market, "token_id_down", ""),
-                            collateral_token,
-                        )
-
-                    # Prefer gasless merge
-                    if self.gasless_merger and self.gasless_merger.is_available:
-                        tx = await self.gasless_merger.merge_positions(
-                            condition_id, amount, collateral_token=collateral_token
-                        )
-
-                    # Fallback to on-chain
-                    if not tx and self.ctf:
-                        tx = await self.ctf.merge_positions(
-                            condition_id, amount, collateral_token=collateral_token
-                        )
-
-                    if tx:
-                        # ERC20 approvals are permanent (MAX_UINT256) and set at
-                        # startup. Post-merge we only need to sync the CLOB's
-                        # indexed view so the returned USDC.e is credited as cash.
-                        sync_balance = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
-                        if callable(sync_balance):
-                            # Wait for CLOB indexer to catch up with on-chain
-                            # merge state before syncing balance/allowance.
-                            await asyncio.sleep(3)
-                            sync_ok = False
-                            for attempt in range(1, 6):
-                                try:
-                                    sync_ok = bool(await sync_balance())
-                                except Exception as e:
-                                    log.warning("post_settle_merge_balance_sync_error",
-                                                asset=self.asset, attempt=attempt, error=str(e))
-                                    sync_ok = False
-                                if sync_ok:
-                                    break
-                                await asyncio.sleep(min(2 * attempt, 8))
-                            if sync_ok:
-                                log.info("post_settle_merge_balance_allowance_synced", asset=self.asset)
-                            else:
-                                log.warning("post_settle_merge_balance_allowance_sync_failed", asset=self.asset)
-                        pair_profit = pos.matched_pair_profit()
-                        self.pnl.record_settlement(pair_profit, market.market_id)
-                        self.pnl.record_capital_recovery(pairs * 1.0)
-                        pos.acknowledge_settlement()
-                        log.info("pairs_merged",
-                                 pairs=pairs,
-                                 profit=f"${pair_profit:.4f}",
-                                 tx=str(tx)[:16] if tx else "none")
-
-            # Try to redeem any remaining tokens (if market resolved)
-            if self.ctf or self.gasless_merger:
-                condition_id = getattr(market, 'condition_id', None)
-                if condition_id:
-                    resolved = await self.ctf.is_market_resolved(condition_id) if self.ctf else False
-                    if resolved:
-                        tx = None
-                        if self.gasless_merger and self.gasless_merger.is_available:
-                            tx = await self.gasless_merger.redeem_positions(condition_id)
-                        elif self.ctf:
-                            log.error("gasless_redeem_unavailable",
-                                      msg="Gasless redeem unavailable; on-chain fallback disabled by policy")
-                        if tx:
-                            # Calculate redemption value for unmatched tokens
-                            unmatched_up = pos.yes_shares - pairs
-                            unmatched_down = pos.no_shares - pairs
-                            log.info("tokens_redeemed",
-                                     unmatched_up=unmatched_up,
-                                     unmatched_down=unmatched_down,
-                                     tx=tx[:16] if tx else "none")
-
-            # Simulate redemption of unmatched tokens in Dry-Run
-            elif not self.ctf and not self.gasless_merger:
-                if pairs > 0:
-                    pair_profit = pos.matched_pair_profit()
-                    self.pnl.record_settlement(pair_profit, market.market_id)
-                    self.pnl.record_capital_recovery(pairs * 1.0)
-                    pos.acknowledge_settlement()
-                    log.info("dry_run_pairs_merged",
-                             pairs=pairs,
-                             profit=f"${pair_profit:.4f}")
-
-                unmatched_up = pos.yes_shares - pairs
-                unmatched_down = pos.no_shares - pairs
-
-                # Always track/record the real outcome (even if flat).
-                # This is useful for analyzing market behavior and verifying the model.
-                pos_snapshot = {
-                    "yes_avg_entry": pos.yes_avg_entry,
-                    "no_avg_entry": pos.no_avg_entry,
-                    "unmatched_up": unmatched_up,
-                    "unmatched_down": unmatched_down,
-                }
-
-                # Persist a pending resolution record so the next run can finish it even if
-                # this process exits (timeout/restart).
-                sm = getattr(self.inventory, "state_manager", None)
-                if sm:
-                    try:
-                        sm.add_pending_resolution({
-                            "slug": market.slug,
-                            "asset": market.asset,
-                            "window_start_ts": int(market.window_start_ts),
-                            "market_id": market.market_id,
-                            "yes_avg_entry": pos_snapshot["yes_avg_entry"],
-                            "no_avg_entry": pos_snapshot["no_avg_entry"],
-                            "unmatched_up": pos_snapshot["unmatched_up"],
-                            "unmatched_down": pos_snapshot["unmatched_down"],
-                            "created_ts": _time.time(),
-                        })
-                    except Exception as ex:
-                        log.debug("pending_resolution_persist_failed", slug=market.slug, error=str(ex))
-
-                # Kick off background task to wait for actual resolution from Gamma API
-                asyncio.create_task(self._wait_and_settle_unmatched(market, pos_snapshot))
-
-            # Clear position from inventory state
-            self.inventory.clear_market(market.market_id)
-            
-            self.current_market = None
-
-        # Reset per-market state for next cycle
-        self.quote_engine.reset_params()
-        if not self.portfolio_pnl_getter:
-            self.risk_engine.reset_for_new_market(self.pnl.net_pnl)
+        await settle_market(self)
 
     async def _wait_and_settle_unmatched(self, market: MarketInfo, pos_snapshot: dict):
-        """Background task to poll Gamma API and wait for actual market resolution.
-        
-        Args:
-            market: MarketInfo for the expired market.
-            pos_snapshot: Frozen dict with keys: yes_avg_entry, no_avg_entry,
-                          unmatched_up, unmatched_down.
-        """
-        unmatched_up = pos_snapshot["unmatched_up"]
-        unmatched_down = pos_snapshot["unmatched_down"]
-        yes_avg = pos_snapshot["yes_avg_entry"]
-        no_avg = pos_snapshot["no_avg_entry"]
-        
-        await self._wait_and_settle_unmatched_by_fields(
-            asset=market.asset,
-            slug=market.slug,
-            window_start_ts=int(market.window_start_ts),
-            market_id=market.market_id,
-            pos_snapshot=pos_snapshot,
-        )
+        await wait_and_settle_unmatched(self, market, pos_snapshot)
 
     async def _wait_and_settle_unmatched_by_fields(self, asset: str, slug: str,
                                                    window_start_ts: int,
                                                    market_id: str,
                                                    pos_snapshot: dict):
-        """Poll Gamma until the market is inactive, then record outcome.
-
-        NOTE: We require m.active == False to avoid false positives.
-        """
-        unmatched_up = pos_snapshot["unmatched_up"]
-        unmatched_down = pos_snapshot["unmatched_down"]
-        yes_avg = pos_snapshot["yes_avg_entry"]
-        no_avg = pos_snapshot["no_avg_entry"]
-
-        log.info("waiting_for_actual_resolution", slug=slug)
-
-        while self._running:
-            await asyncio.sleep(30)
-            try:
-                m = await self.discovery._fetch_market(asset, int(window_start_ts))
-                if not m:
-                    continue
-
-                # Require actual Gamma closed/inactive/archived status to prevent
-                # volatility false positives while still supporting markets that
-                # remain active=True after close.
-                resolved = bool(getattr(m, "closed", False) or getattr(m, "archived", False) or not m.active)
-                if not resolved:
-                    continue
-
-                up = m.up_price
-                down = m.down_price
-                won_up = up >= down
-
-                winning_shares = unmatched_up if won_up else unmatched_down
-                losing_shares = unmatched_down if won_up else unmatched_up
-                winner_str = "UP" if won_up else "DOWN"
-
-                cost_of_winning = winning_shares * (yes_avg if won_up else no_avg)
-                cost_of_losing = losing_shares * (no_avg if won_up else yes_avg)
-
-                revenue = winning_shares * 1.0
-                net_profit = revenue - cost_of_winning - cost_of_losing
-
-                self.pnl.record_outcome_resolution(net_profit, market_id)
-                self.pnl.record_capital_recovery(revenue)
-
-                log.info(
-                    "dry_run_actual_resolution",
-                    slug=slug,
-                    winner=winner_str,
-                    winning_shares=winning_shares,
-                    losing_shares=losing_shares,
-                    outcome_pnl=round(net_profit, 4),
-                    pnl=f"${net_profit:.4f}",
-                )
-
-                sm = getattr(self.inventory, "state_manager", None)
-                if sm:
-                    try:
-                        sm.remove_pending_resolution(slug)
-                    except Exception as ex:
-                        log.debug("pending_resolution_remove_failed", slug=slug, error=str(ex))
-                break
-            except Exception as e:
-                log.error("wait_and_settle_error", slug=slug, error=str(e))
+        await wait_and_settle_unmatched_by_fields(
+            self, asset, slug, window_start_ts, market_id, pos_snapshot
+        )
 
     async def _find_next_market(self) -> Optional[MarketInfo]:
         """Find the next eligible market for this asset."""
@@ -2525,73 +2300,7 @@ class MarketCycler:
                                 quotes, pos, imbalance, inv_state.value)
 
     def _update_dashboard_waiting(self):
-        if not self._dashboard_cb:
-            return
-            
-        spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0)
-        price_age = (self.price_feed.get_price_age(self.ac.symbol)
-                     if hasattr(self.price_feed, "get_price_age") else 0)
-        price_source = (self.price_feed.get_price_source(self.ac.symbol)
-                        if hasattr(self.price_feed, "get_price_source") else "unknown")
-        
-        state = {
-            "asset": self.asset,
-            "market_id": "waiting...",
-            "slug": "Waiting for next Polymarket window...",
-            "question": "",
-            "start_price": 0,
-            "spot_price": spot,
-            "raw_spot": spot,
-            "chainlink_spread": 0,
-            "price_age": price_age,
-            "price_source": price_source,
-            "fair_value": 0,
-            "sigma": 0,
-            "ws_ticks": getattr(self.price_feed, "ticks", 0),
-            "phase": "WAITING",
-            "time_remaining": 0,
-            "regime": "WAITING",
-            "up_buy": 0,
-            "down_buy": 0,
-            "up_size": 0,
-            "down_size": 0,
-            "combined_cost": 0,
-            "edge": 0,
-            "up_shares": 0,
-            "down_shares": 0,
-            "up_avg": 0,
-            "down_avg": 0,
-            "share_imbalance": 0,
-            "dollar_delta": 0,
-            "matched_pairs": 0,
-            "avg_pair_cost": 0,
-            "matched_pair_pnl": 0,
-            "negative_pair_edge": False,
-            "inv_state": "WAITING",
-            "net_trading_pnl": self.pnl.net_trading_pnl,
-            "outcome_pnl": self.pnl.outcome_pnl,
-            "est_rebates": self.pnl.est_rebates,
-            "net_pnl": self.pnl.net_pnl,
-            "economic_pnl": self.pnl.economic_pnl,
-            "rebates_per_hour": self.pnl.rebates_per_hour(),
-            "total_volume": self.pnl.total_volume,
-            "total_shares": self.pnl.total_shares,
-            "markets_settled": self.pnl.markets_settled,
-            "total_fills": self.pnl.total_fills,
-            "starting_capital": getattr(self.pnl, "starting_capital", 0),
-            "current_capital": getattr(self.pnl, "current_capital", 0),
-        }
-        
-        if self.balance_monitor:
-            bm_stats = self.balance_monitor.stats
-            state["wallet_balance"] = bm_stats["last_balance"]
-            state["auto_merges"] = bm_stats["total_merges"]
-            state["auto_merged_usdc"] = bm_stats["total_merged_usdc"]
-            state["balance_warn_threshold"] = self.balance_monitor.warn_balance
-            state["balance_merge_threshold"] = self.balance_monitor.merge_balance
-            state["merge_message"] = bm_stats.get("merge_message", "")
-            
-        self._dashboard_cb(state)
+        update_dashboard_waiting(self)
 
     def _max_spot_price_age_seconds(self) -> float:
         """Allowed active spot age for live quoting.
@@ -2606,122 +2315,12 @@ class MarketCycler:
         return MAX_SPOT_PRICE_AGE_SECONDS
 
     def _dashboard_sigma_for_stale_spot(self) -> float:
-        """Best dashboard sigma when spot is stale and model updates are paused."""
-        if self.last_sigma and self.last_sigma > 0:
-            return self.last_sigma
-        try:
-            sigma = self.vol_estimator.sigma_for_model()
-            if sigma and sigma > 0:
-                return sigma
-        except Exception:
-            pass
-        return float(getattr(self.ac, "default_sigma", 0) or 0)
+        return dashboard_sigma_for_stale_spot(self)
 
     def _update_dashboard(self, market, spot, fv, sigma, phase,
                            remaining, quotes=None, pos=None,
                            delta=0, inv_state="NORMAL"):
-        """Push state to dashboard callback.
-        
-        Always fetches the real position from inventory so that
-        shares/delta display correctly even when quotes are paused
-        (e.g., regime spike, risk halt, dead zone).
-        """
-        if not self._dashboard_cb:
-            return
-
-        start_price = (self.fair_value_model.start_price
-                       if self.fair_value_model else 0)
-
-        # Local inventory keeps cost basis/P&L. In live mode, wallet/ERC1155
-        # balances are the display/position truth because CLOB fills can lag.
-        real_pos = self.inventory.get_or_create(market.market_id, self.asset)
-        real_delta = real_pos.dollar_delta(fv) if fv else 0
-        real_state = self.inventory.get_state(market.market_id, fv)
-        wallet_snapshot = getattr(self, "_wallet_truth_by_market", {}).get(market.market_id)
-        display_up_shares = real_pos.yes_shares
-        display_down_shares = real_pos.no_shares
-        display_imbalance = real_pos.share_imbalance()
-        display_matched_pairs = real_pos.matched_pairs()
-        display_delta = real_delta
-        inventory_source = "local"
-        if wallet_snapshot:
-            display_up_shares = float(wallet_snapshot.get("yes_shares", 0) or 0)
-            display_down_shares = float(wallet_snapshot.get("no_shares", 0) or 0)
-            display_imbalance = float(wallet_snapshot.get("share_imbalance", display_up_shares - display_down_shares) or 0)
-            display_matched_pairs = float(wallet_snapshot.get("matched_pairs", min(display_up_shares, display_down_shares)) or 0)
-            display_delta = (display_up_shares * fv - display_down_shares * (1 - fv)) if fv else 0
-            inventory_source = "wallet"
-
-        raw_spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, spot)
-        price_age = (self.price_feed.get_price_age(self.ac.symbol)
-                     if hasattr(self.price_feed, "get_price_age") else 0)
-        price_source = (self.price_feed.get_price_source(self.ac.symbol)
-                        if hasattr(self.price_feed, "get_price_source") else "unknown")
-        
-        state = {
-            "asset": self.asset,
-            "market_id": market.market_id,
-            "slug": market.slug,
-            "question": market.question,
-            "start_price": start_price or 0,
-            "spot_price": spot or 0,
-            "raw_spot": raw_spot or 0,
-            "chainlink_spread": getattr(self, 'chainlink_spread', 0),
-            "price_age": price_age,
-            "price_source": price_source,
-            "fair_value": fv,
-            "sigma": sigma,
-            "ws_ticks": getattr(self.price_feed, "ticks", 0),
-            "phase": phase,
-            "time_remaining": remaining,
-            "regime": self.regime_filter.regime(),
-            "up_buy": quotes.yes_buy_price if quotes else 0,
-            "down_buy": quotes.no_buy_price if quotes else 0,
-            "up_size": quotes.yes_buy_size if quotes else 0,
-            "down_size": quotes.no_buy_size if quotes else 0,
-            "combined_cost": quotes.combined_cost if quotes else 0,
-            "edge": quotes.edge_per_pair if quotes else 0,
-            # Display live wallet truth when available; keep local averages/P&L.
-            "up_shares": display_up_shares,
-            "down_shares": display_down_shares,
-            "up_avg": real_pos.yes_avg_entry,
-            "down_avg": real_pos.no_avg_entry,
-            "share_imbalance": display_imbalance,
-            "dollar_delta": display_delta,
-            "matched_pairs": display_matched_pairs,
-            "avg_pair_cost": real_pos.avg_matched_pair_cost(),
-            "matched_pair_pnl": real_pos.matched_pair_profit(),
-            "negative_pair_edge": has_negative_matched_pair_edge(real_pos),
-            "inventory_source": inventory_source,
-            "inv_state": real_state.value,
-            # P&L with rebates and outcomes
-            "net_trading_pnl": self.pnl.net_trading_pnl,
-            "outcome_pnl": self.pnl.outcome_pnl,
-            "est_rebates": self.pnl.est_rebates,
-            "net_pnl": self.pnl.net_pnl,
-            "economic_pnl": self.pnl.economic_pnl,
-            "rebates_per_hour": self.pnl.rebates_per_hour(),
-            "total_volume": self.pnl.total_volume,
-            "total_shares": self.pnl.total_shares,
-            "markets_settled": self.pnl.markets_settled,
-            "total_fills": self.pnl.total_fills,
-            "starting_capital": getattr(self.pnl, "starting_capital", 0),
-            "current_capital": getattr(self.pnl, "current_capital", 0),
-        }
-        if getattr(self, "_dashboard_event", None):
-            state.update(self._dashboard_event)
-
-        # Add balance monitor stats (live mode only)
-        if self.balance_monitor:
-            bm_stats = self.balance_monitor.stats
-            state["wallet_balance"] = bm_stats["last_balance"]
-            state["auto_merges"] = bm_stats["total_merges"]
-            state["auto_merged_usdc"] = bm_stats["total_merged_usdc"]
-            state["balance_warn_threshold"] = self.balance_monitor.warn_balance
-            state["balance_merge_threshold"] = self.balance_monitor.merge_balance
-            state["merge_message"] = bm_stats.get("merge_message", "")
-
-        self._dashboard_cb(state)
+        update_dashboard(self, market, spot, fv, sigma, phase, remaining, quotes, pos, delta, inv_state)
 
     async def stop(self):
         self._running = False
