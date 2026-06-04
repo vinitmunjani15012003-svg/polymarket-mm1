@@ -1854,66 +1854,52 @@ class MarketCycler:
                         no_size=quotes.no_buy_size,
                     )
 
-            # After capital scaling/backoff, drop any active side that fell below
-            # Polymarket's minimum order size. Dust-normalization is an atomic
-            # paired plan: if either leg is no longer valid, cancel both rather
-            # than leaving a one-sided top-up landmine.
-            quote_policy.normalize_sizes(
+            # QuotePolicy owns the post-capital quote invariants: minimum live
+            # sizes, close-only repair side enforcement, and normal-mode
+            # atomicity. MarketCycler only emits side effects for the decision.
+            post_capital_decision = quote_policy.apply_post_capital_safety(
                 quotes,
-                min_order_size,
+                min_order_size=min_order_size,
                 allow_round_up=False,
                 repair_mode=repair_mode,
-            )
-
-            # Final invariant after all capital/backoff transforms: repair mode
-            # is close-only. repair_up means Down is heavy, so quote YES only;
-            # repair_down means Up is heavy, so quote NO only.
-            quote_policy.enforce_repair_side(quotes, repair_mode)
-
-            # Normal/balanced quoting is atomic unless we intentionally entered
-            # FV-favored one-sided entry mode while flat. Capital scaling/backoff
-            # must not accidentally turn a balanced market into a one-sided bet.
-            atomic_decision = quote_policy.enforce_normal_atomicity(
-                quotes,
-                repair_mode=repair_mode,
                 abs_imbalance=abs_imbalance,
-                min_order_size=min_order_size,
                 fv_entry_side=fv_entry_side,
                 sct_entry_side=sct_entry_side,
                 merge_blocked=self._merge_unavailable_until > _time.time(),
-                reason="NORMAL_QUOTE_NOT_ATOMIC",
+                atomic_reason="NORMAL_QUOTE_NOT_ATOMIC",
             )
-            if not atomic_decision.allowed:
+            if not post_capital_decision.allowed and post_capital_decision.reason == "NORMAL_QUOTE_NOT_ATOMIC":
                 log.warning(
                     "normal_quote_blocked_not_atomic",
                     asset=self.asset,
-                    yes_size=atomic_decision.metadata.get("before", {}).get("yes_size", quotes.yes_buy_size),
-                    no_size=atomic_decision.metadata.get("before", {}).get("no_size", quotes.no_buy_size),
-                    merge_blocked=atomic_decision.metadata.get("merge_blocked", False),
+                    yes_size=post_capital_decision.metadata.get("before", {}).get("yes_size", quotes.yes_buy_size),
+                    no_size=post_capital_decision.metadata.get("before", {}).get("no_size", quotes.no_buy_size),
+                    merge_blocked=post_capital_decision.metadata.get("merge_blocked", False),
                     imbalance=round(imbalance, 4),
                 )
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
 
-        # Belt-and-suspenders atomicity check outside the guardrail try-block:
+        # Belt-and-suspenders safety check outside the guardrail try-block:
         # flat normal mode must be both-side, no-side, or an explicitly allowed
-        # FV entry. It must never accidentally leak one naked side.
-        final_atomic_decision = quote_policy.enforce_normal_atomicity(
+        # entry mode, and repair modes must remain close-only.
+        final_post_capital_decision = quote_policy.apply_post_capital_safety(
             quotes,
+            min_order_size=min_order_size,
+            allow_round_up=False,
             repair_mode=repair_mode,
             abs_imbalance=abs_imbalance,
-            min_order_size=min_order_size,
             fv_entry_side=fv_entry_side,
             sct_entry_side=sct_entry_side,
-            reason="NORMAL_QUOTE_NOT_ATOMIC_FINAL",
+            atomic_reason="NORMAL_QUOTE_NOT_ATOMIC_FINAL",
         )
-        if not final_atomic_decision.allowed:
+        if not final_post_capital_decision.allowed and final_post_capital_decision.reason == "NORMAL_QUOTE_NOT_ATOMIC_FINAL":
             log.warning(
                 "normal_quote_blocked_not_atomic_final",
                 asset=self.asset,
-                yes_size=final_atomic_decision.metadata.get("before", {}).get("yes_size", quotes.yes_buy_size),
-                no_size=final_atomic_decision.metadata.get("before", {}).get("no_size", quotes.no_buy_size),
+                yes_size=final_post_capital_decision.metadata.get("before", {}).get("yes_size", quotes.yes_buy_size),
+                no_size=final_post_capital_decision.metadata.get("before", {}).get("no_size", quotes.no_buy_size),
                 imbalance=round(imbalance, 4),
             )
 
@@ -2007,9 +1993,8 @@ class MarketCycler:
                     return
 
         # Absolute post-generation invariant: if inventory is already imbalanced
-        # by at least one live-min order, do not quote the heavy side. This is a
-        # final backstop against quote-engine/capital transforms reintroducing
-        # the side we are trying to stop buying.
+        # by at least one live-min order, QuotePolicy blocks the heavy side
+        # before pair-cost caps are computed for the remaining repair quote.
         heavy_side_decision = quote_policy.enforce_inventory_heavy_side(
             quotes,
             pos.share_imbalance(),
@@ -2043,9 +2028,7 @@ class MarketCycler:
             sct_saved_cap = None
             sct_guard_source = "fifo"
             if sct_opening_spent:
-                is_sct_repair_side = (repair_mode == f"repair_{side_label}"
-                                      or (side_label == "yes" and repair_mode == "repair_up")
-                                      or (side_label == "no" and repair_mode == "repair_down"))
+                is_sct_repair_side = quote_policy.is_repair_side(side_label, repair_mode)
                 if is_sct_repair_side:
                     sct_state_for_cap = self._small_capital_state(market.market_id)
                     emergency_cap, emergency_active, emergency_elapsed = self._small_capital_emergency_hedge_cap(
@@ -2151,7 +2134,14 @@ class MarketCycler:
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
             return
 
-        final_quote_decision = quote_policy.validate_final(quotes, max_combined_cost=MAX_COMBINED_COST)
+        final_quote_decision = quote_policy.apply_final_inventory_safety(
+            quotes,
+            imbalance=pos.share_imbalance(),
+            min_order_size=min_order_size,
+            repair_mode=repair_mode,
+            max_combined_cost=MAX_COMBINED_COST,
+        )
+        repair_mode = final_quote_decision.metadata.get("repair_mode", repair_mode)
         if not final_quote_decision.allowed:
             log.warning(
                 "final_quote_validation_failed",
@@ -2160,6 +2150,17 @@ class MarketCycler:
                 **final_quote_decision.metadata,
             )
             self._set_dashboard_event("skip", final_quote_decision.reason, str(final_quote_decision.metadata)[:160])
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
+        quotes.combined_cost = round(
+            (float(quotes.yes_buy_price or 0) if quotes.yes_buy_size else 0.0)
+            + (float(quotes.no_buy_price or 0) if quotes.no_buy_size else 0.0),
+            4,
+        )
+        quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
+        if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
+            self._set_dashboard_event("skip", "NO_QUOTES", halt_reason if is_halted else phase)
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
             return
