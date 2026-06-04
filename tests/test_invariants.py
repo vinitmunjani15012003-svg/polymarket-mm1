@@ -18,6 +18,7 @@ from src.orchestration.market_cycler import (
     aggressive_repair_price,
     apply_dust_price_guardrails,
     apply_fv_favored_entry_mode,
+    apply_fast_feed_confidence_floor,
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     blended_fair_value,
@@ -155,6 +156,54 @@ def test_blended_fair_value_missing_book_tempers_to_neutral():
     final_fv = blended_fair_value(0.90, None, confidence)
 
     assert 0.50 < final_fv < 0.60
+
+
+def test_exness_fast_feed_confidence_floor_reduces_fv_lag_on_real_move():
+    base_conf = fv_model_confidence(0.60, elapsed_fraction=0.05, standardized_move=0.30, market_fv=0.50)
+    fast_conf = apply_fast_feed_confidence_floor(base_conf, "exness_mt5", standardized_move=0.30)
+
+    assert fast_conf >= 0.65
+    assert blended_fair_value(0.60, 0.50, fast_conf) > blended_fair_value(0.60, 0.50, base_conf)
+
+
+def test_non_exness_confidence_floor_is_unchanged():
+    base_conf = fv_model_confidence(0.60, elapsed_fraction=0.05, standardized_move=0.30, market_fv=0.50)
+
+    assert apply_fast_feed_confidence_floor(base_conf, "aggTrade", standardized_move=0.30) == base_conf
+
+
+def test_fast_adverse_cancel_removes_active_bid_before_requote_path():
+    import asyncio
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.cancelled = []
+            self.active = SimpleNamespace(
+                yes_order_id="OID-YES",
+                yes_price=0.54,
+                no_order_id=None,
+                no_price=None,
+            )
+
+        def get_active(self, market_id):
+            return self.active
+
+        async def cancel_side_quotes(self, market_id, side, token_id):
+            self.cancelled.append((market_id, side, token_id))
+            if side == "yes":
+                self.active.yes_order_id = None
+            return True
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.order_mgr = FakeOrderManager()
+    cycler.current_market = True
+    market = SimpleNamespace(market_id="M1", token_id_up="UP", token_id_down="DOWN")
+
+    cancelled = asyncio.run(cycler._cancel_fast_adverse_active_quotes(market, fast_fv=0.55, min_edge=0.02))
+
+    assert cancelled is True
+    assert cycler.order_mgr.cancelled == [("M1", "yes", "UP")]
 
 
 def test_vatic_strike_remains_price_to_beat_even_when_market_model_disagrees():

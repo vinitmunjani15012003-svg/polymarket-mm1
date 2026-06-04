@@ -48,7 +48,7 @@ class OrderManager:
 
     def __init__(self, executor, reprice_threshold: float = 0.005,
                  min_update_interval: float = 0.0,
-                 crossed_bid_grace_seconds: float = 0.6,
+                 crossed_bid_grace_seconds: float = 0.0,
                  repair_crossed_bid_grace_seconds: float = 1.0):
         """
         Args:
@@ -74,9 +74,9 @@ class OrderManager:
         # the order we need filled and leaves one-sided inventory into expiry.
         self.repair_reprice_threshold = max(0.05, reprice_threshold)
         self.repair_min_update_interval = max(10.0, min_update_interval)
-        # BUY maker orders that touch/cross the best ask are often exactly the
-        # orders about to fill. Do not immediately cancel and chase lower; give
-        # CLOB fill/order-state propagation a short chance to catch up first.
+        # Normal BUY maker orders that touch/cross the best ask are adverse-risk
+        # candidates; cancel immediately. Repair quotes can still use a short
+        # grace to avoid cancelling the one order that may flatten inventory.
         self.crossed_bid_grace_seconds = max(0.0, crossed_bid_grace_seconds)
         self.repair_crossed_bid_grace_seconds = max(
             self.crossed_bid_grace_seconds,

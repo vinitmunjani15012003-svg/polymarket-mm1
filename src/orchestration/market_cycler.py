@@ -69,6 +69,16 @@ FV_HARD_DISAGREEMENT = 0.15
 # spot move. Keep that market input diagnostic, but cap small tail pulls.
 FV_TAIL_BLEND_GUARD = 0.10
 FV_TAIL_MAX_MARKET_PULL = 0.02
+# Exness/MT5 is the fastest oracle input we have. During real spot moves,
+# blending too heavily toward Polymarket's own book makes FV lag exactly when
+# adverse selection risk is highest.
+FAST_FEED_CONFIDENCE_MOVE_THRESHOLD = 0.20
+FAST_FEED_CONFIDENCE_STRONG_MOVE_THRESHOLD = 0.45
+FAST_FEED_CONFIDENCE_FLOOR = 0.65
+FAST_FEED_CONFIDENCE_STRONG_FLOOR = 0.85
+# Cancel resting BUYs as soon as the raw fast-feed model no longer gives enough
+# edge versus our active bid. This runs before book fetch/requote work.
+FAST_ADVERSE_CANCEL_MIN_EDGE = 0.02
 
 
 def clamp_probability(value: float, lo: float = 0.01, hi: float = 0.99) -> float:
@@ -101,6 +111,21 @@ def fv_model_confidence(model_fv: float,
     if market_fv is not None and abs(clamp_probability(model_fv) - clamp_probability(market_fv)) >= FV_HARD_DISAGREEMENT:
         confidence = min(confidence, FV_DISAGREEMENT_CONFIDENCE_CAP)
     return max(0.0, min(1.0, confidence))
+
+
+def apply_fast_feed_confidence_floor(confidence: float,
+                                     price_source: str,
+                                     standardized_move: float) -> float:
+    """Trust Exness/MT5 more during real moves so FV does not lag the book."""
+    conf = max(0.0, min(1.0, float(confidence or 0.0)))
+    if price_source != "exness_mt5":
+        return conf
+    move = max(0.0, float(standardized_move or 0.0))
+    if move >= FAST_FEED_CONFIDENCE_STRONG_MOVE_THRESHOLD:
+        return max(conf, FAST_FEED_CONFIDENCE_STRONG_FLOOR)
+    if move >= FAST_FEED_CONFIDENCE_MOVE_THRESHOLD:
+        return max(conf, FAST_FEED_CONFIDENCE_FLOOR)
+    return conf
 
 
 def spot_from_binary_probability(start_price: float,
@@ -1067,6 +1092,64 @@ class MarketCycler:
 
     def _small_capital_opening_spent(self, state: dict) -> bool:
         return bool(state.get("opening_attempt_spent") or state.get("quote_cycle_started"))
+
+    async def _cancel_fast_adverse_active_quotes(self, market: MarketInfo, fast_fv: float,
+                                                min_edge: float = FAST_ADVERSE_CANCEL_MIN_EDGE) -> bool:
+        """Cancel active bids immediately when fast-feed FV removes their edge.
+
+        This is intentionally earlier than the normal cancel/reprice path. The
+        normal path waits for book fetch + quote generation and can defer
+        touched/crossed bids; adverse-selection protection should not wait.
+        """
+        if not self.current_market or market is None:
+            return False
+        active = self.order_mgr.get_active(market.market_id)
+        fv = max(0.0, min(1.0, float(fast_fv or 0.5)))
+        min_edge = max(0.0, float(min_edge or 0.0))
+        cancelled = False
+
+        yes_price = float(active.yes_price or 0.0)
+        if active.yes_order_id and yes_price > 0 and (fv - yes_price) < min_edge:
+            log.warning(
+                "fast_adverse_yes_cancel",
+                asset=self.asset,
+                market=market.market_id[:8],
+                fast_fv=round(fv, 4),
+                active_price=round(yes_price, 4),
+                edge=round(fv - yes_price, 4),
+                min_edge=round(min_edge, 4),
+            )
+            ok = bool(await self.order_mgr.cancel_side_quotes(
+                market.market_id, "yes", market.token_id_up
+            ))
+            if not ok:
+                self.stop_reason = "fast_adverse_yes_cancel_failed"
+                self._running = False
+                return True
+            cancelled = True
+
+        no_price = float(active.no_price or 0.0)
+        no_fair = 1.0 - fv
+        if active.no_order_id and no_price > 0 and (no_fair - no_price) < min_edge:
+            log.warning(
+                "fast_adverse_no_cancel",
+                asset=self.asset,
+                market=market.market_id[:8],
+                fast_fv=round(fv, 4),
+                active_price=round(no_price, 4),
+                edge=round(no_fair - no_price, 4),
+                min_edge=round(min_edge, 4),
+            )
+            ok = bool(await self.order_mgr.cancel_side_quotes(
+                market.market_id, "no", market.token_id_down
+            ))
+            if not ok:
+                self.stop_reason = "fast_adverse_no_cancel_failed"
+                self._running = False
+                return True
+            cancelled = True
+
+        return cancelled
 
     async def _small_capital_fail_closed_before_quotes(self, market: MarketInfo, pos, wallet_snapshot: dict | None, fv: float, sigma: float, remaining: float) -> bool:
         """Block all opening quote generation after small-cap opening is spent.
@@ -2120,6 +2203,13 @@ class MarketCycler:
         total_window = max(1.0, self.fair_value_model.resolve_ts - self.fair_value_model.event_start_ts)
         elapsed_fraction = max(0.0, min(1.0, (now - self.fair_value_model.event_start_ts) / total_window))
 
+        if price_source == "exness_mt5":
+            fast_model_fv = self.fair_value_model.fair_value(spot, sigma, now, update_state=False)
+            if await self._cancel_fast_adverse_active_quotes(market, fast_model_fv):
+                self._set_dashboard_event("skip", "FAST_ADVERSE_CANCEL", "fast Exness FV removed active quote edge")
+                self._update_dashboard(market, spot, fast_model_fv, sigma, "FAST_ADVERSE_CANCEL", remaining)
+                return
+
         # Fetch Polymarket books early so every dashboard/early-return path uses
         # the same authoritative blended FV. Previously, early returns displayed
         # raw/model FV while the UI/book price was already far away (e.g. UP 15c
@@ -2185,6 +2275,11 @@ class MarketCycler:
             elapsed_fraction,
             standardized_move,
             polymarket_mid_up,
+        )
+        model_confidence = apply_fast_feed_confidence_floor(
+            model_confidence,
+            price_source,
+            standardized_move,
         )
         fv = blended_fair_value(model_fv, polymarket_mid_up, model_confidence)
         self.last_fair_value = fv
