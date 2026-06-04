@@ -14,7 +14,6 @@ from src.strategy.quote_engine import QuoteResult
 from src.execution.order_state import ActiveQuotes
 from src.execution.repricing import RepricePolicy, is_crossed_buy
 from src.monitoring.logger import get_logger
-from src.core.models.orders import OrderState
 from src.services.execution.cancel_manager import CancelManager
 from src.services.execution.order_intents import attach_place_intent, next_quote_version
 from src.services.execution.order_submitter import OrderSubmitter
@@ -123,14 +122,14 @@ class OrderManager:
         yes_repair_side = repair_mode == "repair_up"
         no_repair_side = repair_mode == "repair_down"
 
-        yes_needs, yes_urgent = self._reprice_decision(
+        yes_needs, yes_urgent = self.reprice_policy.decision(
             active.yes_price, quotes.yes_buy_price,
             active.yes_size, quotes.yes_buy_size,
             yes_book_snapshot,
             sticky_repair=yes_repair_side,
         )
 
-        no_needs, no_urgent = self._reprice_decision(
+        no_needs, no_urgent = self.reprice_policy.decision(
             active.no_price, quotes.no_buy_price,
             active.no_size, quotes.no_buy_size,
             no_book_snapshot,
@@ -159,25 +158,27 @@ class OrderManager:
         cancel_yes = bool(yes_needs and active.yes_order_id)
         cancel_no = bool(no_needs and active.no_order_id)
 
-        if cancel_yes and self._is_crossed_buy(active.yes_price, yes_book_snapshot):
-            deferred = await self._maybe_defer_crossed_bid_cancel(
+        if cancel_yes and is_crossed_buy(active.yes_price, yes_book_snapshot):
+            deferred = await self.cancel_manager.crossed_bid_cancel_should_defer(
                 market_id=market_id,
                 side="yes",
                 order_id=active.yes_order_id,
-                active=active,
+                grace_seconds=self._crossed_bid_grace(yes_repair_side),
                 sticky_repair=yes_repair_side,
+                clear_active_side=lambda: self._clear_active_side(active, "yes"),
             )
             if deferred:
                 cancel_yes = False
                 yes_needs = False
 
-        if cancel_no and self._is_crossed_buy(active.no_price, no_book_snapshot):
-            deferred = await self._maybe_defer_crossed_bid_cancel(
+        if cancel_no and is_crossed_buy(active.no_price, no_book_snapshot):
+            deferred = await self.cancel_manager.crossed_bid_cancel_should_defer(
                 market_id=market_id,
                 side="no",
                 order_id=active.no_order_id,
-                active=active,
+                grace_seconds=self._crossed_bid_grace(no_repair_side),
                 sticky_repair=no_repair_side,
+                clear_active_side=lambda: self._clear_active_side(active, "no"),
             )
             if deferred:
                 cancel_no = False
@@ -385,16 +386,6 @@ class OrderManager:
             self.last_order_error = "cancel_all_failed"
         return ok
 
-    async def _place_buy(self, token_id: str, price: float,
-                          size: float, side: str,
-                          book_snapshot=None) -> Optional[str]:
-        """
-        Place a BUY order. This is the single enforcement point.
-        """
-        return await self.order_submitter.place_buy(
-            token_id, price, size, side=side, book_snapshot=book_snapshot
-        )
-
     def _advance_quote_version(self, market_id: str) -> int:
         version = next_quote_version(self._quote_versions.get(market_id, 0))
         self._quote_versions[market_id] = version
@@ -402,24 +393,7 @@ class OrderManager:
 
     async def _place_buys(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Place one or more BUY orders, using executor batch API when available."""
-        filtered = []
-        skipped: dict[str, Optional[str]] = {}
-        intents_by_side = {}
-        for order in orders:
-            intent = order.get("intent")
-            side = str(order.get("side", ""))
-            if intent is not None:
-                if not self.order_tracker.should_submit(intent):
-                    skipped[side] = None
-                    log.warning(
-                        "duplicate_order_intent_suppressed",
-                        market=intent.market_id[:8],
-                        side=intent.side,
-                        quote_version=intent.quote_version,
-                    )
-                    continue
-                intents_by_side[side] = intent
-            filtered.append(order)
+        filtered, skipped, intents_by_side = self.order_tracker.claim_place_orders(orders)
 
         if not filtered:
             return skipped
@@ -427,76 +401,21 @@ class OrderManager:
         try:
             placed = await self.order_submitter.place_buys(filtered)
         except Exception as exc:
-            for intent in intents_by_side.values():
-                self.order_tracker.mark_rejected(intent)
+            failed = self.order_tracker.mark_submission_exception(intents_by_side)
             log.error(
                 "order_placement_failed",
                 error=str(exc),
                 sides=list(intents_by_side),
             )
             self.last_order_error = "order_placement_failed"
-            return {**skipped, **{side: None for side in intents_by_side}}
+            return {**skipped, **failed}
 
-        for side in intents_by_side:
-            if side not in placed:
-                placed[side] = None
-
-        for side, order_id in placed.items():
-            intent = intents_by_side.get(side)
-            if intent is None:
-                continue
-            if order_id:
-                self.order_tracker.mark_order(OrderState(
-                    order_id=order_id,
-                    intent_id=intent.intent_id,
-                    market_id=intent.market_id,
-                    side=intent.side,
-                    price=intent.price,
-                    size=intent.size,
-                    status="open",
-                    updated_ts=time.time(),
-                    metadata={"quote_version": intent.quote_version, "token_id": intent.token_id},
-                ))
-            else:
-                self.order_tracker.mark_rejected(intent)
-                self.last_order_error = "order_placement_failed"
+        if self.order_tracker.record_submission_results(placed, intents_by_side):
+            self.last_order_error = "order_placement_failed"
         return {**skipped, **placed}
 
-    def _needs_reprice(self, existing_price: Optional[float],
-                       new_price: Optional[float],
-                       existing_size: int,
-                       new_size: int) -> bool:
-        """Compatibility wrapper around RepricePolicy."""
-        return self.reprice_policy.needs_reprice(
-            existing_price,
-            new_price,
-            existing_size,
-            new_size,
-        )
-
-    def _reprice_decision(self, existing_price: Optional[float],
-                          new_price: Optional[float],
-                          existing_size: int,
-                          new_size: int,
-                          book_snapshot=None,
-                          sticky_repair: bool = False) -> tuple[bool, bool]:
-        """Return (needs_reprice, urgent). Compatibility wrapper around RepricePolicy."""
-        return self.reprice_policy.decision(
-            existing_price,
-            new_price,
-            existing_size,
-            new_size,
-            book_snapshot=book_snapshot,
-            sticky_repair=sticky_repair,
-        )
-
-    @staticmethod
-    def _is_crossed_buy(existing_price: Optional[float], book_snapshot=None) -> bool:
-        return is_crossed_buy(existing_price, book_snapshot)
-
-    async def _order_still_open(self, order_id: str) -> bool:
-        """Compatibility wrapper around CancelManager open-state check."""
-        return await self.cancel_manager.order_still_open(order_id)
+    def _crossed_bid_grace(self, sticky_repair: bool) -> float:
+        return self.repair_crossed_bid_grace_seconds if sticky_repair else self.crossed_bid_grace_seconds
 
     def _clear_active_side(self, active: ActiveQuotes, side: str):
         if side == "yes":
@@ -507,28 +426,6 @@ class OrderManager:
             active.no_order_id = None
             active.no_price = None
             active.no_size = 0
-
-    async def _maybe_defer_crossed_bid_cancel(self, market_id: str, side: str,
-                                              order_id: str,
-                                              active: ActiveQuotes,
-                                              sticky_repair: bool) -> bool:
-        """Return True when the caller should skip cancel/repost this cycle.
-
-        A BUY maker bid at/above best ask is ambiguous: it may be stale, but it
-        may also be filled or partially filled while local state lags. We first
-        check whether the order still exists, then wait a short grace window and
-        check again. If it disappeared, avoid cancel/repost so the next
-        pre-quote fill sync can update inventory before new exposure is placed.
-        """
-        grace = self.repair_crossed_bid_grace_seconds if sticky_repair else self.crossed_bid_grace_seconds
-        return await self.cancel_manager.crossed_bid_cancel_should_defer(
-            market_id=market_id,
-            side=side,
-            order_id=order_id,
-            grace_seconds=grace,
-            sticky_repair=sticky_repair,
-            clear_active_side=lambda: self._clear_active_side(active, side),
-        )
 
     def check_stale_quotes(self, market_id: str,
                             yes_book=None, no_book=None) -> bool:
