@@ -33,3 +33,23 @@ class RepairPlan:
     mode: str = "flat"
     reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class RepairPriceCapDecision:
+    cap: float
+    source: str = "fifo"
+    min_edge: float = 0.0
+    blocked: bool = False
+    reason: str = "OK"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class MatchedPairEdgeStatus:
+    triggered: bool = False
+    matched_pairs: float = 0.0
+    pair_pnl: float = 0.0
+    tolerance: float = 0.005
+    reason: str = "OK"
+    metadata: dict[str, Any] = field(default_factory=dict)
