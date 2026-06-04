@@ -12,6 +12,7 @@ import inspect
 from typing import Optional
 
 from src.core.models.orders import OrderIntent
+from src.services.execution.order_intents import strip_execution_metadata
 
 
 class OrderSubmitter:
@@ -46,11 +47,12 @@ class OrderSubmitter:
         return await self.executor.place_buy_order(token_id, price, size)
 
     async def place_buys(self, orders: list[dict]) -> dict[str, Optional[str]]:
+        executor_orders = [strip_execution_metadata(order) for order in orders]
         if hasattr(self.executor, "place_buy_orders"):
-            return await self.executor.place_buy_orders(orders)
+            return await self.executor.place_buy_orders(executor_orders)
 
         placed: dict[str, Optional[str]] = {}
-        for order in orders:
+        for order in executor_orders:
             placed[order["side"]] = await self.place_buy(
                 order["token_id"],
                 order["price"],
