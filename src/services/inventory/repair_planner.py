@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from src.core.models.inventory import RepairPlan
+
 MIN_LIVE_PAIR_EDGE = 0.02
 
 
@@ -25,6 +27,47 @@ def compute_inventory_repair_sizes(imbalance: float,
     if imbalance > 0:
         return 0, repair_size, "repair_down"
     return repair_size, 0, "repair_up"
+
+
+def plan_inventory_repair(imbalance: float,
+                          min_order_size: int,
+                          max_order_size: int,
+                          *,
+                          fair_value: float | None = None,
+                          fv_aware: bool = False) -> RepairPlan:
+    """Return an explicit repair plan for callers that need metadata.
+
+    This wraps the legacy tuple helpers without changing their sizing semantics.
+    """
+    if fv_aware and fair_value is not None:
+        yes_size, no_size, mode = compute_fv_aware_dust_repair_sizes(
+            imbalance, fair_value, min_order_size, max_order_size
+        )
+    else:
+        yes_size, no_size, mode = compute_inventory_repair_sizes(
+            imbalance, min_order_size, max_order_size
+        )
+    if mode == "flat":
+        reason = "FLAT"
+    elif mode.startswith("dust_hold"):
+        reason = "DUST_HOLD"
+    elif abs(float(imbalance or 0.0)) < max(1, int(min_order_size or 1)):
+        reason = "SUB_MINIMUM_TAIL"
+    else:
+        reason = "IMBALANCE_REPAIR"
+    return RepairPlan(
+        yes_size=yes_size,
+        no_size=no_size,
+        mode=mode,
+        reason=reason,
+        metadata={
+            "imbalance": float(imbalance or 0.0),
+            "min_order_size": max(1, int(min_order_size or 1)),
+            "max_order_size": max(max(1, int(min_order_size or 1)), int(max_order_size or min_order_size or 1)),
+            "fair_value": fair_value,
+            "fv_aware": fv_aware,
+        },
+    )
 
 
 def compute_fv_aware_dust_repair_sizes(imbalance: float,
