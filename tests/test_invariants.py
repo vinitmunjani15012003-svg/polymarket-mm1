@@ -22,6 +22,7 @@ from src.orchestration.market_cycler import (
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     blended_fair_value,
+    cap_fair_value_to_market,
     fv_model_confidence,
     has_negative_matched_pair_edge,
     polymarket_implied_up_mid,
@@ -156,6 +157,12 @@ def test_blended_fair_value_missing_book_tempers_to_neutral():
     final_fv = blended_fair_value(0.90, None, confidence)
 
     assert 0.50 < final_fv < 0.60
+
+
+def test_trading_fair_value_is_capped_near_polymarket_price_when_model_is_optimistic():
+    assert cap_fair_value_to_market(0.75, 0.60, max_deviation=0.06) == pytest.approx(0.66)
+    assert cap_fair_value_to_market(0.45, 0.60, max_deviation=0.06) == pytest.approx(0.54)
+    assert cap_fair_value_to_market(0.63, 0.60, max_deviation=0.06) == pytest.approx(0.63)
 
 
 def test_exness_fast_feed_confidence_floor_reduces_fv_lag_on_real_move():
@@ -1056,10 +1063,10 @@ def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     assert feed.get_price_source("BTCUSDT") == "bookTicker"
 
 
-def test_exness_spot_age_uses_mt5_stale_tolerance():
+def test_exness_spot_age_fails_closed_faster_than_bridge_stale_tolerance():
     cycler = MarketCycler.__new__(MarketCycler)
     cycler.price_feed = SimpleNamespace(mt5_bridge_url="http://bridge:8765", mt5_bridge_stale_seconds=15.0)
-    assert cycler._max_spot_price_age_seconds() == pytest.approx(15.0)
+    assert cycler._max_spot_price_age_seconds() == pytest.approx(1.0)
 
     cycler.price_feed = SimpleNamespace(mt5_bridge_url="", mt5_bridge_stale_seconds=15.0)
     assert cycler._max_spot_price_age_seconds() == pytest.approx(3.0)

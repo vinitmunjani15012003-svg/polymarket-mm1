@@ -11,33 +11,13 @@ import asyncio
 import inspect
 import time
 from typing import Optional
-from dataclasses import dataclass
 
 from src.strategy.quote_engine import QuoteResult
+from src.execution.order_state import ActiveQuotes, order_token_id as _order_token_id
+from src.execution.repricing import RepricePolicy, is_crossed_buy
 from src.monitoring.logger import get_logger
 
 log = get_logger("order_manager")
-
-
-@dataclass
-class ActiveQuotes:
-    """Currently active quotes for a market."""
-    yes_order_id: Optional[str] = None
-    no_order_id: Optional[str] = None
-    yes_price: Optional[float] = None
-    no_price: Optional[float] = None
-    yes_size: int = 0
-    no_size: int = 0
-    last_update: float = 0.0
-
-
-def _order_token_id(info) -> str:
-    """Return an order token id from live dicts or dry-run order objects."""
-    if info is None:
-        return ""
-    if isinstance(info, dict):
-        return str(info.get("token_id") or info.get("asset_id") or "")
-    return str(getattr(info, "token_id", "") or getattr(info, "asset_id", "") or "")
 
 
 class OrderManager:
@@ -73,6 +53,10 @@ class OrderManager:
         # to earn queue priority. Chasing every FV/book wiggle cancels exactly
         # the order we need filled and leaves one-sided inventory into expiry.
         self.repair_reprice_threshold = max(0.05, reprice_threshold)
+        self.reprice_policy = RepricePolicy(
+            reprice_threshold=self.reprice_threshold,
+            repair_reprice_threshold=self.repair_reprice_threshold,
+        )
         self.repair_min_update_interval = max(10.0, min_update_interval)
         # Normal BUY maker orders that touch/cross the best ask are adverse-risk
         # candidates; cancel immediately. Repair quotes can still use a short
@@ -452,31 +436,13 @@ class OrderManager:
                        new_price: Optional[float],
                        existing_size: int,
                        new_size: int) -> bool:
-        """Check if a quote needs to be repriced.
-
-        Uses >= (not >) so that half-cent changes trigger repricing in a
-        1-cent tick market.  Also reprices on significant size changes in
-        EITHER direction — stale large orders accumulate adverse fills.
-        """
-        # Always reprice if no existing quote
-        if existing_price is None:
-            return new_price is not None and new_size > 0
-
-        # Remove quote if new is None or zero size
-        if new_price is None or new_size <= 0:
-            return True
-
-        # Reprice if price moved more than threshold (>= not >)
-        if abs(new_price - existing_price) >= self.reprice_threshold:
-            return True
-
-        # Reprice on significant size change in EITHER direction (>50%)
-        if existing_size > 0:
-            ratio = new_size / existing_size
-            if ratio < 0.5 or ratio > 1.5:
-                return True
-
-        return False
+        """Compatibility wrapper around RepricePolicy."""
+        return self.reprice_policy.needs_reprice(
+            existing_price,
+            new_price,
+            existing_size,
+            new_size,
+        )
 
     def _reprice_decision(self, existing_price: Optional[float],
                           new_price: Optional[float],
@@ -484,56 +450,19 @@ class OrderManager:
                           new_size: int,
                           book_snapshot=None,
                           sticky_repair: bool = False) -> tuple[bool, bool]:
-        """Return (needs_reprice, urgent)."""
-        # Always place if no existing quote; not urgent because there is no
-        # stale risk, but no cooldown applies before first placement anyway.
-        if existing_price is None:
-            return (new_price is not None and new_size > 0), False
-
-        # Remove quote if new is None or zero size. This is urgent because a
-        # risk phase/capital guard decided the quote should not exist.
-        if new_price is None or new_size <= 0:
-            return True, True
-
-        # If our BUY bid crosses/touches best ask, it needs attention, but the
-        # async update path confirms exchange state and applies a short grace
-        # before actually cancelling. A crossed maker bid may be in-flight fill.
-        if book_snapshot is not None and existing_price >= book_snapshot.best_ask:
-            return True, True
-
-        price_delta = new_price - existing_price
-
-        if sticky_repair:
-            # In repair mode, queue priority is the product. Keep the existing
-            # light-side bid resting unless it is dangerously stale. Small FV
-            # wiggles should not cancel the only order that can flatten us.
-            if abs(price_delta) > self.repair_reprice_threshold:
-                return True, price_delta < 0
-            if existing_size > 0 and new_size > existing_size * 2.0:
-                return True, False
-            return False, False
-
-        if abs(price_delta) > self.reprice_threshold:
-            # Lowering a BUY bid reduces adverse selection / overpaying risk.
-            # Raising a BUY bid is just chasing/improving and can be throttled.
-            return True, price_delta < 0
-
-        # To preserve queue position, DO NOT reprice if size merely decreases.
-        # Only reprice if we need significantly MORE size (>50% increase), and
-        # treat that as non-urgent so it can be rate-limited.
-        if existing_size > 0 and new_size > existing_size * 1.5:
-            return True, False
-
-        return False, False
+        """Return (needs_reprice, urgent). Compatibility wrapper around RepricePolicy."""
+        return self.reprice_policy.decision(
+            existing_price,
+            new_price,
+            existing_size,
+            new_size,
+            book_snapshot=book_snapshot,
+            sticky_repair=sticky_repair,
+        )
 
     @staticmethod
     def _is_crossed_buy(existing_price: Optional[float], book_snapshot=None) -> bool:
-        if existing_price is None or book_snapshot is None:
-            return False
-        best_ask = getattr(book_snapshot, "best_ask", None)
-        if best_ask is None or best_ask <= 0:
-            return False
-        return existing_price >= best_ask
+        return is_crossed_buy(existing_price, book_snapshot)
 
     async def _order_still_open(self, order_id: str) -> bool:
         """Best-effort exchange/local check for whether an order is still open."""

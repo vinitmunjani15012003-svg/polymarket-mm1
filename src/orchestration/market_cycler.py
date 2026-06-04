@@ -32,557 +32,47 @@ from src.monitoring.logger import get_logger
 
 log = get_logger("market_cycler")
 
-# Live repair must leave a real buffer. One cent was too thin after tick
-# rounding, CLOB/API price normalization, and partial fill sequencing; live
-# pairs repeatedly landed at/above 1.00. Two cents is still tight, but stops the
-# bot from recycling capital into guaranteed-loss pairs.
-MIN_LIVE_PAIR_EDGE = 0.02
+# Roadmap extraction: strategy helpers now live in service packages.  They are
+# imported here for backward compatibility with existing tests/callers while
+# MarketCycler is gradually reduced to lifecycle orchestration.
 PRE_EXPIRY_AUTO_MERGE_SECONDS = 120
 
-# When flat and the model has a meaningful directional lean, enter on the side
-# favored by fair value first, then let the existing inventory-repair path quote
-# only the opposite side after a fill. This avoids opening with the adverse/cheap
-# side just because both sides are atomically quotable.
-# In live flat entry, never rest both sides at once. Pick the side with
-# stronger model edge first, then let close-only repair quote the complement
-# after that leg fills. A neutral tie is held flat instead of opening inventory.
-FV_FAVORED_ENTRY_THRESHOLD = 0.50
-FV_FAVORED_ENTRY_MIN_EDGE = 0.0
-FV_FAVORED_ENTRY_MAX_SIZE = 5
-FV_FAVORED_ENTRY_STOP_SECONDS = 600
-
-# Live FV safety. If the external spot feed is stale, all model prices are
-# suspect; remove active quotes rather than trading on frozen FV. The basis guard
-# compares model P(Up) against Polymarket's current implied P(Up); a large gap
-# means the Binance→Chainlink fixed-spread assumption is probably drifting.
-MAX_SPOT_PRICE_AGE_SECONDS = 3.0
-BASIS_GUARD_MAX_FV_DEVIATION = 0.12
-# FV blending: the raw sigma model is useful but too jumpy by itself early in
-# 15m windows. Blend it with Polymarket-implied probability when books are
-# available, and otherwise temper model confidence by elapsed time + move size.
-FV_MIN_MODEL_CONFIDENCE = 0.10
-FV_MAX_MODEL_CONFIDENCE = 0.85
-FV_DISAGREEMENT_CONFIDENCE_CAP = 0.05
-FV_HARD_DISAGREEMENT = 0.15
-# When the sigma model is already deep in the tail, a thin/noisy Polymarket
-# book can briefly pull FV back toward neutral (e.g. 0.05 -> 0.12) even with no
-# spot move. Keep that market input diagnostic, but cap small tail pulls.
-FV_TAIL_BLEND_GUARD = 0.10
-FV_TAIL_MAX_MARKET_PULL = 0.02
-# Exness/MT5 is the fastest oracle input we have. During real spot moves,
-# blending too heavily toward Polymarket's own book makes FV lag exactly when
-# adverse selection risk is highest.
-FAST_FEED_CONFIDENCE_MOVE_THRESHOLD = 0.20
-FAST_FEED_CONFIDENCE_STRONG_MOVE_THRESHOLD = 0.45
-FAST_FEED_CONFIDENCE_FLOOR = 0.65
-FAST_FEED_CONFIDENCE_STRONG_FLOOR = 0.85
-# Cancel resting BUYs as soon as the raw fast-feed model no longer gives enough
-# edge versus our active bid. This runs before book fetch/requote work.
-FAST_ADVERSE_CANCEL_MIN_EDGE = 0.02
-
-
-def clamp_probability(value: float, lo: float = 0.01, hi: float = 0.99) -> float:
-    try:
-        return max(lo, min(hi, float(value)))
-    except Exception:
-        return 0.50
-
-
-def fv_model_confidence(model_fv: float,
-                        elapsed_fraction: float,
-                        standardized_move: float,
-                        market_fv: Optional[float] = None,
-                        min_confidence: float = FV_MIN_MODEL_CONFIDENCE,
-                        max_confidence: float = FV_MAX_MODEL_CONFIDENCE) -> float:
-    """Confidence weight for raw model FV in a 15m binary window.
-
-    Edge cases:
-    - first seconds: stay near market/neutral
-    - large standardized move: trust model more
-    - hard model-vs-market disagreement: cap confidence, don't blindly follow it
-    """
-    elapsed = max(0.0, min(1.0, float(elapsed_fraction or 0.0)))
-    move = max(0.0, float(standardized_move or 0.0))
-    time_component = 0.60 * (elapsed ** 0.75)
-    move_component = 0.25 * min(1.0, move / 1.5)
-    confidence = min_confidence + time_component + move_component
-    confidence = max(min_confidence, min(max_confidence, confidence))
-
-    if market_fv is not None and abs(clamp_probability(model_fv) - clamp_probability(market_fv)) >= FV_HARD_DISAGREEMENT:
-        confidence = min(confidence, FV_DISAGREEMENT_CONFIDENCE_CAP)
-    return max(0.0, min(1.0, confidence))
-
-
-def apply_fast_feed_confidence_floor(confidence: float,
-                                     price_source: str,
-                                     standardized_move: float) -> float:
-    """Trust Exness/MT5 more during real moves so FV does not lag the book."""
-    conf = max(0.0, min(1.0, float(confidence or 0.0)))
-    if price_source != "exness_mt5":
-        return conf
-    move = max(0.0, float(standardized_move or 0.0))
-    if move >= FAST_FEED_CONFIDENCE_STRONG_MOVE_THRESHOLD:
-        return max(conf, FAST_FEED_CONFIDENCE_STRONG_FLOOR)
-    if move >= FAST_FEED_CONFIDENCE_MOVE_THRESHOLD:
-        return max(conf, FAST_FEED_CONFIDENCE_FLOOR)
-    return conf
-
-
-def spot_from_binary_probability(start_price: float,
-                                 p_up: float,
-                                 sigma: float,
-                                 time_remaining: float) -> Optional[float]:
-    """Invert binary P(Up) into the live spot implied by market probability."""
-    if not start_price or p_up is None or not sigma or time_remaining <= 0:
-        return None
-    try:
-        from scipy.stats import norm
-        import math
-        p = max(0.02, min(0.98, float(p_up)))
-        t_years = max(1.0, float(time_remaining)) / (365.25 * 86400)
-        return float(start_price) * math.exp(norm.ppf(p) * float(sigma) * math.sqrt(t_years))
-    except Exception:
-        return None
-
-
-def blended_fair_value(model_fv: float,
-                       market_fv: Optional[float],
-                       confidence: float) -> float:
-    model = clamp_probability(model_fv)
-    conf = max(0.0, min(1.0, float(confidence or 0.0)))
-    if market_fv is None:
-        # No book: temper raw model toward neutral using the same confidence.
-        return clamp_probability(0.5 + (model - 0.5) * conf)
-    market = clamp_probability(market_fv)
-    if model <= FV_TAIL_BLEND_GUARD and market > model and (market - model) <= FV_HARD_DISAGREEMENT:
-        # Low-tail model says UP is very unlikely. Do not let a transient/thin
-        # book pull the trading FV materially upward while spot is unchanged.
-        return clamp_probability(model + min(FV_TAIL_MAX_MARKET_PULL, (market - model) * (1.0 - conf)))
-    if model >= 1.0 - FV_TAIL_BLEND_GUARD and market < model and (model - market) <= FV_HARD_DISAGREEMENT:
-        # Symmetric high-tail guard for DOWN-side noisy book pulls.
-        return clamp_probability(model - min(FV_TAIL_MAX_MARKET_PULL, (model - market) * (1.0 - conf)))
-    return clamp_probability(conf * model + (1.0 - conf) * market)
-
-
-def polymarket_implied_up_mid(book_up, book_down) -> Optional[float]:
-    """Estimate Polymarket-implied P(Up) from YES and NO order books."""
-    mids = []
-    if book_up and getattr(book_up, "best_bid", 0) > 0 and getattr(book_up, "best_ask", 0) > 0:
-        mids.append((float(book_up.best_bid) + float(book_up.best_ask)) / 2.0)
-    if book_down and getattr(book_down, "best_bid", 0) > 0 and getattr(book_down, "best_ask", 0) > 0:
-        down_mid = (float(book_down.best_bid) + float(book_down.best_ask)) / 2.0
-        mids.append(1.0 - down_mid)
-    if not mids:
-        return None
-    return max(0.0, min(1.0, sum(mids) / len(mids)))
-
-
-def basis_guard_triggered(fair_value: float,
-                          polymarket_mid_up: Optional[float],
-                          threshold: float = BASIS_GUARD_MAX_FV_DEVIATION) -> bool:
-    if polymarket_mid_up is None:
-        return False
-    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
-    return abs(fv - polymarket_mid_up) >= threshold
-
-
-def start_price_disagrees_with_market(start_price: float,
-                                      current_spot: float,
-                                      sigma: float,
-                                      event_start_ts: float,
-                                      resolve_ts: float,
-                                      market_fv: Optional[float],
-                                      threshold: float = 0.25,
-                                      now_ts: Optional[float] = None) -> bool:
-    """Return True when a candidate price-to-beat is implausible vs live books."""
-    if market_fv is None or not start_price or not current_spot:
-        return False
-    model_fv = UpDownFairValue(
-        event_start_ts=event_start_ts,
-        resolve_ts=resolve_ts,
-        start_price=start_price,
-    ).fair_value(current_spot, sigma, now_ts=now_ts, update_state=False)
-    return abs(clamp_probability(model_fv) - clamp_probability(market_fv)) >= threshold
-
-
-def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: float,
-                                min_order_size: int,
-                                threshold: float = FV_FAVORED_ENTRY_THRESHOLD,
-                                best_ask_yes: Optional[float] = None,
-                                best_ask_no: Optional[float] = None,
-                                best_bid_yes: Optional[float] = None,
-                                best_bid_no: Optional[float] = None,
-                                min_pair_edge: float = MIN_LIVE_PAIR_EDGE,
-                                min_entry_edge: float = FV_FAVORED_ENTRY_MIN_EDGE,
-                                max_entry_size: int = FV_FAVORED_ENTRY_MAX_SIZE) -> str | None:
-    """Quote only the best FV-edge side while flat, if it is repairable.
-
-    Returns "yes" or "no" when it converted normal flat quoting to one-sided
-    FV entry, "blocked" when opening a one-sided leg is too risky, otherwise
-    returns None.
-    """
-    if abs(share_imbalance) >= min_order_size:
-        return None
-    if quotes.yes_buy_size <= 0 and quotes.no_buy_size <= 0:
-        return None
-
-    yes_price = float(quotes.yes_buy_price or 0)
-    no_price = float(quotes.no_buy_price or 0)
-    if yes_price <= 0 or no_price <= 0:
-        return None
-
-    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
-    yes_edge = fv - yes_price
-    no_edge = (1.0 - fv) - no_price
-
-    side = None
-    edge_epsilon = 1e-9
-    if (fv > threshold + edge_epsilon
-            and yes_edge >= min_entry_edge
-            and quotes.yes_buy_size > 0):
-        side = "yes"
-    elif (fv < (1.0 - threshold) - edge_epsilon
-            and no_edge >= min_entry_edge
-            and quotes.no_buy_size > 0):
-        side = "no"
-
-    if not side:
-        quotes.yes_buy_size = 0
-        quotes.no_buy_size = 0
-        return "blocked"
-
-    # Before opening a one-sided leg, require that the complementary repair leg
-    # is not far behind the current maker queue while preserving pair edge.
-    # Checking against best_ask was too strict and stopped quoting entirely in
-    # normal 59/40 style books; repair is a BUY bid, so best_bid proximity is the
-    # right maker-feasibility check.
-    max_repair_bid_lag = 0.02
-    if side == "yes":
-        repair_cap = 1.0 - yes_price - min_pair_edge
-        if best_bid_no is not None:
-            repair_too_far = repair_cap < float(best_bid_no) - max_repair_bid_lag
-        else:
-            repair_too_far = best_ask_no is not None and (float(best_ask_no) - 0.01) > repair_cap
-        if repair_too_far:
-            quotes.yes_buy_size = 0
-            quotes.no_buy_size = 0
-            return "blocked"
-        quotes.yes_buy_size = min(int(quotes.yes_buy_size), max(min_order_size, int(max_entry_size)))
-        quotes.no_buy_size = 0
-        return "yes"
-
-    repair_cap = 1.0 - no_price - min_pair_edge
-    if best_bid_yes is not None:
-        repair_too_far = repair_cap < float(best_bid_yes) - max_repair_bid_lag
-    else:
-        repair_too_far = best_ask_yes is not None and (float(best_ask_yes) - 0.01) > repair_cap
-    if repair_too_far:
-        quotes.yes_buy_size = 0
-        quotes.no_buy_size = 0
-        return "blocked"
-    quotes.no_buy_size = min(int(quotes.no_buy_size), max(min_order_size, int(max_entry_size)))
-    quotes.yes_buy_size = 0
-    return "no"
-
-
-def repair_min_edge_for_remaining(remaining: float, repair_mode: str) -> float:
-    """Relax pair edge only for close-only repair as expiry approaches.
-
-    Carrying a naked wrong-side tail is often worse than completing a scratch
-    pair. Normal quoting keeps the full live buffer; repair-only quotes can use
-    a smaller buffer near expiry.
-    """
-    if repair_mode not in ("repair_up", "repair_down"):
-        return MIN_LIVE_PAIR_EDGE
-    if remaining <= 90:
-        return 0.0
-    if remaining <= 240:
-        return 0.005
-    if remaining <= 480:
-        return 0.01
-    return MIN_LIVE_PAIR_EDGE
-
-
-class UpDownFairValue:
-    """
-    Fair value for "Up or Down" markets.
-
-    P(Up) = P(price at end >= price at start)
-    Uses drift + vol from CEX data. At-the-money ~ 0.50.
-
-    For short horizons with no drift: P(Up) ≈ 0.50
-    With observed drift: P(Up) = Φ(drift / (sigma * sqrt(T)))
-    """
-
-    def __init__(self, event_start_ts: float, resolve_ts: float,
-                 start_price: float = None):
-        self.event_start_ts = event_start_ts
-        self.resolve_ts = resolve_ts
-        self.start_price = start_price  # Price at window open
-        self._last_fair_value = 0.50
-        self._last_update_ts = 0.0
-
-    def fair_value(self, current_price: float, sigma_annualized: float,
-                   now_ts: float = None, update_state: bool = True) -> float:
-        """
-        Compute P(Up) = P(price_end >= price_start).
-
-        If we know the start price: uses log(current/start) as drift signal.
-        If we don't: defaults to 0.50 (no edge from price level).
-        """
-        from scipy.stats import norm
-        import math
-
-        now_ts = now_ts or _time.time()
-        t_remaining = max(1, self.resolve_ts - now_ts)
-        t_years = t_remaining / (365.25 * 86400)
-
-        if self.start_price and self.start_price > 0 and current_price > 0:
-            # We know the start price — compute drift-based fair value
-            log_return_so_far = math.log(current_price / self.start_price)
-
-            vol_sqrt_t = sigma_annualized * math.sqrt(t_years)
-            if vol_sqrt_t < 1e-10:
-                # Near zero vol remaining: deterministic
-                return 0.99 if log_return_so_far >= 0 else 0.01
-
-            # If price is currently above start, it's more likely to end above
-            # d = drift_so_far / remaining_vol
-            d = log_return_so_far / vol_sqrt_t
-            prob = norm.cdf(d)
-        else:
-            # No start price: assume 50/50
-            prob = 0.50
-
-        prob = max(0.01, min(0.99, prob))
-        if update_state:
-            self._last_fair_value = prob
-            self._last_update_ts = now_ts
-        return prob
-
-    def set_start_price(self, price: float):
-        """Set the opening price once known."""
-        if self.start_price is None and price > 0:
-            self.start_price = price
-            log.info("start_price_set", price=price)
-
-    def time_remaining_seconds(self, now_ts: float = None) -> float:
-        now_ts = now_ts or _time.time()
-        return max(0, self.resolve_ts - now_ts)
-
-    def normalized_time(self, now_ts: float = None) -> float:
-        now_ts = now_ts or _time.time()
-        total = self.resolve_ts - self.event_start_ts
-        if total <= 0:
-            return 0.0
-        remaining = self.resolve_ts - now_ts
-        return max(0.0, min(1.0, remaining / total))
-
-    @property
-    def last_fair_value(self) -> float:
-        return self._last_fair_value
-
-    @property
-    def is_stale(self) -> bool:
-        return (_time.time() - self._last_update_ts) > 5.0
-
-
-def compute_inventory_repair_sizes(imbalance: float,
-                                   min_order_size: int,
-                                   max_order_size: int) -> tuple[int, int, str]:
-    """Return (up_size, down_size, mode) for guarded repair quoting.
-
-    Repair quotes only the light side. A sub-minimum tail cannot be repaired
-    exactly on Polymarket because live orders must be at least min_order_size
-    shares, so quote the light side at the minimum valid order size. That may
-    overshoot by a few shares, but it never tops up the already-heavy side.
-
-    Example: Down 3 / Up 0 => imbalance=-3. Quote Up 5 only; do not quote more
-    Down just to make the arithmetic pretty. Pretty arithmetic leaks money.
-    """
-    min_order_size = max(1, int(min_order_size or 1))
-    max_order_size = max(min_order_size, int(max_order_size or min_order_size))
-    tail = abs(float(imbalance or 0))
-
-    if tail <= 0:
-        return 0, 0, "flat"
-
-    if tail < min_order_size:
-        # Live invariant: never top up the already-filled/heavy side. Even for
-        # sub-minimum partial tails, quote only the light side at the minimum
-        # valid order size. This may overshoot by a few shares, but it avoids
-        # digging the imbalance deeper.
-        if imbalance > 0:
-            # Too many Up: quote Down only.
-            return 0, min_order_size, "repair_down"
-        # Too many Down: quote Up only.
-        return min_order_size, 0, "repair_up"
-
-    repair_size = min(max_order_size, int(round(tail)))
-    if imbalance > 0:
-        return 0, repair_size, "repair_down"
-    return repair_size, 0, "repair_up"
-
-
-def compute_fv_aware_dust_repair_sizes(imbalance: float,
-                                       fair_value: float,
-                                       min_order_size: int,
-                                       max_order_size: int,
-                                       neutral_band: float = 0.02) -> tuple[int, int, str]:
-    """Handle sub-minimum tails with a two-step dust ladder.
-
-    Polymarket minimum order size means a 4-share tail cannot be repaired by
-    buying exactly 4 shares. For larger dust tails, quote ``tail + min_size`` on
-    the light side. Example: +4 UP → buy 9 DOWN → leaves -5 DOWN, then normal
-    repair buys 5 UP and lands exactly flat.
-
-    For tiny 1-2 share dust, avoid creating a much larger temporary residual;
-    hold if the tail side is not clearly disfavored by fair value.
-    """
-    min_order_size = max(1, int(min_order_size or 1))
-    max_order_size = max(min_order_size, int(max_order_size or min_order_size))
-    tail = abs(float(imbalance or 0))
-    if tail <= 0:
-        return 0, 0, "flat"
-    if tail >= min_order_size:
-        return compute_inventory_repair_sizes(imbalance, min_order_size, max_order_size)
-
-    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
-    ladder_threshold = max(3, int((min_order_size + 1) // 2))
-    if tail >= ladder_threshold:
-        ladder_size = min(max_order_size, int(round(tail)) + min_order_size)
-        if imbalance > 0:
-            return 0, ladder_size, "repair_down"
-        return ladder_size, 0, "repair_up"
-
-    # Positive imbalance = extra UP. For 1-2 share dust, hold if UP is still at
-    # least roughly favored; otherwise flip with the minimum DOWN clip.
-    if imbalance > 0:
-        if fv >= 0.5 - neutral_band:
-            return 0, 0, "dust_hold_up"
-        return 0, min_order_size, "repair_down"
-
-    # Negative imbalance = extra DOWN. For 1-2 share dust, hold if DOWN is still
-    # at least roughly favored; otherwise flip with the minimum UP clip.
-    if fv <= 0.5 + neutral_band:
-        return 0, 0, "dust_hold_down"
-    return min_order_size, 0, "repair_up"
-
-
-def apply_dust_price_guardrails(quotes, mode: str,
-                                best_ask_yes: Optional[float] = None,
-                                best_ask_no: Optional[float] = None):
-    """Favor the repair side and make the dust top-up side less aggressive.
-
-    Dust normalization is not risk-free: if only the heavy-side top-up fills,
-    the bot makes the tail worse. Biasing prices makes the desired opposite-side
-    fill more likely while preserving the combined-cost invariant.
-    """
-    if mode not in ("dust_up", "dust_down"):
-        return quotes
-
-    yes = float(quotes.yes_buy_price or 0)
-    no = float(quotes.no_buy_price or 0)
-    if yes <= 0 or no <= 0:
-        return quotes
-
-    if mode == "dust_up":
-        # Too many Up: Down is the repair side. Pay up for Down, shade Up down.
-        yes -= 0.01
-        no += 0.01
-    else:
-        # Too many Down: Up is the repair side. Pay up for Up, shade Down down.
-        yes += 0.01
-        no -= 0.01
-
-    if best_ask_yes is not None and yes >= best_ask_yes:
-        yes = best_ask_yes - 0.01
-    if best_ask_no is not None and no >= best_ask_no:
-        no = best_ask_no - 0.01
-
-    yes = max(0.01, min(0.99, round(yes, 2)))
-    no = max(0.01, min(0.99, round(no, 2)))
-
-    # Keep the pair edge. If the repair-side bump pushed combined cost too high,
-    # lower the dust/top-up side first, because that is the dangerous fill.
-    if yes + no >= 1.0:
-        if mode == "dust_up":
-            yes = max(0.01, round(0.99 - no, 2))
-        else:
-            no = max(0.01, round(0.99 - yes, 2))
-
-    quotes.yes_buy_price = yes
-    quotes.no_buy_price = no
-    quotes.combined_cost = round(yes + no, 4)
-    quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
-    return quotes
-
-
-def repair_price_cap(pos, side: str, size: float, fair_value: float,
-                     min_edge: float = 0.01,
-                     adverse_buffer: float = 0.02) -> tuple[float, str]:
-    """Return the max repair bid that preserves positive pair edge.
-
-    Repair mode must not manufacture guaranteed-loss pairs. Earlier live
-    hardening allowed a wrong-way tail to be hedged up to expected value; that
-    reduced naked inventory but created the exact failure Vinit observed: pair
-    average cost > 1. For this strategy, if the missing side cannot be bought
-    under ``1 - opposite_fill_price - min_edge``, we wait/cancel instead of
-    buying a locked-in loser.
-    """
-    side = (side or "").lower()
-    profitable_cap = float(pos.max_profitable_repair_price(side, size, min_edge=min_edge))
-    return profitable_cap, "pair_edge"
-
-
-def aggressive_repair_price(current_price: float | None,
-                            cap: float,
-                            best_ask: Optional[float] = None,
-                            best_bid: Optional[float] = None) -> float | None:
-    """Move repair bids as high as safely possible without crossing.
-
-    Repair mode is not normal rebate farming. If we can complete a pair with
-    combined cost < 1, sitting 5c below the market is just choosing to keep the
-    naked tail. For post-only orders, the most aggressive safe bid is one tick
-    below best ask, capped by the pair/risk cap.
-    """
-    if cap < 0.01:
-        return None
-
-    price = float(current_price or 0.01)
-    target = float(cap)
-
-    if best_ask is not None and float(best_ask or 0) > 0:
-        target = min(target, float(best_ask) - 0.01)
-    if best_bid is not None and float(best_bid or 0) > 0:
-        # At least join the best bid when cap allows. This preserves queue
-        # competitiveness if the book is wide or best_ask is unavailable.
-        target = max(target, min(float(best_bid), float(cap)))
-
-    target = max(0.01, min(0.99, target))
-
-    # This function is also the final pair-edge safety clamp for repair mode.
-    # If the current quote is above the profitable cap, keeping it resting can
-    # fill a guaranteed-loss pair before the next loop. Lower it immediately.
-    if price > float(cap):
-        return round(target, 2)
-
-    if target <= price:
-        return round(price, 2)
-    return round(target, 2)
-
-
-def has_negative_matched_pair_edge(pos, tolerance: float = 0.005) -> bool:
-    """True when FIFO-matched pairs have locked in negative edge.
-
-    This is a circuit breaker, not a quoting input. A pair-matching maker whose
-    matched pairs are already negative is no longer market-making; it is paying
-    to recycle volume. Stop the market instead of compounding.
-    """
-    try:
-        return float(pos.matched_pairs() or 0) > 0 and float(pos.matched_pair_profit()) < -float(tolerance)
-    except Exception:
-        return False
+from src.services.fair_value import (
+    BASIS_GUARD_MAX_FV_DEVIATION,
+    FAST_ADVERSE_CANCEL_MIN_EDGE,
+    MAX_EXNESS_PRICE_AGE_SECONDS,
+    MAX_SPOT_PRICE_AGE_SECONDS,
+    MAX_TRADING_FV_MARKET_DEVIATION,
+    FairValueEngine,
+    FairValueInputs,
+    UpDownFairValue,
+    apply_fast_feed_confidence_floor,
+    basis_guard_triggered,
+    blended_fair_value,
+    cap_fair_value_to_market,
+    clamp_probability,
+    fv_model_confidence,
+    polymarket_implied_up_mid,
+    spot_from_binary_probability,
+    start_price_disagrees_with_market,
+)
+from src.services.inventory import (
+    aggressive_repair_price,
+    apply_dust_price_guardrails,
+    compute_fv_aware_dust_repair_sizes,
+    compute_inventory_repair_sizes,
+    has_negative_matched_pair_edge,
+    repair_min_edge_for_remaining,
+    repair_price_cap,
+)
+from src.services.quoting import (
+    FV_FAVORED_ENTRY_MAX_SIZE,
+    FV_FAVORED_ENTRY_MIN_EDGE,
+    FV_FAVORED_ENTRY_STOP_SECONDS,
+    FV_FAVORED_ENTRY_THRESHOLD,
+    MIN_LIVE_PAIR_EDGE,
+    apply_fv_favored_entry_mode,
+)
 
 
 class MarketCycler:
@@ -2270,18 +1760,32 @@ class MarketCycler:
         except Exception:
             standardized_move = 0.0
 
-        model_confidence = fv_model_confidence(
-            model_fv,
-            elapsed_fraction,
-            standardized_move,
-            polymarket_mid_up,
+        fv_result = FairValueEngine(self.fair_value_model).compute(
+            FairValueInputs(
+                spot=spot,
+                sigma=sigma,
+                now_ts=now,
+                elapsed_fraction=elapsed_fraction,
+                standardized_move=standardized_move,
+                market_fv=polymarket_mid_up,
+                price_source=price_source,
+            ),
+            update_state=False,
         )
-        model_confidence = apply_fast_feed_confidence_floor(
-            model_confidence,
-            price_source,
-            standardized_move,
-        )
-        fv = blended_fair_value(model_fv, polymarket_mid_up, model_confidence)
+        model_fv = fv_result.raw_fv
+        model_confidence = fv_result.confidence
+        uncapped_fv = fv_result.blended_fv
+        fv = fv_result.tradable_fv
+        if polymarket_mid_up is not None and abs(float(fv or 0) - float(uncapped_fv or 0)) >= 0.0001:
+            log.warning(
+                "fair_value_market_deviation_capped",
+                asset=self.asset,
+                uncapped_fv=round(float(uncapped_fv or 0), 4),
+                capped_fv=round(float(fv or 0), 4),
+                market_fv=round(float(polymarket_mid_up or 0), 4),
+                max_deviation=MAX_TRADING_FV_MARKET_DEVIATION,
+                msg="model FV too far from current Polymarket UP price; capping tradable FV",
+            )
         self.last_fair_value = fv
         # The final blended FV is the authoritative trading FV. Refresh the
         # model freshness timestamp here; otherwise pre_trade_checks sees the
@@ -2304,6 +1808,7 @@ class MarketCycler:
             model_fv=round(float(model_fv or 0), 4),
             market_fv=(round(polymarket_mid_up, 4) if polymarket_mid_up is not None else None),
             model_confidence=round(float(model_confidence or 0), 4),
+            uncapped_fv=round(float(uncapped_fv or 0), 4),
             final_fv=round(float(fv or 0), 4),
             basis_delta=(round(basis_delta, 4) if basis_delta is not None else None),
         )
@@ -3567,10 +3072,15 @@ class MarketCycler:
         self._dashboard_cb(state)
 
     def _max_spot_price_age_seconds(self) -> float:
-        """Allowed active spot age; Exness/MT5 can use its configured tolerance."""
+        """Allowed active spot age for live quoting.
+
+        Exness/MT5 is expected to refresh per quote cycle; do not let a large
+        bridge stale_seconds setting keep stale FV tradable for many seconds.
+        """
         if bool(getattr(self.price_feed, "mt5_bridge_url", "")):
-            return float(getattr(self.price_feed, "mt5_bridge_stale_seconds", MAX_SPOT_PRICE_AGE_SECONDS)
-                         or MAX_SPOT_PRICE_AGE_SECONDS)
+            configured = float(getattr(self.price_feed, "mt5_bridge_stale_seconds", MAX_EXNESS_PRICE_AGE_SECONDS)
+                               or MAX_EXNESS_PRICE_AGE_SECONDS)
+            return min(configured, MAX_EXNESS_PRICE_AGE_SECONDS)
         return MAX_SPOT_PRICE_AGE_SECONDS
 
     def _dashboard_sigma_for_stale_spot(self) -> float:
