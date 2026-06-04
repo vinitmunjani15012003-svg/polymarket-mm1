@@ -49,6 +49,24 @@ class BatchCancelExecutor:
         return True
 
 
+class NonePlacementExecutor:
+    def __init__(self):
+        self.batch_calls = []
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        return {order["side"]: None for order in orders}
+
+
+class RaisingPlacementExecutor:
+    def __init__(self):
+        self.batch_calls = []
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        raise RuntimeError("exchange timeout")
+
+
 class OpenOrderExecutor:
     def __init__(self, open_orders):
         self.open_orders = open_orders
@@ -141,6 +159,61 @@ def test_order_manager_suppresses_duplicate_submit_for_same_side_quote_version()
     assert "quote_version" not in submitted
 
 
+def test_order_manager_releases_failed_placement_intent_for_retry():
+    executor = NonePlacementExecutor()
+    manager = OrderManager(executor)
+    spec = {
+        "token_id": "UP",
+        "price": 0.45,
+        "size": 5,
+        "side": "yes",
+    }
+    intent_spec = attach_place_intent(spec, market_id="M1", quote_version=10)
+
+    first = asyncio.run(manager._place_buys([intent_spec]))
+    retry = asyncio.run(manager._place_buys([intent_spec]))
+
+    assert first == {"yes": None}
+    assert retry == {"yes": None}
+    assert len(executor.batch_calls) == 2
+    assert manager.order_tracker.pending == {}
+    assert intent_spec["intent"].intent_id in manager.order_tracker.failed_intents
+
+
+def test_order_manager_releases_raised_placement_intent_for_retry():
+    executor = RaisingPlacementExecutor()
+    manager = OrderManager(executor)
+    intent_spec = attach_place_intent(
+        {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"},
+        market_id="M1",
+        quote_version=11,
+    )
+
+    first = asyncio.run(manager._place_buys([intent_spec]))
+    retry = asyncio.run(manager._place_buys([intent_spec]))
+
+    assert first == {"yes": None}
+    assert retry == {"yes": None}
+    assert len(executor.batch_calls) == 2
+    assert manager.last_order_error == "order_placement_failed"
+
+
+def test_order_manager_allows_new_quote_version_after_duplicate_suppression():
+    executor = SideAwareExecutor()
+    manager = OrderManager(executor)
+    base = {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"}
+
+    v1 = attach_place_intent(base, market_id="M1", quote_version=12)
+    duplicate_v1 = attach_place_intent({**base, "price": 0.46}, market_id="M1", quote_version=12)
+    v2 = attach_place_intent({**base, "price": 0.47}, market_id="M1", quote_version=13)
+
+    assert asyncio.run(manager._place_buys([v1])) == {"yes": "yes-order"}
+    assert asyncio.run(manager._place_buys([duplicate_v1])) == {"yes": None}
+    assert asyncio.run(manager._place_buys([v2])) == {"yes": "yes-order"}
+    assert len(executor.batch_calls) == 2
+    assert executor.batch_calls[-1][0]["price"] == 0.47
+
+
 def test_order_tracker_reconstructs_states_from_active_quotes():
     active = ActiveQuotes(
         yes_order_id="yes-live",
@@ -192,3 +265,19 @@ def test_crossed_bid_cancel_defers_when_fill_race_closes_order():
     assert active.yes_order_id is None
     assert active.yes_price is None
     assert active.yes_size == 0
+
+
+def test_cancel_manager_crossed_bid_deferral_clears_via_callback():
+    executor = OpenOrderExecutor(open_orders={})
+    cleared = []
+
+    deferred = asyncio.run(CancelManager(executor).crossed_bid_cancel_should_defer(
+        market_id="market-1",
+        side="yes",
+        order_id="yes-1",
+        grace_seconds=0.0,
+        clear_active_side=lambda: cleared.append("yes"),
+    ))
+
+    assert deferred is True
+    assert cleared == ["yes"]

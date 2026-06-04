@@ -12,7 +12,12 @@ class OrderTracker:
     def __init__(self):
         self.pending: dict[str, OrderIntent] = {}
         self.orders: dict[str, OrderState] = {}
+        self.failed_intents: dict[str, OrderIntent] = {}
         self._submitted_versions: set[tuple[str, str, int]] = set()
+
+    @staticmethod
+    def _version_key(intent: OrderIntent) -> tuple[str, str, int]:
+        return (intent.market_id, intent.side, int(intent.quote_version))
 
     def add_intent(self, intent: OrderIntent) -> str:
         self.pending[intent.intent_id] = intent
@@ -25,7 +30,7 @@ class OrderTracker:
         size and token) so accidental duplicate PLACE specs for the same quote
         version cannot submit twice on a side.
         """
-        key = (intent.market_id, intent.side, int(intent.quote_version))
+        key = self._version_key(intent)
         if key in self._submitted_versions:
             return False
         self._submitted_versions.add(key)
@@ -35,8 +40,18 @@ class OrderTracker:
     def mark_order(self, state: OrderState):
         self.orders[state.order_id] = state
         self.pending.pop(state.intent_id, None)
+        self.failed_intents.pop(state.intent_id, None)
 
-    def mark_rejected(self, intent: OrderIntent):
+    def release_intent(self, intent: OrderIntent):
+        """Release a claimed submit slot so the same quote version can retry."""
+        self.pending.pop(intent.intent_id, None)
+        self._submitted_versions.discard(self._version_key(intent))
+
+    def mark_rejected(self, intent: OrderIntent, *, release: bool = True):
+        self.failed_intents[intent.intent_id] = intent
+        if release:
+            self.release_intent(intent)
+            return
         self.pending.pop(intent.intent_id, None)
 
     @staticmethod

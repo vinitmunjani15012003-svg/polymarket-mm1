@@ -7,6 +7,14 @@ executor's existing semantics.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+
+from src.monitoring.logger import get_logger
+
+
+log = get_logger("cancel_manager")
+
 
 class CancelManager:
     def __init__(self, target):
@@ -49,3 +57,80 @@ class CancelManager:
         if not callable(update_quotes):
             return False
         return await update_quotes(*args, **kwargs)
+
+    async def order_still_open(self, order_id: str) -> bool:
+        """Best-effort exchange/local check for whether an order is still open."""
+        checker = getattr(self.target, "is_order_open", None)
+        if callable(checker):
+            result = checker(order_id)
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+
+        open_orders = getattr(self.target, "open_orders", None)
+        if isinstance(open_orders, dict):
+            return order_id in open_orders
+
+        # Unknown executor: fail conservative and assume it is still open.
+        return True
+
+    async def crossed_bid_cancel_should_defer(
+        self,
+        *,
+        market_id: str,
+        side: str,
+        order_id: str,
+        grace_seconds: float,
+        sticky_repair: bool = False,
+        clear_active_side=None,
+    ) -> bool:
+        """Return True when crossed-bid cancel/repost should be skipped.
+
+        A BUY maker bid at/above best ask may already have filled while local
+        state lags.  Check open-state before and after an optional grace window;
+        if the order disappeared, let reconciliation/fill sync run before new
+        exposure is placed.
+        """
+        if not await self.order_still_open(order_id):
+            if callable(clear_active_side):
+                clear_active_side()
+            log.warning(
+                "crossed_bid_already_closed_before_cancel",
+                market=market_id[:8],
+                side=side,
+                order_id=order_id[:8],
+            )
+            return True
+
+        grace = max(0.0, float(grace_seconds or 0.0))
+        if grace > 0:
+            log.info(
+                "crossed_bid_grace_wait",
+                market=market_id[:8],
+                side=side,
+                order_id=order_id[:8],
+                grace_ms=round(grace * 1000),
+                repair=sticky_repair,
+            )
+            await asyncio.sleep(grace)
+
+        if not await self.order_still_open(order_id):
+            if callable(clear_active_side):
+                clear_active_side()
+            log.warning(
+                "crossed_bid_closed_during_grace",
+                market=market_id[:8],
+                side=side,
+                order_id=order_id[:8],
+                repair=sticky_repair,
+            )
+            return True
+
+        log.warning(
+            "crossed_bid_cancel_after_grace",
+            market=market_id[:8],
+            side=side,
+            order_id=order_id[:8],
+            repair=sticky_repair,
+        )
+        return False
