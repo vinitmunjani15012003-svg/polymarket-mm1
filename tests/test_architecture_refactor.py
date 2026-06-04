@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.core.lifecycle import LifecycleManager
-from src.core.models import DecisionResult, LifecycleState, OrderIntent
+from src.core.models import DecisionResult, LifecycleState, OrderIntent, RiskDecision
 from src.services.fair_value import FairValueEngine, FairValueInputs, UpDownFairValue
 from src.services.quoting import (
     QuotePolicy,
@@ -12,8 +12,20 @@ from src.services.quoting import (
     normalize_quote_sizes,
     repair_size_or_zero,
 )
-from src.services.inventory import InventoryBook, inventory_diverged
-from src.services.risk import feed_freshness_decision
+from src.core.models.inventory import InventorySnapshot
+from src.services.inventory import (
+    InventoryBook,
+    inventory_diverged,
+    plan_inventory_repair,
+    reconciliation_delta,
+)
+from src.services.risk import (
+    RiskCoordinator,
+    capital_available_decision,
+    feed_freshness_decision,
+    imbalance_decision,
+    negative_pair_edge_decision,
+)
 from src.market_data import freshness
 
 
@@ -103,6 +115,79 @@ def test_inventory_book_wraps_existing_inventory_manager():
     assert snapshot.share_imbalance == 3
     assert snapshot.matched_pairs == 2
     assert snapshot.source == "local"
+
+
+def test_risk_coordinator_aggregates_domain_decisions_with_audit_trail():
+    decision = RiskCoordinator().evaluate(
+        data=feed_freshness_decision(age_seconds=0.1, max_age_seconds=1.0, source="mt5"),
+        market=RiskDecision("CANCEL", "BASIS_GAP", "critical", {"basis_gap": 0.2}),
+        inventory=imbalance_decision(12, hard_limit=10),
+        capital=capital_available_decision(3, required=5),
+    )
+
+    assert decision.action == "CANCEL"
+    assert decision.reason == "BASIS_GAP"
+    assert decision.metadata["basis_gap"] == 0.2
+    assert decision.metadata["blocking_reasons"] == [
+        "BASIS_GAP",
+        "HARD_INVENTORY_LIMIT",
+        "INSUFFICIENT_CAPITAL",
+    ]
+    assert [d["action"] for d in decision.metadata["decisions"]] == [
+        "ALLOW",
+        "CANCEL",
+        "REPAIR",
+        "REDUCE_SIZE",
+    ]
+
+
+def test_inventory_repair_planner_returns_explicit_subminimum_plan():
+    plan = plan_inventory_repair(imbalance=-2.0, min_order_size=5, max_order_size=10)
+
+    assert plan.yes_size == 5
+    assert plan.no_size == 0
+    assert plan.mode == "repair_up"
+    assert plan.reason == "SUB_MINIMUM_TAIL"
+
+
+def test_inventory_book_repair_and_reconciliation_seams():
+    class Position:
+        yes_shares = 1
+        no_shares = 4
+        yes_avg_price = 0.40
+        no_avg_price = 0.50
+
+        def max_profitable_repair_price(self, side, size, min_edge=0.01):
+            return 0.47 if side == "yes" else 0.43
+
+    class InventoryManager:
+        def get_or_create(self, market_id, asset):
+            return Position()
+
+    book = InventoryBook(InventoryManager())
+    wallet = InventorySnapshot("M1", yes_shares=5, no_shares=4, source="wallet")
+
+    assert book.plan_repair("M1", min_order_size=5, max_order_size=10).mode == "repair_up"
+    assert book.repair_price_cap("M1", "yes", 5, fair_value=0.6) == (0.47, "pair_edge")
+    assert book.reconciliation_needed("M1", wallet) is True
+    delta = reconciliation_delta(book.get_snapshot("M1"), wallet)
+    assert delta["diverged"] is True
+    assert delta["imbalance_delta"] == 4
+
+
+def test_negative_pair_edge_decision_halts_with_pair_metadata():
+    class Position:
+        def matched_pairs(self):
+            return 3
+
+        def matched_pair_profit(self):
+            return -0.04
+
+    decision = negative_pair_edge_decision(Position(), tolerance=0.005)
+
+    assert decision.action == "HALT"
+    assert decision.reason == "NEGATIVE_PAIR_EDGE"
+    assert decision.metadata["matched_pairs"] == 3
 
 
 def test_data_risk_and_feed_health_share_freshness_semantics():
