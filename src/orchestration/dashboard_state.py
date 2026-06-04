@@ -177,7 +177,11 @@ def update_dashboard(cycler, market, spot, fv, sigma, phase,
         "matched_pairs": display_matched_pairs,
         "avg_pair_cost": real_pos.avg_matched_pair_cost(),
         "matched_pair_pnl": real_pos.matched_pair_profit(),
-        "negative_pair_edge": has_negative_matched_pair_edge(real_pos),
+        "negative_pair_edge": (
+            cycler._decide_negative_pair_edge(real_pos).triggered
+            if hasattr(cycler, "_decide_negative_pair_edge")
+            else has_negative_matched_pair_edge(real_pos)
+        ),
         "inventory_source": inventory_source,
         "inv_state": real_state.value,
         "net_trading_pnl": cycler.pnl.net_trading_pnl,
