@@ -2,7 +2,7 @@
 
 This file tracks legacy guards while the architecture migrates to service-owned decisions.
 
-Status scale: **Extracted** means service/facade owns the decision shape; **Wired** means the live cycler/execution path consumes it; percentages are migration completeness estimates as of 2026-06-04 after the restart/live scenario coverage pass.
+Status scale: **Extracted** means service/facade owns the decision shape; **Wired** means the live cycler/execution path consumes it; percentages are migration completeness estimates as of 2026-06-04 after the final MarketCycler helper-slimming pass.
 
 | Guard | Current Owner | Target Owner | Status | Completion | Keep / Merge / Delete | Notes |
 |---|---|---|---|---:|---|---|
@@ -14,7 +14,7 @@ Status scale: **Extracted** means service/facade owns the decision shape; **Wire
 | Tradable FV market cap | `services/fair_value/blender.py` | `FairValueEngine` | Extracted | 85% | Keep | Replaces ad hoc optimistic-FV guards. Next: merge any remaining direct `cap_fair_value_to_market` call sites into engine result consumption. |
 | Basis/FV-book divergence guard | `services/fair_value/basis_protection.py` + `services/risk/market_risk.py` | `RiskCoordinator` | Extracted, partially wired | 70% | Merge | Scenario test covers `BASIS_GAP` divergence metadata. Next: merge fair-value basis check and market-risk decision into a single coordinator-owned cancel/halt decision. |
 | Normal quote atomicity | `MarketCycler._quote_cycle` | `services/quoting/quote_sanity.py` | Extracted, partially wired | 65% | Merge | Must remain until quote policy fully owns plan generation. Next: have `QuotePolicy` produce/validate the final order list before `OrderManager` placement, then delete inline pair-cost/atomicity gates. |
-| Small-cap opening/done guards | `orchestration/small_capital.py` via `MarketCycler` delegation | `orchestration/small_capital.py` state machine | Mostly extracted | 85% | Keep | Critical live safety. New scenarios cover restart mid-cycle hold, partial-fill-after-cancel balancing, completed-cycle no-requote. Next: move remaining compatibility wrappers out of `MarketCycler` after quote-loop extraction. |
+| Small-cap opening/done guards | `orchestration/small_capital.py` via `MarketCycler` delegation | `orchestration/small_capital.py` state machine | Mostly extracted | 87% | Keep | Critical live safety. New scenarios cover restart mid-cycle hold, partial-fill-after-cancel balancing, completed-cycle no-requote. Latest pass moved dashboard and settlement helper blocks out of `MarketCycler`; next: move remaining compatibility wrappers out after quote-loop extraction. |
 | Repair pair edge cap | `InventoryBook`/`services/inventory/repair_planner.py` | `InventoryBook`/repair planner | Extracted | 80% | Keep | Prevents guaranteed-loss matched pairs; book exposes service seam. Next: delete direct position-method calls from cycler when repair planner supplies both size and cap. |
 | Negative pair edge halt | `services/inventory/pair_tracker.py` + `services/risk/inventory_risk.py` | `RiskCoordinator` | Extracted, partially wired | 75% | Merge | Available as `RiskDecision`; cycler halt/merge call sites remain live. Next: route all negative-edge checks through coordinator audit trail. |
 | Crossed bid cancel | `OrderManager` | `services/execution/cancel_manager.py` + fill/reconciliation policy | Partially extracted | 65% | Merge | Execution service should own cancel/fill race policy; existing test covers fill-race defer. Next: merge `_maybe_defer_crossed_bid_cancel` behind cancel manager/reconciliation facade. |
@@ -24,7 +24,8 @@ Status scale: **Extracted** means service/facade owns the decision shape; **Wire
 
 ## Current cleanup rollup
 
-- Estimated overall guard migration completion: **74%**.
+- Estimated overall guard migration completion: **76%**.
+- Completed helper slimming: dashboard/waiting-state payload construction now lives in `src/orchestration/dashboard_state.py`; settlement and dry-run resolution polling orchestration now lives in `src/orchestration/settlement.py`, with `MarketCycler` compatibility wrappers retained.
 - High-confidence deletes after full quote-loop wiring: legacy fast-feed confidence floor call sites, direct tradable-FV cap call sites, duplicated stale-age booleans, and inline quote atomicity/pair-cost checks.
 - High-confidence merges before deletes: basis/FV-book divergence into `RiskCoordinator`, crossed-cancel fill-race handling into execution cancel/reconciliation services, repair price caps into inventory repair planner output.
 - Guards that should remain explicit even after migration: Exness live max-age fail-closed, tail blend guard, tradable FV cap, small-cap one-cycle completion/no-requote, repair pair-edge cap, duplicate `OrderIntent` idempotency.
