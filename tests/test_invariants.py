@@ -18,6 +18,7 @@ from src.orchestration.market_cycler import (
     aggressive_repair_price,
     apply_dust_price_guardrails,
     apply_fv_favored_entry_mode,
+    apply_fast_feed_confidence_floor,
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     blended_fair_value,
@@ -155,6 +156,54 @@ def test_blended_fair_value_missing_book_tempers_to_neutral():
     final_fv = blended_fair_value(0.90, None, confidence)
 
     assert 0.50 < final_fv < 0.60
+
+
+def test_exness_fast_feed_confidence_floor_reduces_fv_lag_on_real_move():
+    base_conf = fv_model_confidence(0.60, elapsed_fraction=0.05, standardized_move=0.30, market_fv=0.50)
+    fast_conf = apply_fast_feed_confidence_floor(base_conf, "exness_mt5", standardized_move=0.30)
+
+    assert fast_conf >= 0.65
+    assert blended_fair_value(0.60, 0.50, fast_conf) > blended_fair_value(0.60, 0.50, base_conf)
+
+
+def test_non_exness_confidence_floor_is_unchanged():
+    base_conf = fv_model_confidence(0.60, elapsed_fraction=0.05, standardized_move=0.30, market_fv=0.50)
+
+    assert apply_fast_feed_confidence_floor(base_conf, "aggTrade", standardized_move=0.30) == base_conf
+
+
+def test_fast_adverse_cancel_removes_active_bid_before_requote_path():
+    import asyncio
+
+    class FakeOrderManager:
+        def __init__(self):
+            self.cancelled = []
+            self.active = SimpleNamespace(
+                yes_order_id="OID-YES",
+                yes_price=0.54,
+                no_order_id=None,
+                no_price=None,
+            )
+
+        def get_active(self, market_id):
+            return self.active
+
+        async def cancel_side_quotes(self, market_id, side, token_id):
+            self.cancelled.append((market_id, side, token_id))
+            if side == "yes":
+                self.active.yes_order_id = None
+            return True
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.order_mgr = FakeOrderManager()
+    cycler.current_market = True
+    market = SimpleNamespace(market_id="M1", token_id_up="UP", token_id_down="DOWN")
+
+    cancelled = asyncio.run(cycler._cancel_fast_adverse_active_quotes(market, fast_fv=0.55, min_edge=0.02))
+
+    assert cancelled is True
+    assert cycler.order_mgr.cancelled == [("M1", "yes", "UP")]
 
 
 def test_vatic_strike_remains_price_to_beat_even_when_market_model_disagrees():
@@ -310,7 +359,7 @@ def test_price_feed_does_not_switch_to_aggtrade_between_stale_mt5_ticks():
     assert pf.get_price_age("BTCUSDT") >= 1.0
 
 
-def test_price_feed_records_stale_mt5_tick_instead_of_showing_unavailable():
+def test_price_feed_uses_mt5_bridge_receive_time_for_active_age():
     pf = PriceFeed(
         "wss://stream.binance.com:9443/ws",
         ["BTCUSDT"],
@@ -318,10 +367,669 @@ def test_price_feed_records_stale_mt5_tick_instead_of_showing_unavailable():
         mt5_bridge_stale_seconds=0.01,
     )
 
-    pf._store_mt5_bridge_price("BTCUSDT", 74150.0, time.time() - 1.0)
+    pf._store_mt5_bridge_price("BTCUSDT", 74150.0, time.time() - 1.0, received_ts=time.time())
+
+    assert pf.get_price("BTCUSDT") == 74150.0
+    assert pf.get_price_source("BTCUSDT") == "exness_mt5"
+    assert pf.get_price_age("BTCUSDT") < 0.01
+    assert pf.mt5_tick_timestamps["BTCUSDT"] <= time.time() - 0.5
+
+
+def test_price_feed_marks_mt5_stale_when_bridge_receive_time_is_stale():
+    pf = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=0.01,
+    )
+
+    pf._store_mt5_bridge_price("BTCUSDT", 74150.0, time.time(), received_ts=time.time() - 1.0)
 
     assert pf.get_price("BTCUSDT") == 74150.0
     assert pf.get_price_source("BTCUSDT") == "exness_mt5_stale"
+
+
+def test_price_feed_mt5_exception_detail_is_never_empty():
+    assert PriceFeed._exception_detail(Exception()) == "Exception"
+    assert PriceFeed._exception_detail(TimeoutError()) == "TimeoutError"
+    assert PriceFeed._exception_detail(ValueError("bad tick")) == "bad tick"
+
+
+def test_price_feed_mt5_bridge_host_is_redacted_to_host_only():
+    assert PriceFeed._url_host("http://192.168.1.10:8765") == "192.168.1.10:8765"
+    assert PriceFeed._url_host("http://bridge.local:8765/path") == "bridge.local:8765"
+
+
+def test_price_feed_rewrites_local_mt5_bridge_url_inside_container(monkeypatch):
+    monkeypatch.setattr(PriceFeed, "_running_in_container", staticmethod(lambda: True))
+
+    assert PriceFeed._normalize_mt5_bridge_url("http://localhost:8765") == "http://host.docker.internal:8765"
+    assert PriceFeed._normalize_mt5_bridge_url("http://127.0.0.1:8765") == "http://host.docker.internal:8765"
+    assert PriceFeed._normalize_mt5_bridge_url("http://0.0.0.0:8765") == "http://host.docker.internal:8765"
+    assert PriceFeed._normalize_mt5_bridge_url("http://192.168.1.10:8765") == "http://192.168.1.10:8765"
+
+
+def test_small_capital_balancing_override_blocks_duplicate_down_quote_after_down_fill():
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return {
+                "quote_cycle_started": True,
+                "initial_filled": True,
+                "balancing_filled": False,
+                "initial_side": "no",
+                "initial_order_id": "OID-NO",
+            }
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    pos = SimpleNamespace(share_imbalance=lambda: 0.0)
+    quotes = SimpleNamespace(yes_buy_size=0, no_buy_size=5)
+
+    mode = cycler._apply_small_capital_balancing_override("0xmarket", pos, quotes, "normal", 5)
+
+    assert mode == "repair_up"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
+def test_small_capital_balancing_override_uses_wallet_imbalance_over_local_lag():
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return {"quote_cycle_started": True, "initial_filled": False}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    pos = SimpleNamespace(share_imbalance=lambda: 0.0)  # local fill accounting is lagging/flat
+    quotes = SimpleNamespace(yes_buy_size=0, no_buy_size=5)
+
+    mode = cycler._apply_small_capital_balancing_override(
+        "0xmarket", pos, quotes, "normal", 5, wallet_imbalance=-5.0
+    )
+
+    assert mode == "repair_up"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
+def test_small_capital_balancing_override_uses_inventory_imbalance_even_without_fill_state():
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return {"quote_cycle_started": True, "initial_filled": False}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    pos = SimpleNamespace(share_imbalance=lambda: -5.0)  # too many DOWN/NO; buy YES only
+    quotes = SimpleNamespace(yes_buy_size=0, no_buy_size=5)
+
+    mode = cycler._apply_small_capital_balancing_override("0xmarket", pos, quotes, "normal", 5)
+
+    assert mode == "repair_up"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
+def test_small_capital_opening_forces_one_side_when_normal_quote_is_two_sided():
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return {"quote_cycle_started": False, "opening_attempt_spent": False}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    quotes = SimpleNamespace(
+        yes_buy_size=5,
+        no_buy_size=5,
+        yes_buy_price=0.49,
+        no_buy_price=0.47,
+    )
+
+    side = cycler._apply_small_capital_opening_one_side("0xmarket", quotes, "normal", 0.52)
+
+    assert side == "yes"
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
+def test_small_capital_opening_does_not_touch_repair_or_spent_state():
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return {"quote_cycle_started": True, "opening_attempt_spent": True}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    quotes = SimpleNamespace(yes_buy_size=5, no_buy_size=5, yes_buy_price=0.49, no_buy_price=0.47)
+
+    side = cycler._apply_small_capital_opening_one_side("0xmarket", quotes, "normal", 0.52)
+
+    assert side is None
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 5
+
+
+def test_small_capital_marks_opening_limit_price_for_pair_cost_fallback():
+    saved = {}
+
+    class StateManager:
+        def get_small_capital_window(self, market_id):
+            return saved
+
+        def update_small_capital_window(self, market_id, state):
+            saved.update(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    cycler.order_mgr = SimpleNamespace(get_active=lambda market_id: SimpleNamespace(yes_order_id="OID-UP", no_order_id=""))
+    market = SimpleNamespace(market_id="0xmarket", slug="btc-window")
+    quotes = SimpleNamespace(yes_buy_size=5, no_buy_size=0, yes_buy_price=0.51, no_buy_price=0.48)
+
+    cycler._mark_small_capital_quote_started(market, quotes, "normal")
+
+    assert saved["initial_side"] == "yes"
+    assert saved["initial_yes_price"] == 0.51
+    assert saved["initial_price"] == 0.51
+
+
+def test_small_capital_saved_repair_cap_blocks_pair_cost_over_one_when_fifo_lags():
+    cycler = MarketCycler.__new__(MarketCycler)
+    state = {"initial_side": "yes", "initial_yes_price": 0.51}
+
+    assert cycler._small_capital_saved_repair_cap(state, "no", 0.01) == 0.48
+    assert cycler._small_capital_saved_repair_cap(state, "yes", 0.01) is None
+    assert cycler._small_capital_saved_repair_cap({"initial_side": "yes"}, "no", 0.01) is None
+
+
+def test_small_capital_emergency_hedge_waits_then_allows_bounded_pair_loss():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.small_capital_config = SimpleNamespace(
+        emergency_hedge_enabled=True,
+        emergency_hedge_after_seconds=20.0,
+        emergency_hedge_max_pair_loss=0.20,
+    )
+    waiting_state = {
+        "initial_filled": True,
+        "balancing_filled": False,
+        "initial_side": "yes",
+        "initial_yes_price": 0.51,
+        "initial_fill_ts": time.time() - 19.0,
+    }
+    cap, active, elapsed = cycler._small_capital_emergency_hedge_cap(waiting_state, "no")
+    assert cap is None
+    assert active is False
+    assert elapsed >= 18.0
+
+    expired_state = {**waiting_state, "initial_fill_ts": time.time() - 21.0}
+    cap, active, elapsed = cycler._small_capital_emergency_hedge_cap(expired_state, "no")
+    assert active is True
+    assert elapsed >= 20.0
+    assert cap == 0.69  # 1.00 + max_loss 0.20 - opening 0.51
+
+
+def test_small_capital_emergency_hedge_blocks_when_entry_price_unknown():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.small_capital_config = SimpleNamespace(
+        emergency_hedge_enabled=True,
+        emergency_hedge_after_seconds=20.0,
+        emergency_hedge_max_pair_loss=0.20,
+    )
+    state = {
+        "initial_filled": True,
+        "balancing_filled": False,
+        "initial_side": "yes",
+        "initial_fill_ts": time.time() - 21.0,
+    }
+
+    cap, active, elapsed = cycler._small_capital_emergency_hedge_cap(state, "no")
+    assert cap is None
+    assert active is True
+    assert elapsed >= 20.0
+
+
+def test_pre_expiry_auto_merge_forces_balance_monitor_preflight_even_when_pairs_unknown():
+    import asyncio
+
+    class FakeBalanceMonitor:
+        def __init__(self):
+            self.calls = []
+
+        async def check_and_merge(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"checked": True, "merged": False, "pairs_merged": 0, "usdc_recovered": 0.0}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler._has_done_pre_expiry_merge = False
+    cycler._last_pre_expiry_merge_attempt_ts = 0.0
+    cycler.balance_monitor = FakeBalanceMonitor()
+    cycler.gasless_merger = SimpleNamespace(is_available=True)
+    cycler.ctf = None
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.order_mgr = SimpleNamespace(executor=SimpleNamespace(sync_balance_allowance=lambda: True))
+    market = SimpleNamespace(market_id="M1", condition_id="0xCOND", token_id_up="1", token_id_down="2")
+    pos = SimpleNamespace(matched_pairs=lambda: 0)
+
+    result = asyncio.run(cycler._maybe_pre_expiry_auto_merge(market, pos, 120, wallet_truth=None))
+
+    assert result["checked"] is True
+    assert cycler.balance_monitor.calls
+    assert cycler.balance_monitor.calls[0]["force"] is True
+    assert cycler._has_done_pre_expiry_merge is False  # retry later if no merge yet
+
+
+def test_pre_expiry_auto_merge_marks_done_after_balance_monitor_success():
+    import asyncio
+
+    class FakeBalanceMonitor:
+        async def check_and_merge(self, **kwargs):
+            return {"checked": True, "merged": True, "pairs_merged": 5, "usdc_recovered": 5.0}
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler._has_done_pre_expiry_merge = False
+    cycler._last_pre_expiry_merge_attempt_ts = 0.0
+    cycler.balance_monitor = FakeBalanceMonitor()
+    cycler.gasless_merger = SimpleNamespace(is_available=True)
+    cycler.ctf = None
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.order_mgr = SimpleNamespace(executor=SimpleNamespace(sync_balance_allowance=lambda: True))
+    market = SimpleNamespace(market_id="M1", condition_id="0xCOND", token_id_up="1", token_id_down="2")
+    pos = SimpleNamespace(matched_pairs=lambda: 0)
+
+    result = asyncio.run(cycler._maybe_pre_expiry_auto_merge(market, pos, 120, wallet_truth=(5.0, 5.0)))
+
+    assert result["merged"] is True
+    assert result["pairs_merged"] == 5
+    assert cycler._has_done_pre_expiry_merge is True
+    assert cycler._dashboard_event["event_reason"] == "PRE_EXPIRY_AUTO_MERGE"
+
+
+def test_pre_expiry_auto_merge_triggers_only_within_two_minutes_and_pairs():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler._has_done_pre_expiry_merge = False
+
+    assert cycler._should_pre_expiry_auto_merge(121, 10) is False
+    assert cycler._should_pre_expiry_auto_merge(120, 0) is True
+    assert cycler._should_pre_expiry_auto_merge(120, 1) is True
+    assert cycler._should_pre_expiry_auto_merge(30, 1) is True
+
+    cycler._has_done_pre_expiry_merge = True
+    assert cycler._should_pre_expiry_auto_merge(120, 1) is False
+
+
+def test_dashboard_event_helper_uses_market_cycler_time_alias():
+    cycler = MarketCycler.__new__(MarketCycler)
+
+    cycler._set_dashboard_event("skip", "PRE_TRADE_FAILED", "risk check")
+
+    assert cycler._dashboard_event["event_level"] == "skip"
+    assert cycler._dashboard_event["event_reason"] == "PRE_TRADE_FAILED"
+    assert cycler._dashboard_event["event_detail"] == "risk check"
+    assert cycler._dashboard_event["event_ts"] > 0
+
+
+def test_small_capital_done_uses_wallet_truth_even_when_local_inventory_lags():
+    import asyncio
+
+    states = []
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.fair_value_model = None
+    cycler.last_fair_value = 0.5
+    cycler.last_sigma = 0.2
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.inventory.state_manager = SimpleNamespace(
+        get_small_capital_window=lambda market_id: {"quote_cycle_started": True, "initial_filled": True},
+        update_small_capital_window=lambda market_id, state: None,
+    )
+    cycler.balance_monitor = None
+    cycler._dashboard_cb = states.append
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {
+        "M1": {"yes_shares": 5.0, "no_shares": 5.0, "matched_pairs": 5.0, "share_imbalance": 0.0}
+    }
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True, stop_after_balanced_fill=True, cancel_remaining_orders_on_stop=True)
+    cycler.order_mgr = SimpleNamespace(cancel_market_quotes=AsyncMock(return_value=True))
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC up?", time_remaining=600)
+    pos = cycler.inventory.get_or_create("M1", "BTC")
+    pos.add_fill("no", 0.5, 5)  # local accounting lagged/missed YES fill
+
+    ok = asyncio.run(cycler._small_capital_maybe_stop_completed(
+        market,
+        pos,
+        "wallet_balanced",
+        wallet_snapshot=cycler._wallet_truth_by_market["M1"],
+    ))
+
+    assert ok is True
+    assert states[-1]["phase"] == "SMALL_CAP_DONE"
+    assert states[-1]["up_shares"] == 5.0
+    assert states[-1]["down_shares"] == 5.0
+    assert states[-1]["share_imbalance"] == 0.0
+    assert states[-1]["matched_pairs"] == 5.0
+    assert states[-1]["inventory_source"] == "wallet"
+
+
+def test_small_capital_done_uses_completed_state_even_when_inventory_lags():
+    import asyncio
+
+    class StateManager:
+        def __init__(self):
+            self.state = {
+                "quote_cycle_started": True,
+                "opening_attempt_spent": True,
+                "initial_filled": True,
+                "balancing_filled": True,
+                "stopped_for_window": False,
+            }
+
+        def get_small_capital_window(self, market_id):
+            return self.state
+
+        def update_small_capital_window(self, market_id, state):
+            self.state = dict(state)
+
+    states = []
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.fair_value_model = None
+    cycler.last_fair_value = 0.5
+    cycler.last_sigma = 0.2
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.inventory.state_manager = StateManager()
+    cycler.balance_monitor = None
+    cycler._dashboard_cb = states.append
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {}
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True, stop_after_balanced_fill=True, cancel_remaining_orders_on_stop=True)
+    cycler.order_mgr = SimpleNamespace(cancel_market_quotes=AsyncMock(return_value=True))
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC up?", time_remaining=600)
+    pos = cycler.inventory.get_or_create("M1", "BTC")  # local fill accounting can lag at zero briefly
+
+    ok = asyncio.run(cycler._small_capital_maybe_stop_completed(market, pos, "state_completed"))
+
+    assert ok is True
+    assert cycler.inventory.state_manager.state["stopped_for_window"] is True
+    assert states[-1]["phase"] == "SMALL_CAP_DONE"
+
+
+def test_dashboard_uses_wallet_truth_for_live_inventory_display():
+    states = []
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.fair_value_model = None
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.inventory = InventoryManager()
+    cycler.balance_monitor = None
+    cycler._dashboard_cb = states.append
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {
+        "M1": {"yes_shares": 5.0, "no_shares": 5.0, "matched_pairs": 5.0, "share_imbalance": 0.0}
+    }
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC up?")
+
+    cycler._update_dashboard(market, 100.0, 0.5, 0.2, "ACTIVE", 100)
+
+    assert states[-1]["up_shares"] == 5.0
+    assert states[-1]["down_shares"] == 5.0
+    assert states[-1]["matched_pairs"] == 5.0
+    assert states[-1]["inventory_source"] == "wallet"
+
+
+def test_small_capital_state_reconciles_from_wallet_truth():
+    class StateManager:
+        def __init__(self):
+            self.state = {"quote_cycle_started": False, "initial_filled": False, "balancing_filled": False}
+
+        def get_small_capital_window(self, market_id):
+            return self.state
+
+        def update_small_capital_window(self, market_id, state):
+            self.state = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+
+    cycler._apply_wallet_truth_to_small_capital_state("M1", {"yes_shares": 5.0, "no_shares": 5.0})
+
+    state = cycler.inventory.state_manager.state
+    assert state["quote_cycle_started"] is True
+    assert state["initial_filled"] is True
+    assert state["balancing_filled"] is True
+    assert state["wallet_truth_reconciled"] is True
+
+
+def test_small_capital_opening_spent_uses_strict_repair_for_sub_minimum_reverse_move():
+    # Regression for sudden reverse move: generic dust/FV logic might otherwise
+    # hold or quote normal/top-up. Small-cap after opening spent must only buy
+    # the opposite/light side.
+    up_size, down_size, mode = compute_inventory_repair_sizes(-2.0, 5, 5)
+
+    assert mode == "repair_up"
+    assert up_size == 5
+    assert down_size == 0
+
+
+def test_small_capital_pre_generation_allows_retry_after_unfilled_flat_spent_state():
+    import asyncio
+
+    class StateManager:
+        def __init__(self):
+            self.state = {"quote_cycle_started": True, "opening_attempt_spent": True, "initial_filled": False}
+
+        def get_small_capital_window(self, market_id):
+            return self.state
+
+        def update_small_capital_window(self, market_id, state):
+            self.state = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.inventory = InventoryManager()
+    cycler.inventory.state_manager = StateManager()
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True, retry_unfilled_opening=True)
+    cycler.order_mgr = OrderManager(DummyExecutor())
+    cycler._dashboard_cb = lambda *_: None
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {}
+    cycler.fair_value_model = None
+    cycler.last_fair_value = 0.7
+    cycler.last_sigma = 0.2
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.balance_monitor = None
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC?", time_remaining=500)
+    pos = cycler.inventory.get_or_create("M1", "BTC")
+
+    blocked = asyncio.run(cycler._small_capital_fail_closed_before_quotes(market, pos, None, 0.7, 0.2, 500))
+
+    assert blocked is False
+    state = cycler.inventory.state_manager.state
+    assert state["quote_cycle_started"] is False
+    assert state["opening_attempt_spent"] is False
+    assert state["stale_quote_cycle_repaired"] is True
+
+
+def test_small_capital_pre_generation_can_preserve_strict_wait_next_when_configured():
+    import asyncio
+
+    states = []
+    class StateManager:
+        def __init__(self):
+            self.state = {"quote_cycle_started": True, "opening_attempt_spent": True, "initial_filled": False}
+
+        def get_small_capital_window(self, market_id):
+            return self.state
+
+        def update_small_capital_window(self, market_id, state):
+            self.state = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.ac = SimpleNamespace(symbol="BTCUSDT")
+    cycler.price_feed = SimpleNamespace(prices={"BTCUSDT": 100.0}, get_price_age=lambda s: 0.1, get_price_source=lambda s: "exness_mt5")
+    cycler.inventory = InventoryManager()
+    cycler.inventory.state_manager = StateManager()
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True, retry_unfilled_opening=False)
+    cycler.order_mgr = OrderManager(DummyExecutor())
+    cycler._dashboard_cb = states.append
+    cycler._dashboard_event = {}
+    cycler._wallet_truth_by_market = {}
+    cycler.fair_value_model = None
+    cycler.last_fair_value = 0.7
+    cycler.last_sigma = 0.2
+    cycler.regime_filter = SimpleNamespace(regime=lambda: "STABLE")
+    cycler.pnl = PnLTracker()
+    cycler.balance_monitor = None
+    market = SimpleNamespace(market_id="M1", slug="btc-window", question="BTC?", time_remaining=500)
+    pos = cycler.inventory.get_or_create("M1", "BTC")
+
+    blocked = asyncio.run(cycler._small_capital_fail_closed_before_quotes(market, pos, None, 0.7, 0.2, 500))
+
+    assert blocked is True
+    assert states[-1]["phase"] == "SMALL_CAP_WAIT_NEXT"
+    assert states[-1]["event_reason"] == "SMALL_CAP_OPENING_SPENT"
+
+
+def test_small_capital_holds_active_unfilled_opening_quote_without_repricing():
+    cycler = MarketCycler.__new__(MarketCycler)
+    state = {"quote_cycle_started": True, "initial_filled": False, "initial_order_id": "OID-OPEN"}
+
+    assert cycler._small_capital_should_hold_opening_quote(state, True, 0) is True
+    assert cycler._small_capital_should_hold_opening_quote(state, False, 0) is False
+    assert cycler._small_capital_should_hold_opening_quote({**state, "initial_filled": True}, True, 0) is False
+    assert cycler._small_capital_should_hold_opening_quote(state, True, 1) is False
+    assert cycler._small_capital_opening_spent({"opening_attempt_spent": True, "quote_cycle_started": False}) is True
+
+
+def test_small_capital_canceled_unfilled_opening_can_retry_by_default():
+    class StateManager:
+        def __init__(self):
+            self.saved = None
+
+        def update_small_capital_window(self, market_id, state):
+            self.saved = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.small_capital_config = SimpleNamespace(retry_unfilled_opening=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    state = {
+        "quote_cycle_started": True,
+        "opening_attempt_spent": True,
+        "initial_filled": False,
+        "initial_order_id": "OID-CANCELED",
+        "initial_side": "no",
+        "initial_price": 0.49,
+    }
+
+    repaired = cycler._repair_small_capital_unfilled_opening_state("M1", state, False, 0)
+
+    assert repaired is True
+    assert state["quote_cycle_started"] is False
+    assert cycler._small_capital_opening_spent(state) is False
+    assert state["initial_order_id"] == ""
+    assert state["initial_side"] == ""
+    assert state["initial_price"] == 0.0
+    assert cycler.inventory.state_manager.saved["stale_quote_cycle_repaired"] is True
+
+
+def test_small_capital_canceled_unfilled_opening_can_preserve_spent_when_configured():
+    class StateManager:
+        def update_small_capital_window(self, market_id, state):
+            self.saved = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.small_capital_config = SimpleNamespace(retry_unfilled_opening=False)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    state = {"quote_cycle_started": True, "opening_attempt_spent": True, "initial_filled": False}
+
+    repaired = cycler._repair_small_capital_unfilled_opening_state("M1", state, False, 0)
+
+    assert repaired is True
+    assert state["quote_cycle_started"] is True
+    assert cycler._small_capital_opening_spent(state) is True
+
+
+def test_small_capital_does_not_mark_opening_cycle_without_order_id():
+    class StateManager:
+        def __init__(self):
+            self.state = {}
+
+        def get_small_capital_window(self, market_id):
+            return self.state.setdefault(market_id, {"quote_cycle_started": False, "quote_cycles_started": 0})
+
+        def update_small_capital_window(self, market_id, state):
+            self.state[market_id] = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    cycler.order_mgr = OrderManager(DummyExecutor())
+    market = SimpleNamespace(market_id="M1", slug="btc-window")
+    quotes = SimpleNamespace(yes_buy_size=5, no_buy_size=0)
+
+    cycler._mark_small_capital_quote_started(market, quotes, "normal")
+
+    state = cycler.inventory.state_manager.get_small_capital_window("M1")
+    assert state["quote_cycle_started"] is False
+    assert state["quote_cycles_started"] == 0
+    assert state.get("initial_order_id", "") == ""
+
+
+def test_small_capital_marks_opening_cycle_only_after_order_id_exists():
+    class StateManager:
+        def __init__(self):
+            self.state = {}
+
+        def get_small_capital_window(self, market_id):
+            return self.state.setdefault(market_id, {"quote_cycle_started": False, "quote_cycles_started": 0})
+
+        def update_small_capital_window(self, market_id, state):
+            self.state[market_id] = dict(state)
+
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    cycler.small_capital_config = SimpleNamespace(enabled=True, one_cycle_per_window=True)
+    cycler.inventory = SimpleNamespace(state_manager=StateManager())
+    cycler.order_mgr = OrderManager(DummyExecutor())
+    active = cycler.order_mgr.get_active("M1")
+    active.yes_order_id = "OID-YES"
+    market = SimpleNamespace(market_id="M1", slug="btc-window")
+    quotes = SimpleNamespace(yes_buy_size=5, no_buy_size=0)
+
+    cycler._mark_small_capital_quote_started(market, quotes, "normal")
+
+    state = cycler.inventory.state_manager.get_small_capital_window("M1")
+    assert state["quote_cycle_started"] is True
+    assert state["quote_cycles_started"] == 1
+    assert state["initial_order_id"] == "OID-YES"
 
 
 def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():

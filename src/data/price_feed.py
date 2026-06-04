@@ -7,11 +7,13 @@ and maintains latest price + rolling data for each subscribed symbol.
 
 import asyncio
 import json
+import os
 import time
 import math
 import numpy as np
 from collections import deque
 from typing import Dict, Optional, Callable
+from urllib.parse import urlparse, urlunparse
 
 import websockets
 
@@ -41,7 +43,7 @@ class PriceFeed:
         """
         self.ws_url = ws_url
         self.rest_url = rest_url
-        self.mt5_bridge_url = (mt5_bridge_url or "").rstrip("/")
+        self.mt5_bridge_url = self._normalize_mt5_bridge_url(mt5_bridge_url or "")
         self.mt5_bridge_api_key = mt5_bridge_api_key or ""
         self.mt5_bridge_stale_seconds = float(mt5_bridge_stale_seconds or 5.0)
         self.symbols = [s.lower() for s in symbols]
@@ -54,6 +56,7 @@ class PriceFeed:
         # Timestamp of latest usable feed update
         self.timestamps: Dict[str, float] = {}
         self.price_sources: Dict[str, str] = {}
+        self.mt5_tick_timestamps: Dict[str, float] = {}
         self.book_mid_prices: Dict[str, float] = {}
         self.book_timestamps: Dict[str, float] = {}
         self.trade_prices: Dict[str, float] = {}
@@ -71,6 +74,8 @@ class PriceFeed:
         self._reconnect_delay = 1
         self._last_message_ts: float = 0.0
         self._message_timeout: float = 15.0
+        self._mt5_bridge_unavailable_until: float = 0.0
+        self._mt5_bridge_unreachable_backoff_seconds: float = max(5.0, self.mt5_bridge_stale_seconds)
         # Throttle: only record one price sample per second for vol calculation
         self._last_history_ts: Dict[str, float] = {}
 
@@ -325,12 +330,58 @@ class PriceFeed:
             return sym[:-1]  # BTCUSDT -> BTCUSD
         return sym
 
-    def _store_mt5_bridge_price(self, symbol: str, price: float, ts: float) -> None:
+    @staticmethod
+    def _running_in_container() -> bool:
+        if os.path.exists("/.dockerenv"):
+            return True
+        try:
+            with open("/proc/1/cgroup", "r") as f:
+                return any(marker in f.read() for marker in ("docker", "kubepods", "containerd"))
+        except OSError:
+            return False
+
+    @classmethod
+    def _normalize_mt5_bridge_url(cls, url: str) -> str:
+        """Make localhost MT5 bridge URLs reachable from Docker containers.
+
+        MT5 usually runs on the host/Windows side, while the bot may run in a
+        container. In that topology, http://localhost:8765 points at the bot
+        container itself, not the MT5 bridge. Docker's host-gateway alias fixes
+        that when docker-compose provides host.docker.internal.
+        """
+        clean = (url or "").rstrip("/")
+        if not clean:
+            return ""
+        parsed = urlparse(clean)
+        if cls._running_in_container() and parsed.hostname in {"localhost", "127.0.0.1", "0.0.0.0"}:
+            netloc = "host.docker.internal"
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            return urlunparse(parsed._replace(netloc=netloc))
+        return clean
+
+    def _store_mt5_bridge_price(self, symbol: str, price: float, ts: float, received_ts: float | None = None) -> None:
         """Store an MT5 bridge price, even when stale, as the active MT5 source."""
         sym = symbol.upper()
         self.prices[sym] = price
-        self.timestamps[sym] = ts or time.time()
+        # Active feed age should mean "seconds since the bot successfully
+        # received an MT5 bridge update". MT5 tick timestamps can remain old or
+        # repeat even while the bridge is healthy, which made the dashboard show
+        # false STALE_SPOT events.
+        self.timestamps[sym] = received_ts or time.time()
+        self.mt5_tick_timestamps[sym] = ts or self.timestamps[sym]
         self.price_sources[sym] = "exness_mt5"
+
+    @staticmethod
+    def _exception_detail(exc: Exception) -> str:
+        """Return a non-empty, actionable exception detail for structured logs."""
+        detail = str(exc).strip()
+        return detail or exc.__class__.__name__
+
+    @staticmethod
+    def _url_host(url: str) -> str:
+        parsed = urlparse(url)
+        return parsed.netloc or parsed.path or "unknown"
 
     async def fetch_mt5_bridge_price(self, symbol: str) -> Optional[float]:
         """Fetch primary Exness/MT5 spot from local/remote bridge if configured."""
@@ -340,24 +391,44 @@ class PriceFeed:
         import httpx
         sym = symbol.upper()
         bridge_symbol = self._mt5_symbol_for(sym)
+        url = f"{self.mt5_bridge_url}/price/{bridge_symbol}"
+        host = self._url_host(self.mt5_bridge_url)
+        now = time.time()
+        if now < self._mt5_bridge_unavailable_until:
+            log.debug(
+                "mt5_bridge_unreachable_backoff",
+                symbol=bridge_symbol,
+                host=host,
+                retry_in=round(self._mt5_bridge_unavailable_until - now, 3),
+            )
+            return None
         try:
             headers = {}
             if self.mt5_bridge_api_key:
                 headers["X-API-Key"] = self.mt5_bridge_api_key
             async with httpx.AsyncClient(timeout=1.5) as client:
-                resp = await client.get(
-                    f"{self.mt5_bridge_url}/price/{bridge_symbol}",
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+                resp = await client.get(url, headers=headers)
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                if resp.status_code >= 400:
+                    bridge_error = str(data.get("error") or "").strip()
+                    detail = bridge_error or f"HTTP {resp.status_code}"
+                    log.warning(
+                        "mt5_bridge_price_error",
+                        symbol=bridge_symbol,
+                        error=detail,
+                        status_code=resp.status_code,
+                    )
+                    return None
             price = float(data.get("mid") or data.get("price") or 0)
             ts = float(data.get("ts") or 0)
             now = time.time()
             if price <= 0:
                 return None
             age = max(0.0, now - ts) if ts else 0.0
-            self._store_mt5_bridge_price(sym, price, ts or now)
+            self._store_mt5_bridge_price(sym, price, ts or now, received_ts=now)
             if age > self.mt5_bridge_stale_seconds:
                 log.warning("mt5_bridge_price_stale",
                             symbol=bridge_symbol, age=round(age, 3),
@@ -374,8 +445,44 @@ class PriceFeed:
                 except Exception as e:
                     log.debug("mt5_price_callback_error", error=str(e))
             return price
+        except httpx.ConnectTimeout as e:
+            self._mt5_bridge_unavailable_until = time.time() + self._mt5_bridge_unreachable_backoff_seconds
+            log.warning(
+                "mt5_bridge_price_error",
+                symbol=bridge_symbol,
+                host=host,
+                error=self._exception_detail(e),
+                error_type=e.__class__.__name__,
+                connect_timeout_seconds=1.5,
+                retry_in=self._mt5_bridge_unreachable_backoff_seconds,
+            )
+            return None
+        except httpx.TimeoutException as e:
+            log.warning(
+                "mt5_bridge_price_timeout",
+                symbol=bridge_symbol,
+                host=host,
+                error=self._exception_detail(e),
+                error_type=e.__class__.__name__,
+                timeout_seconds=1.5,
+            )
+            return None
+        except httpx.HTTPError as e:
+            log.warning(
+                "mt5_bridge_price_error",
+                symbol=bridge_symbol,
+                error=self._exception_detail(e),
+                error_type=e.__class__.__name__,
+                host=host,
+            )
+            return None
         except Exception as e:
-            log.warning("mt5_bridge_price_error", symbol=bridge_symbol, error=str(e))
+            log.warning(
+                "mt5_bridge_price_error",
+                symbol=bridge_symbol,
+                error=self._exception_detail(e),
+                error_type=e.__class__.__name__,
+            )
             return None
 
     async def fetch_price_rest(self, symbol: str,
@@ -664,4 +771,3 @@ class PriceFeed:
         except Exception as e:
             log.error("chainlink_error", symbol=symbol, error=str(e))
             return None
-

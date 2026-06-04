@@ -162,6 +162,16 @@ class Dashboard:
         table.add_row("Regime", s.get("regime", "STABLE"),
                        "", "")
 
+        event_reason = s.get("event_reason", "") or s.get("skip_reason", "") or s.get("error_reason", "")
+        if event_reason:
+            event_level = (s.get("event_level", "info") or "info").lower()
+            event_detail = s.get("event_detail", "") or ""
+            color = {"error": "red bold", "critical": "red bold", "warning": "yellow", "skip": "yellow", "info": "cyan"}.get(event_level, "cyan")
+            text = str(event_reason)
+            if event_detail:
+                text = f"{text}: {event_detail}"
+            table.add_row("Last Event", f"[{color}]{text[:70]}[/]", "", "")
+
         # Wallet balance (live mode only or simulated)
         wallet_bal = s.get("wallet_balance", -1)
         if wallet_bal >= 0:
@@ -208,6 +218,7 @@ class Dashboard:
         table.add_column("Fills", width=5, justify="right")
         table.add_column("Rebate", width=9, justify="right")
         table.add_column("Net P&L", width=9, justify="right")
+        table.add_column("Last Event", width=18)
 
         for asset in sorted(self._states.keys()):
             s = self._states[asset]
@@ -225,6 +236,7 @@ class Dashboard:
             fills = s.get("total_fills", 0) or 0
             rebates = s.get("est_rebates", 0) or 0
             net = s.get("economic_pnl", s.get("net_pnl", 0)) or 0
+            event_reason = s.get("event_reason", "") or s.get("skip_reason", "") or s.get("error_reason", "") or ""
 
             rc = "green" if rebates > 0 else "dim"
             nc = "green" if net >= 0 else "red"
@@ -240,6 +252,7 @@ class Dashboard:
                 str(fills),
                 f"[{rc}]${rebates:.3f}[/]",
                 f"[{nc}]${net:.3f}[/]",
+                str(event_reason)[:18],
             )
 
         # Summary row
@@ -253,6 +266,7 @@ class Dashboard:
             f"[bold]{total_fills}[/]",
             f"[bold green]${total_rebates:.3f}[/]",
             f"[bold {nc}]${total_net:.3f}[/]",
+            "",
         )
 
         return table
