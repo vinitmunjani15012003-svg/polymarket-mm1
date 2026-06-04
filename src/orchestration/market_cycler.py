@@ -29,7 +29,13 @@ from src.risk.risk_engine import (RiskEngine, determine_phase,
                                    apply_phase_params, pre_trade_checks)
 from src.monitoring.pnl_tracker import PnLTracker
 from src.monitoring.logger import get_logger
-from src.orchestration.quote_cycle import QuoteCycleContext
+from src.orchestration.quote_cycle import (
+    QuoteCycleContext,
+    decide_basis_risk,
+    decide_stale_spot,
+    package_book_snapshot,
+    package_fair_value_result,
+)
 from src.orchestration.small_capital import SmallCapitalLifecycle
 
 log = get_logger("market_cycler")
@@ -1118,9 +1124,24 @@ class MarketCycler:
             log.error("pre_quote_live_fill_sync_error", error=str(e))
             return False
 
+    def _quote_cycle_context(self, market: MarketInfo, now: float | None = None) -> QuoteCycleContext:
+        return QuoteCycleContext.from_market(market, now=_time.time() if now is None else now)
+
+    def _decide_stale_spot(self, raw_spot, price_age: float, max_spot_age: float):
+        return decide_stale_spot(raw_spot, price_age, max_spot_age)
+
+    def _package_book_snapshot(self, books, market: MarketInfo):
+        return package_book_snapshot(books, market)
+
+    def _package_fair_value_result(self, fv_result, polymarket_mid_up):
+        return package_fair_value_result(fv_result, polymarket_mid_up)
+
+    def _decide_basis_risk(self, **kwargs):
+        return decide_basis_risk(**kwargs)
+
     async def _quote_cycle(self, market: MarketInfo):
         """Single quote cycle iteration."""
-        ctx = QuoteCycleContext.from_market(market, now=_time.time())
+        ctx = self._quote_cycle_context(market)
         now = ctx.now
         remaining = ctx.remaining
 
@@ -1155,14 +1176,15 @@ class MarketCycler:
                 price_source = (self.price_feed.get_price_source(self.ac.symbol)
                                 if hasattr(self.price_feed, "get_price_source") else "unknown")
 
-        if not raw_spot:
+        stale_spot_decision = self._decide_stale_spot(raw_spot, price_age, max_spot_age)
+        if stale_spot_decision.should_stop and stale_spot_decision.dashboard_reason == "NO_SPOT":
             log.warning("no_spot_price", symbol=self.ac.symbol)
             self._set_dashboard_event("skip", "NO_SPOT_PRICE", f"{self.ac.symbol} unavailable")
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, 0, self.last_fair_value or 0, self._dashboard_sigma_for_stale_spot(), "NO_SPOT", remaining)
             return
 
-        if price_age > max_spot_age:
+        if stale_spot_decision.should_stop and stale_spot_decision.dashboard_reason == "STALE_SPOT":
             log.warning(
                 "spot_price_stale_stop_quoting",
                 asset=self.asset,
@@ -1174,7 +1196,7 @@ class MarketCycler:
             self._set_dashboard_event(
                 "skip",
                 "STALE_SPOT",
-                f"age {price_age:.2f}s > max {max_spot_age:.2f}s",
+                stale_spot_decision.event_message or f"age {price_age:.2f}s > max {max_spot_age:.2f}s",
             )
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(
@@ -1256,13 +1278,14 @@ class MarketCycler:
         # raw/model FV while the UI/book price was already far away (e.g. UP 15c
         # but dashboard stuck near 54c).
         books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
-        book_up = books.get(market.token_id_up)
-        book_down = books.get(market.token_id_down)
-        best_ask_yes = book_up.best_ask if book_up else None
-        best_bid_yes = book_up.best_bid if book_up else None
-        best_ask_no = book_down.best_ask if book_down else None
-        best_bid_no = book_down.best_bid if book_down else None
-        polymarket_mid_up = polymarket_implied_up_mid(book_up, book_down)
+        book_snapshot = self._package_book_snapshot(books, market)
+        book_up = book_snapshot.book_up
+        book_down = book_snapshot.book_down
+        best_ask_yes = book_snapshot.best_ask_yes
+        best_bid_yes = book_snapshot.best_bid_yes
+        best_ask_no = book_snapshot.best_ask_no
+        best_bid_no = book_snapshot.best_bid_no
+        polymarket_mid_up = book_snapshot.polymarket_mid_up
 
         # Dynamic live oracle/Polymarket spot estimate. Only use this to adjust
         # Binance/fallback feeds. If Exness/MT5 is active, it is the primary live
@@ -1323,10 +1346,11 @@ class MarketCycler:
             ),
             update_state=False,
         )
-        model_fv = fv_result.raw_fv
-        model_confidence = fv_result.confidence
-        uncapped_fv = fv_result.blended_fv
-        fv = fv_result.tradable_fv
+        fv_package = self._package_fair_value_result(fv_result, polymarket_mid_up)
+        model_fv = fv_package.model_fv
+        model_confidence = fv_package.model_confidence
+        uncapped_fv = fv_package.uncapped_fv
+        fv = fv_package.tradable_fv
         if polymarket_mid_up is not None and abs(float(fv or 0) - float(uncapped_fv or 0)) >= 0.0001:
             log.warning(
                 "fair_value_market_deviation_capped",
@@ -1347,7 +1371,7 @@ class MarketCycler:
         if hasattr(self.order_mgr.executor, 'update_fair_value'):
             self.order_mgr.executor.update_fair_value(fv, spot)
 
-        basis_delta = abs(model_fv - polymarket_mid_up) if polymarket_mid_up is not None else None
+        basis_delta = fv_package.basis_delta
         log.info(
             "fair_value_inputs",
             asset=self.asset,
@@ -1804,11 +1828,17 @@ class MarketCycler:
 
         # Book snapshots/FV blend were already computed before any early-return
         # path so dashboard, risk, sizing, and quotes all use one FV source.
-        if (repair_mode == "normal"
-                and not balance_only
-                and not is_halted
-                and basis_guard_triggered(model_fv, polymarket_mid_up)):
-            if abs_imbalance >= min_order_size:
+        basis_risk_decision = self._decide_basis_risk(
+            repair_mode=repair_mode,
+            balance_only=balance_only,
+            is_halted=is_halted,
+            model_fv=model_fv,
+            polymarket_mid_up=polymarket_mid_up,
+            abs_imbalance=abs_imbalance,
+            min_order_size=min_order_size,
+        )
+        if basis_risk_decision.triggered:
+            if basis_risk_decision.action == "close_only":
                 up_size, down_size, repair_mode = compute_inventory_repair_sizes(
                     imbalance,
                     min_order_size,
