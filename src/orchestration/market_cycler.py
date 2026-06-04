@@ -90,6 +90,7 @@ from src.services.quoting import (
     FV_FAVORED_ENTRY_STOP_SECONDS,
     FV_FAVORED_ENTRY_THRESHOLD,
     MIN_LIVE_PAIR_EDGE,
+    QuotePolicy,
     apply_directional_market_guard,
     apply_fv_favored_entry_mode,
     apply_pair_cost_precheck,
@@ -1674,6 +1675,7 @@ class MarketCycler:
             best_bid_yes=best_bid_yes,
             best_bid_no=best_bid_no,
         )
+        quote_policy = QuotePolicy()
         quotes.phase = phase
         quotes = apply_dust_price_guardrails(
             quotes,
@@ -1868,45 +1870,40 @@ class MarketCycler:
             # Polymarket's minimum order size. Dust-normalization is an atomic
             # paired plan: if either leg is no longer valid, cancel both rather
             # than leaving a one-sided top-up landmine.
-            quotes.yes_buy_size, quotes.no_buy_size = normalize_quote_sizes(
-                quotes.yes_buy_size,
-                quotes.no_buy_size,
+            quote_policy.normalize_sizes(
+                quotes,
                 min_order_size,
                 allow_round_up=False,
+                repair_mode=repair_mode,
             )
-            if repair_mode.startswith("dust_") and (
-                quotes.yes_buy_size < min_order_size or quotes.no_buy_size < min_order_size
-            ):
-                quotes.yes_buy_size = 0
-                quotes.no_buy_size = 0
 
             # Final invariant after all capital/backoff transforms: repair mode
             # is close-only. repair_up means Down is heavy, so quote YES only;
             # repair_down means Up is heavy, so quote NO only.
-            if repair_mode == "repair_up":
-                quotes.no_buy_size = 0
-            elif repair_mode == "repair_down":
-                quotes.yes_buy_size = 0
+            quote_policy.enforce_repair_side(quotes, repair_mode)
 
             # Normal/balanced quoting is atomic unless we intentionally entered
             # FV-favored one-sided entry mode while flat. Capital scaling/backoff
             # must not accidentally turn a balanced market into a one-sided bet.
-            if repair_mode == "normal" and abs_imbalance < min_order_size:
-                one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
-                merge_blocked = self._merge_unavailable_until > _time.time()
-                allowed_fv_entry = fv_entry_side in ("yes", "no") and one_sided_normal and not merge_blocked
-                allowed_sct_entry = sct_entry_side in ("yes", "no") and one_sided_normal and not merge_blocked
-                if (one_sided_normal and not (allowed_fv_entry or allowed_sct_entry)) or merge_blocked:
-                    log.warning(
-                        "normal_quote_blocked_not_atomic",
-                        asset=self.asset,
-                        yes_size=quotes.yes_buy_size,
-                        no_size=quotes.no_buy_size,
-                        merge_blocked=merge_blocked,
-                        imbalance=round(imbalance, 4),
-                    )
-                    quotes.yes_buy_size = 0
-                    quotes.no_buy_size = 0
+            atomic_decision = quote_policy.enforce_normal_atomicity(
+                quotes,
+                repair_mode=repair_mode,
+                abs_imbalance=abs_imbalance,
+                min_order_size=min_order_size,
+                fv_entry_side=fv_entry_side,
+                sct_entry_side=sct_entry_side,
+                merge_blocked=self._merge_unavailable_until > _time.time(),
+                reason="NORMAL_QUOTE_NOT_ATOMIC",
+            )
+            if not atomic_decision.allowed:
+                log.warning(
+                    "normal_quote_blocked_not_atomic",
+                    asset=self.asset,
+                    yes_size=atomic_decision.metadata.get("before", {}).get("yes_size", quotes.yes_buy_size),
+                    no_size=atomic_decision.metadata.get("before", {}).get("no_size", quotes.no_buy_size),
+                    merge_blocked=atomic_decision.metadata.get("merge_blocked", False),
+                    imbalance=round(imbalance, 4),
+                )
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
@@ -1914,20 +1911,23 @@ class MarketCycler:
         # Belt-and-suspenders atomicity check outside the guardrail try-block:
         # flat normal mode must be both-side, no-side, or an explicitly allowed
         # FV entry. It must never accidentally leak one naked side.
-        if repair_mode == "normal" and abs_imbalance < min_order_size:
-            one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
-            allowed_fv_entry = fv_entry_side in ("yes", "no") and one_sided_normal
-            allowed_sct_entry = sct_entry_side in ("yes", "no") and one_sided_normal
-            if one_sided_normal and not (allowed_fv_entry or allowed_sct_entry):
-                log.warning(
-                    "normal_quote_blocked_not_atomic_final",
-                    asset=self.asset,
-                    yes_size=quotes.yes_buy_size,
-                    no_size=quotes.no_buy_size,
-                    imbalance=round(imbalance, 4),
-                )
-                quotes.yes_buy_size = 0
-                quotes.no_buy_size = 0
+        final_atomic_decision = quote_policy.enforce_normal_atomicity(
+            quotes,
+            repair_mode=repair_mode,
+            abs_imbalance=abs_imbalance,
+            min_order_size=min_order_size,
+            fv_entry_side=fv_entry_side,
+            sct_entry_side=sct_entry_side,
+            reason="NORMAL_QUOTE_NOT_ATOMIC_FINAL",
+        )
+        if not final_atomic_decision.allowed:
+            log.warning(
+                "normal_quote_blocked_not_atomic_final",
+                asset=self.asset,
+                yes_size=final_atomic_decision.metadata.get("before", {}).get("yes_size", quotes.yes_buy_size),
+                no_size=final_atomic_decision.metadata.get("before", {}).get("no_size", quotes.no_buy_size),
+                imbalance=round(imbalance, 4),
+            )
 
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
             self._set_dashboard_event("skip", "NO_QUOTES", halt_reason if is_halted else phase)
@@ -2022,13 +2022,13 @@ class MarketCycler:
         # by at least one live-min order, do not quote the heavy side. This is a
         # final backstop against quote-engine/capital transforms reintroducing
         # the side we are trying to stop buying.
-        if abs(pos.share_imbalance()) >= min_order_size:
-            if pos.share_imbalance() > 0:
-                quotes.yes_buy_size = 0
-                repair_mode = "repair_down"
-            else:
-                quotes.no_buy_size = 0
-                repair_mode = "repair_up"
+        heavy_side_decision = quote_policy.enforce_inventory_heavy_side(
+            quotes,
+            pos.share_imbalance(),
+            min_order_size,
+            repair_mode,
+        )
+        repair_mode = heavy_side_decision.metadata.get("repair_mode", repair_mode)
 
         # ──────────────────────────────────────────────────────────
         # Universal pair-cost guard: cap EACH side's bid against
@@ -2118,50 +2118,60 @@ class MarketCycler:
             if cap >= 0.99:
                 continue
 
-            is_repair = (repair_mode == f"repair_{side_label}"
-                         or (side_label == "yes" and repair_mode == "repair_up")
-                         or (side_label == "no" and repair_mode == "repair_down"))
-
-            if cap < 0.01:
+            pair_cost_decision = quote_policy.apply_pair_cost_side_guard(
+                quotes,
+                side_label=side_label,
+                repair_mode=repair_mode,
+                cap=cap,
+                pair_edge=pair_edge,
+                best_ask=best_ask,
+                best_bid=best_bid,
+                aggressive_price_fn=aggressive_repair_price,
+                guard_source=sct_guard_source,
+            )
+            if pair_cost_decision.reason == "PAIR_COST_BLOCKED":
                 log.warning("pair_cost_guard_blocked",
                             market=market.market_id[:8], side=side_label,
                             quoted=price_val, cap=round(cap, 4),
                             mode=repair_mode)
-                setattr(quotes, buy_size_attr, 0)
-            elif is_repair:
-                # In repair mode: use aggressive pricing up to cap
-                old_price = price_val
-                new_price = aggressive_repair_price(
-                    price_val, cap, best_ask=best_ask, best_bid=best_bid)
-                if new_price is None:
-                    setattr(quotes, buy_size_attr, 0)
-                else:
-                    if old_price and old_price > cap:
-                        log.warning("repair_quote_capped_for_pair_edge",
-                                    market=market.market_id[:8], side=side_label,
-                                    quoted=old_price, cap=round(cap, 4),
-                                    min_edge=pair_edge,
-                                    source=sct_guard_source)
-                    elif new_price > float(old_price or 0):
-                        log.info("repair_quote_aggressed_to_cap",
-                                 market=market.market_id[:8], side=side_label,
-                                 old=old_price, new=new_price,
-                                 cap=round(cap, 4), min_edge=pair_edge,
-                                 best_ask=best_ask)
-                    setattr(quotes, buy_price_attr, new_price)
-            elif float(price_val) > cap:
+            elif pair_cost_decision.reason == "REPAIR_QUOTE_CAPPED_FOR_PAIR_EDGE":
+                log.warning("repair_quote_capped_for_pair_edge",
+                            market=market.market_id[:8], side=side_label,
+                            quoted=pair_cost_decision.metadata.get("old_price"), cap=round(cap, 4),
+                            min_edge=pair_edge,
+                            source=sct_guard_source)
+            elif pair_cost_decision.reason == "REPAIR_QUOTE_AGGRESSED_TO_CAP":
+                log.info("repair_quote_aggressed_to_cap",
+                         market=market.market_id[:8], side=side_label,
+                         old=pair_cost_decision.metadata.get("old_price"),
+                         new=pair_cost_decision.metadata.get("new_price"),
+                         cap=round(cap, 4), min_edge=pair_edge,
+                         best_ask=best_ask)
+            elif pair_cost_decision.reason == "PAIR_COST_CLAMPED":
                 # Normal mode: silently clamp to cap
                 log.info("pair_cost_guard_clamped",
                          market=market.market_id[:8], side=side_label,
                          quoted=price_val, cap=round(cap, 4),
                          mode=repair_mode)
-                setattr(quotes, buy_price_attr, round(cap, 2))
 
         quotes.combined_cost = round(float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0), 4)
         quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
 
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
             self._set_dashboard_event("skip", "NO_QUOTES", halt_reason if is_halted else phase)
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
+
+        final_quote_decision = quote_policy.validate_final(quotes, max_combined_cost=MAX_COMBINED_COST)
+        if not final_quote_decision.allowed:
+            log.warning(
+                "final_quote_validation_failed",
+                market=market.market_id,
+                reason=final_quote_decision.reason,
+                **final_quote_decision.metadata,
+            )
+            self._set_dashboard_event("skip", final_quote_decision.reason, str(final_quote_decision.metadata)[:160])
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
             return

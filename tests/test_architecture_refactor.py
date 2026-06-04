@@ -98,6 +98,124 @@ def test_quote_policy_helpers_apply_directional_and_pair_cost_guards():
     assert quotes.no_buy_size == 0
 
 
+def test_quote_policy_final_validation_ignores_inactive_stale_side_prices():
+    quotes = SimpleNamespace(yes_buy_price=1.25, yes_buy_size=0, no_buy_price=0.40, no_buy_size=5)
+
+    decision = QuotePolicy().validate_final(quotes)
+
+    assert decision.allowed is True
+    assert decision.reason == "OK"
+
+
+def test_quote_policy_final_validation_blocks_active_pair_cost():
+    quotes = SimpleNamespace(yes_buy_price=0.60, yes_buy_size=5, no_buy_price=0.40, no_buy_size=5)
+
+    decision = QuotePolicy().validate_final(quotes, max_combined_cost=0.99)
+
+    assert decision.allowed is False
+    assert decision.reason == "PAIR_COST_TOO_HIGH"
+    assert decision.metadata["combined_cost"] == 1.0
+
+
+def test_quote_policy_normalizes_dust_repairs_atomically():
+    quotes = SimpleNamespace(yes_buy_price=0.50, yes_buy_size=3, no_buy_price=0.45, no_buy_size=6)
+
+    decision = QuotePolicy().normalize_sizes(quotes, min_order_size=5, allow_round_up=False, repair_mode="dust_up")
+
+    assert decision.allowed is False
+    assert decision.reason == "DUST_REPAIR_NOT_ATOMIC"
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 0
+
+
+def test_quote_policy_normal_atomicity_allows_explicit_entry_modes_only():
+    quotes = SimpleNamespace(yes_buy_price=0.50, yes_buy_size=5, no_buy_price=0.45, no_buy_size=0)
+    policy = QuotePolicy()
+
+    blocked = policy.enforce_normal_atomicity(
+        quotes,
+        repair_mode="normal",
+        abs_imbalance=0,
+        min_order_size=5,
+    )
+
+    assert blocked.allowed is False
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 0
+
+    quotes = SimpleNamespace(yes_buy_price=0.50, yes_buy_size=5, no_buy_price=0.45, no_buy_size=0)
+    allowed = policy.enforce_normal_atomicity(
+        quotes,
+        repair_mode="normal",
+        abs_imbalance=0,
+        min_order_size=5,
+        fv_entry_side="yes",
+    )
+
+    assert allowed.allowed is True
+    assert quotes.yes_buy_size == 5
+    assert quotes.no_buy_size == 0
+
+
+def test_quote_policy_pair_cost_guard_supports_quote_result_like_objects():
+    class QuoteResultLike:
+        yes_buy_price = 0.70
+        yes_buy_size = 5
+        no_buy_price = 0.20
+        no_buy_size = 5
+
+    quotes = QuoteResultLike()
+
+    decision = QuotePolicy().apply_pair_cost_side_guard(
+        quotes,
+        side_label="yes",
+        repair_mode="normal",
+        cap=0.64,
+        pair_edge=0.02,
+        best_ask=0.72,
+        best_bid=0.68,
+        aggressive_price_fn=lambda price, cap, best_ask=None, best_bid=None: min(price, cap),
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "PAIR_COST_CLAMPED"
+    assert quotes.yes_buy_price == 0.64
+    assert quotes.yes_buy_size == 5
+
+
+def test_quote_policy_repair_pair_cost_guard_caps_or_blocks_side():
+    quotes = SimpleNamespace(yes_buy_price=0.70, yes_buy_size=5, no_buy_price=0.20, no_buy_size=5)
+
+    capped = QuotePolicy().apply_pair_cost_side_guard(
+        quotes,
+        side_label="yes",
+        repair_mode="repair_up",
+        cap=0.65,
+        pair_edge=0.02,
+        best_ask=0.72,
+        best_bid=0.68,
+        aggressive_price_fn=lambda price, cap, best_ask=None, best_bid=None: min(price, cap),
+    )
+
+    assert capped.reason == "REPAIR_QUOTE_CAPPED_FOR_PAIR_EDGE"
+    assert quotes.yes_buy_price == 0.65
+
+    blocked = QuotePolicy().apply_pair_cost_side_guard(
+        quotes,
+        side_label="yes",
+        repair_mode="normal",
+        cap=0.005,
+        pair_edge=0.02,
+        best_ask=None,
+        best_bid=None,
+        aggressive_price_fn=lambda price, cap, best_ask=None, best_bid=None: None,
+    )
+
+    assert blocked.allowed is False
+    assert blocked.reason == "PAIR_COST_BLOCKED"
+    assert quotes.yes_buy_size == 0
+
+
 def test_quote_size_policy_normalizes_and_rejects_sub_min_repairs():
     assert normalize_quote_sizes(2, 0, min_order_size=5, allow_round_up=True) == (5, 0)
     assert normalize_quote_sizes(2, 7, min_order_size=5, allow_round_up=False) == (0, 7)
