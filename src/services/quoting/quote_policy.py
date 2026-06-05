@@ -55,6 +55,20 @@ class QuotePolicy:
                 yes_size=quotes.yes_buy_size,
                 no_size=quotes.no_buy_size,
             )
+        if repair_mode == "balanced_repair":
+            pair_size = min(int(quotes.yes_buy_size or 0), int(quotes.no_buy_size or 0))
+            if pair_size < min_order_size:
+                quotes.yes_buy_size = 0
+                quotes.no_buy_size = 0
+                return DecisionResult.block(
+                    "HOLD",
+                    "BALANCED_REPAIR_NOT_ATOMIC",
+                    before=before,
+                    yes_size=quotes.yes_buy_size,
+                    no_size=quotes.no_buy_size,
+                )
+            quotes.yes_buy_size = pair_size
+            quotes.no_buy_size = pair_size
         return DecisionResult.allow(
             "QUOTE",
             "SIZES_NORMALIZED",

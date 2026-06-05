@@ -78,9 +78,11 @@ from src.services.fair_value import (
 from src.services.inventory import (
     aggressive_repair_price,
     apply_dust_price_guardrails,
+    balanced_repair_debt_eligible,
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     has_negative_matched_pair_edge,  # compatibility re-export; live cycler uses quote_cycle decisions
+    plan_balanced_negative_edge_repair,
     plan_repair_price_cap,
     repair_min_edge_for_remaining,
     repair_price_cap,  # compatibility re-export; live repair planning owns behavior
@@ -121,7 +123,8 @@ class MarketCycler:
                  ctf_ops: Optional[CTFOperations] = None,
                  gasless_merger: Optional[GaslessMerger] = None,
                  balance_monitor: Optional[BalanceMonitor] = None,
-                 small_capital_config=None):
+                 small_capital_config=None,
+                 balanced_repair_config=None):
 
         self.asset = asset
         self.ac = asset_config
@@ -141,6 +144,7 @@ class MarketCycler:
         self.gasless_merger: Optional[GaslessMerger] = gasless_merger
         self.balance_monitor: Optional[BalanceMonitor] = balance_monitor
         self.small_capital_config = small_capital_config
+        self.balanced_repair_config = balanced_repair_config
         self.small_capital = SmallCapitalLifecycle(self)
         log.info(
             "market_cycler_small_capital_mode",
@@ -1215,92 +1219,112 @@ class MarketCycler:
         if negative_pair_edge.triggered:
             pairs = negative_pair_edge.matched_pairs
             pair_pnl = round(negative_pair_edge.pair_pnl, 4)
-            condition_id = getattr(pos, "condition_id", None) or market.market_id
-            log.warning(
-                "negative_pair_edge_recovery",
-                asset=self.asset,
-                market=market.market_id[:8],
-                matched_pairs=pairs,
-                pair_pnl=pair_pnl,
-                msg="Stale negative-edge pairs detected; merging to recover capital",
+            debt_eligible, debt_reason, debt_meta = balanced_repair_debt_eligible(
+                pos, self.balanced_repair_config
             )
-
-            # The loss is already locked in from fills. Merge recovers ~$1/pair
-            # minus the small loss back to the wallet. Halting would just
-            # abandon the capital AND prevent future profitable trading.
-            merged = False
-            if pairs > 0 and condition_id:
-                amount = int(pairs * 1e6)
-                tx = None
-
-                # Infer correct collateral for this market
-                collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
-                if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
-                    try:
-                        from src.execution.ctf_ops import infer_collateral_token_for_market
-                        collateral_token = infer_collateral_token_for_market(
-                            self.balance_monitor._w3,
-                            self.balance_monitor._ctf,
-                            condition_id,
-                            getattr(pos, "yes_token_id", ""),
-                            getattr(pos, "no_token_id", ""),
-                            collateral_token,
-                        )
-                    except Exception:
-                        pass
-
-                if self.gasless_merger and self.gasless_merger.is_available:
-                    tx = await self.gasless_merger.merge_positions(
-                        condition_id, amount, collateral_token=collateral_token)
-                if not tx and self.ctf:
-                    tx = await self.ctf.merge_positions(
-                        condition_id, amount, collateral_token=collateral_token)
-
-                if tx:
-                    # Record the (negative) profit, recover capital, clear state
-                    profit = pos.matched_pair_profit()
-                    self.pnl.record_settlement(profit, market.market_id)
-                    self.pnl.record_capital_recovery(pairs * 1.0)
-                    pos.acknowledge_settlement()
-
-                    # ERC20 approvals are permanent; only sync CLOB balance.
-                    sync_balance = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
-                    if callable(sync_balance):
-                        await asyncio.sleep(3)
-                        for _attempt in range(1, 4):
-                            try:
-                                if await sync_balance():
-                                    break
-                            except Exception:
-                                pass
-                            await asyncio.sleep(2 * _attempt)
-
-                    log.info(
-                        "negative_pair_edge_recovered",
-                        asset=self.asset,
-                        pairs=pairs,
-                        profit=f"${profit:.4f}",
-                        tx=str(tx)[:16],
-                    )
-                    merged = True
-
-            # Clear stale inventory regardless of merge success.
-            # If merge failed, the on-chain state is unknown (maybe already
-            # merged by a previous session). Either way, continuing to trade
-            # is better than halting permanently.
-            self.inventory.clear_market(market.market_id)
-            pos = self.inventory.get_or_create(market.market_id, self.asset)
-            pos.condition_id = getattr(market, "condition_id", None) or market.market_id
-            pos.yes_token_id = str(getattr(market, "token_id_up", "") or "")
-            pos.no_token_id = str(getattr(market, "token_id_down", "") or "")
-
-            if not merged:
+            if debt_eligible and not self._small_capital_enabled():
                 log.warning(
-                    "negative_pair_edge_cleared_without_merge",
+                    "negative_pair_edge_balanced_repair_armed",
                     asset=self.asset,
                     market=market.market_id[:8],
-                    msg="Cleared stale inventory; on-chain pairs may need manual redemption",
+                    matched_pairs=pairs,
+                    pair_pnl=pair_pnl,
+                    debt=debt_meta.get("debt"),
+                    msg="Keeping negative-edge pairs open for balanced repair instead of immediate merge",
                 )
+                self._set_dashboard_event(
+                    "warn",
+                    "BALANCED_REPAIR_ARMED",
+                    f"debt ${float(debt_meta.get('debt', 0) or 0):.2f}; waiting for profitable pairs",
+                )
+            else:
+                condition_id = getattr(pos, "condition_id", None) or market.market_id
+                log.warning(
+                    "negative_pair_edge_recovery",
+                    asset=self.asset,
+                    market=market.market_id[:8],
+                    matched_pairs=pairs,
+                    pair_pnl=pair_pnl,
+                    balanced_repair_reason=debt_reason,
+                    msg="Stale negative-edge pairs detected; merging to recover capital",
+                )
+
+                # The loss is already locked in from fills. Merge recovers ~$1/pair
+                # minus the small loss back to the wallet. Halting would just
+                # abandon the capital AND prevent future profitable trading.
+                merged = False
+                if pairs > 0 and condition_id:
+                    amount = int(pairs * 1e6)
+                    tx = None
+
+                    # Infer correct collateral for this market
+                    collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
+                    if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
+                        try:
+                            from src.execution.ctf_ops import infer_collateral_token_for_market
+                            collateral_token = infer_collateral_token_for_market(
+                                self.balance_monitor._w3,
+                                self.balance_monitor._ctf,
+                                condition_id,
+                                getattr(pos, "yes_token_id", ""),
+                                getattr(pos, "no_token_id", ""),
+                                collateral_token,
+                            )
+                        except Exception:
+                            pass
+
+                    if self.gasless_merger and self.gasless_merger.is_available:
+                        tx = await self.gasless_merger.merge_positions(
+                            condition_id, amount, collateral_token=collateral_token)
+                    if not tx and self.ctf:
+                        tx = await self.ctf.merge_positions(
+                            condition_id, amount, collateral_token=collateral_token)
+
+                    if tx:
+                        # Record the (negative) profit, recover capital, clear state
+                        profit = pos.matched_pair_profit()
+                        self.pnl.record_settlement(profit, market.market_id)
+                        self.pnl.record_capital_recovery(pairs * 1.0)
+                        pos.acknowledge_settlement()
+
+                        # ERC20 approvals are permanent; only sync CLOB balance.
+                        sync_balance = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
+                        if callable(sync_balance):
+                            await asyncio.sleep(3)
+                            for _attempt in range(1, 4):
+                                try:
+                                    if await sync_balance():
+                                        break
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(2 * _attempt)
+
+                        log.info(
+                            "negative_pair_edge_recovered",
+                            asset=self.asset,
+                            pairs=pairs,
+                            profit=f"${profit:.4f}",
+                            tx=str(tx)[:16],
+                        )
+                        merged = True
+
+                # Clear stale inventory regardless of merge success.
+                # If merge failed, the on-chain state is unknown (maybe already
+                # merged by a previous session). Either way, continuing to trade
+                # is better than halting permanently.
+                self.inventory.clear_market(market.market_id)
+                pos = self.inventory.get_or_create(market.market_id, self.asset)
+                pos.condition_id = getattr(market, "condition_id", None) or market.market_id
+                pos.yes_token_id = str(getattr(market, "token_id_up", "") or "")
+                pos.no_token_id = str(getattr(market, "token_id_down", "") or "")
+
+                if not merged:
+                    log.warning(
+                        "negative_pair_edge_cleared_without_merge",
+                        asset=self.asset,
+                        market=market.market_id[:8],
+                        msg="Cleared stale inventory; on-chain pairs may need manual redemption",
+                    )
 
         if phase == "DEAD_ZONE" and float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance()) == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
@@ -1672,6 +1696,43 @@ class MarketCycler:
             best_ask_yes=best_ask_yes,
             best_ask_no=best_ask_no,
         )
+
+        # Balanced repair: if previous matched pairs locked a loss but current
+        # market prices offer a clearly profitable YES+NO pair, add equal size
+        # on both sides to offset the repair debt. This intentionally runs
+        # before directional guards so extreme-price repair pairs like
+        # YES 0.15 + NO 0.84 can remain two-sided when config permits it.
+        balanced_repair_plan = plan_balanced_negative_edge_repair(
+            pos,
+            yes_price=quotes.yes_buy_price,
+            no_price=quotes.no_buy_price,
+            min_order_size=min_order_size,
+            max_order_size=self.quote_engine.max_order_size,
+            config=self.balanced_repair_config,
+            remaining_seconds=remaining,
+            abs_imbalance=abs_imbalance,
+            is_halted=is_halted,
+            close_only_phase=close_only_phase,
+            small_capital_enabled=self._small_capital_enabled(),
+        )
+        if balanced_repair_plan.mode == "balanced_repair":
+            quotes.yes_buy_size = balanced_repair_plan.yes_size
+            quotes.no_buy_size = balanced_repair_plan.no_size
+            repair_mode = "balanced_repair"
+            quotes.combined_cost = round(float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0), 4)
+            quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
+            log.warning(
+                "balanced_repair_quote_planned",
+                asset=self.asset,
+                market=market.market_id[:8],
+                yes_price=quotes.yes_buy_price,
+                no_price=quotes.no_buy_price,
+                size=balanced_repair_plan.yes_size,
+                pair_cost=balanced_repair_plan.metadata.get("pair_cost"),
+                pair_edge=balanced_repair_plan.metadata.get("pair_edge"),
+                debt=balanced_repair_plan.metadata.get("debt"),
+                needed_pairs=balanced_repair_plan.metadata.get("needed_pairs"),
+            )
 
         directional_action = apply_directional_market_guard(quotes, fv, repair_mode)
         if directional_action == "block_cheap_side":
@@ -2227,58 +2288,91 @@ class MarketCycler:
         post_fill_negative_pair_edge = decide_negative_pair_edge(pos) if fills else None
         if post_fill_negative_pair_edge and post_fill_negative_pair_edge.triggered:
             pairs = post_fill_negative_pair_edge.matched_pairs
-            log.critical(
-                "negative_pair_edge_halt",
-                asset=self.asset,
-                market=market.market_id[:8],
-                matched_pairs=pairs,
-                pair_pnl=round(post_fill_negative_pair_edge.pair_pnl, 4),
-                msg="Matched pair cost exceeded 1 after fill; merging and stopping this market",
+            debt_eligible, debt_reason, debt_meta = balanced_repair_debt_eligible(
+                pos, self.balanced_repair_config
             )
-            # Merge the negative-edge pairs to recover capital before halting.
-            # The loss is locked in from fills; leaving pairs unmerged just
-            # abandons capital on-chain.
-            if pairs > 0:
-                condition_id = getattr(pos, "condition_id", None) or market.market_id
-                amount = int(pairs * 1e6)
-                tx = None
-                collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
-                if self.gasless_merger and self.gasless_merger.is_available:
-                    tx = await self.gasless_merger.merge_positions(
-                        condition_id, amount, collateral_token=collateral_token)
-                if tx:
-                    profit = pos.matched_pair_profit()
-                    self.pnl.record_settlement(profit, market.market_id)
-                    self.pnl.record_capital_recovery(pairs * 1.0)
-                    pos.acknowledge_settlement()
-                    log.info("negative_pair_edge_force_merged",
-                             pairs=pairs, profit=f"${profit:.4f}", tx=str(tx)[:16])
-                    sync_fn = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
-                    if callable(sync_fn):
-                        await asyncio.sleep(3)
-                        try:
-                            await sync_fn()
-                        except Exception:
-                            pass
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-            self.stop_reason = "negative_pair_edge_halt"
-            self._set_dashboard_event("error", "NEGATIVE_PAIR_EDGE", "matched pair cost exceeded 1")
-            self._running = False
-            return
+            if debt_eligible and not self._small_capital_enabled():
+                log.warning(
+                    "negative_pair_edge_balanced_repair_after_fill",
+                    asset=self.asset,
+                    market=market.market_id[:8],
+                    matched_pairs=pairs,
+                    pair_pnl=round(post_fill_negative_pair_edge.pair_pnl, 4),
+                    debt=debt_meta.get("debt"),
+                    msg="Negative pair edge accepted as repair debt; future balanced pairs must offset it",
+                )
+                self._set_dashboard_event(
+                    "warn",
+                    "BALANCED_REPAIR_DEBT",
+                    f"debt ${float(debt_meta.get('debt', 0) or 0):.2f}",
+                )
+            else:
+                log.critical(
+                    "negative_pair_edge_halt",
+                    asset=self.asset,
+                    market=market.market_id[:8],
+                    matched_pairs=pairs,
+                    pair_pnl=round(post_fill_negative_pair_edge.pair_pnl, 4),
+                    balanced_repair_reason=debt_reason,
+                    msg="Matched pair cost exceeded 1 after fill; merging and stopping this market",
+                )
+                # Merge the negative-edge pairs to recover capital before halting.
+                # The loss is locked in from fills; leaving pairs unmerged just
+                # abandons capital on-chain.
+                if pairs > 0:
+                    condition_id = getattr(pos, "condition_id", None) or market.market_id
+                    amount = int(pairs * 1e6)
+                    tx = None
+                    collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
+                    if self.gasless_merger and self.gasless_merger.is_available:
+                        tx = await self.gasless_merger.merge_positions(
+                            condition_id, amount, collateral_token=collateral_token)
+                    if tx:
+                        profit = pos.matched_pair_profit()
+                        self.pnl.record_settlement(profit, market.market_id)
+                        self.pnl.record_capital_recovery(pairs * 1.0)
+                        pos.acknowledge_settlement()
+                        log.info("negative_pair_edge_force_merged",
+                                 pairs=pairs, profit=f"${profit:.4f}", tx=str(tx)[:16])
+                        sync_fn = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
+                        if callable(sync_fn):
+                            await asyncio.sleep(3)
+                            try:
+                                await sync_fn()
+                            except Exception:
+                                pass
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self.stop_reason = "negative_pair_edge_halt"
+                self._set_dashboard_event("error", "NEGATIVE_PAIR_EDGE", "matched pair cost exceeded 1")
+                self._running = False
+                return
 
         # 15.5. Auto-merge check: dollar-based threshold OR low balance. The
         # 2-minute pre-expiry force merge runs earlier so it is not skipped by
         # quote/order early returns.
         force_merge = False
         merge_reason = "routine"
-        # Dollar-based mid-market merge trigger
-        if not force_merge and self.inventory.should_merge(market.market_id):
+        debt_eligible_for_repair, _, debt_repair_meta = balanced_repair_debt_eligible(
+            pos, self.balanced_repair_config
+        )
+        suppress_routine_merge_for_repair = debt_eligible_for_repair and not self._small_capital_enabled()
+        # Dollar-based mid-market merge trigger. If balanced repair is armed,
+        # keep the negative debt visible so profitable new pairs can offset it;
+        # low-balance/pre-expiry merge paths may still recover capital.
+        if not force_merge and self.inventory.should_merge(market.market_id) and not suppress_routine_merge_for_repair:
             force_merge = True
             merge_reason = "dollar_threshold"
             log.info("dollar_threshold_merge_triggered",
                      asset=self.asset,
                      locked=f"${pos.locked_capital():.2f}",
                      threshold=f"${self.inventory.auto_merge_dollar_threshold:.2f}")
+        elif suppress_routine_merge_for_repair:
+            log.info(
+                "dollar_threshold_merge_suppressed_for_balanced_repair",
+                asset=self.asset,
+                debt=debt_repair_meta.get("debt"),
+                locked=f"${pos.locked_capital():.2f}",
+            )
 
         if self.balance_monitor:
             merge_result = await self.balance_monitor.check_and_merge(

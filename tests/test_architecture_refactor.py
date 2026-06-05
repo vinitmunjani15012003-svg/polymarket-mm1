@@ -15,8 +15,10 @@ from src.services.quoting import (
 from src.core.models.inventory import InventorySnapshot
 from src.services.inventory import (
     InventoryBook,
+    balanced_repair_debt_eligible,
     inventory_diverged,
     matched_pair_edge_status,
+    plan_balanced_negative_edge_repair,
     plan_inventory_repair,
     plan_repair_price_cap,
     reconciliation_delta,
@@ -159,6 +161,37 @@ def test_quote_policy_normal_atomicity_allows_explicit_entry_modes_only():
     assert allowed.allowed is True
     assert quotes.yes_buy_size == 5
     assert quotes.no_buy_size == 0
+
+
+def test_quote_policy_balanced_repair_must_remain_atomic_after_scaling():
+    policy = QuotePolicy()
+    unequal = SimpleNamespace(yes_buy_price=0.15, yes_buy_size=5, no_buy_price=0.82, no_buy_size=3)
+
+    blocked = policy.apply_post_capital_safety(
+        unequal,
+        min_order_size=5,
+        allow_round_up=False,
+        repair_mode="balanced_repair",
+        abs_imbalance=0,
+    )
+
+    assert blocked.allowed is False
+    assert blocked.reason == "BALANCED_REPAIR_NOT_ATOMIC"
+    assert unequal.yes_buy_size == 0
+    assert unequal.no_buy_size == 0
+
+    equalizable = SimpleNamespace(yes_buy_price=0.15, yes_buy_size=8, no_buy_price=0.82, no_buy_size=6)
+    allowed = policy.apply_post_capital_safety(
+        equalizable,
+        min_order_size=5,
+        allow_round_up=False,
+        repair_mode="balanced_repair",
+        abs_imbalance=0,
+    )
+
+    assert allowed.allowed is True
+    assert equalizable.yes_buy_size == 6
+    assert equalizable.no_buy_size == 6
 
 
 def test_quote_policy_post_capital_safety_enforces_repair_and_atomicity():
@@ -319,6 +352,94 @@ def test_inventory_repair_planner_returns_explicit_subminimum_plan():
     assert plan.no_size == 0
     assert plan.mode == "repair_up"
     assert plan.reason == "SUB_MINIMUM_TAIL"
+
+
+def test_balanced_repair_plans_equal_profitable_pairs_for_negative_debt():
+    class Position:
+        def matched_pairs(self):
+            return 5
+
+        def matched_pair_profit(self):
+            return -1.30
+
+    cfg = SimpleNamespace(
+        enabled=True,
+        min_repair_debt=0.01,
+        max_repair_debt=5.0,
+        min_pair_edge=0.02,
+        max_pair_cost=0.98,
+        target_net_profit=0.0,
+        max_order_size=10,
+        max_abs_imbalance=0.5,
+        min_seconds_remaining=90,
+    )
+
+    eligible, reason, meta = balanced_repair_debt_eligible(Position(), cfg)
+    plan = plan_balanced_negative_edge_repair(
+        Position(),
+        yes_price=0.15,
+        no_price=0.82,
+        min_order_size=5,
+        max_order_size=30,
+        config=cfg,
+        remaining_seconds=300,
+        abs_imbalance=0,
+    )
+
+    assert eligible is True
+    assert reason == "ELIGIBLE"
+    assert meta["debt"] == 1.3
+    assert plan.mode == "balanced_repair"
+    assert plan.yes_size == 10
+    assert plan.no_size == 10
+    assert plan.metadata["pair_cost"] == 0.97
+    assert plan.metadata["needed_pairs"] == 44
+
+
+def test_balanced_repair_rejects_thin_or_imbalanced_pairs():
+    class Position:
+        def matched_pairs(self):
+            return 5
+
+        def matched_pair_profit(self):
+            return -1.30
+
+    cfg = SimpleNamespace(
+        enabled=True,
+        min_repair_debt=0.01,
+        max_repair_debt=5.0,
+        min_pair_edge=0.02,
+        max_pair_cost=0.98,
+        max_order_size=10,
+        max_abs_imbalance=0.5,
+        min_seconds_remaining=90,
+    )
+
+    thin = plan_balanced_negative_edge_repair(
+        Position(),
+        yes_price=0.15,
+        no_price=0.84,
+        min_order_size=5,
+        max_order_size=30,
+        config=cfg,
+        remaining_seconds=300,
+        abs_imbalance=0,
+    )
+    imbalanced = plan_balanced_negative_edge_repair(
+        Position(),
+        yes_price=0.15,
+        no_price=0.82,
+        min_order_size=5,
+        max_order_size=30,
+        config=cfg,
+        remaining_seconds=300,
+        abs_imbalance=3,
+    )
+
+    assert thin.mode == "normal"
+    assert thin.reason == "PAIR_EDGE_TOO_THIN"
+    assert imbalanced.mode == "normal"
+    assert imbalanced.reason == "IMBALANCE_REPAIR_FIRST"
 
 
 def test_repair_price_cap_planner_owns_fifo_and_saved_small_cap_caps():

@@ -1,5 +1,10 @@
 """Inventory service package."""
 
+from .balanced_repair import (
+    balanced_repair_debt_eligible,
+    negative_pair_debt,
+    plan_balanced_negative_edge_repair,
+)
 from .exposure import gross_exposure, inventory_skew, matched_pairs, share_imbalance
 from .inventory_book import InventoryBook
 from .pair_tracker import has_negative_matched_pair_edge
@@ -19,6 +24,9 @@ from .repair_planner import (
 )
 
 __all__ = [
+    "balanced_repair_debt_eligible",
+    "negative_pair_debt",
+    "plan_balanced_negative_edge_repair",
     "gross_exposure",
     "inventory_skew",
     "matched_pairs",
