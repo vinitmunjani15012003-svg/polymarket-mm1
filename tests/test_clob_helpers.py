@@ -89,8 +89,8 @@ def test_ensure_builder_code_mutates_when_missing_and_facade_delegates_static_he
     assert ClobClientWrapper._fill_dedupe_key({"id": "fill"}, "m") == "id:fill"
 
 
-def test_v2_deposit_wallet_order_signing_uses_api_key_owner_not_funder():
-    assert ClobClientWrapper._order_signature_type_for_client("v2", 3, "0xfunder") == 1
+def test_v2_deposit_wallet_order_signing_keeps_poly_1271_mode():
+    assert ClobClientWrapper._order_signature_type_for_client("v2", 3, "0xfunder") == 3
     assert ClobClientWrapper._order_signature_type_for_client("v2", 1, "0xfunder") == 1
     assert ClobClientWrapper._order_signature_type_for_client("v2", 3, "") == 3
     assert ClobClientWrapper._order_signature_type_for_client("v1", 3, "0xfunder") == 3

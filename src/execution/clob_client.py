@@ -99,22 +99,15 @@ class ClobClientWrapper:
     def _order_signature_type_for_client(client_version: str, signature_type: int, funder: str = "") -> int:
         """Return the signature mode to use for CLOB order signing.
 
-        py-clob-client-v2 treats POLY_1271/signature_type=3 specially: it sets
-        the V2 order ``signer`` field to the funder wallet. Polymarket's order
-        endpoint rejects that when the API key belongs to the owner EOA with:
-        "the order signer address has to be the address of the API KEY".
-
-        Deposit-wallet relayer/balance flows still use signature_type=3, but
-        order placement should sign as the EOA and keep the funder as maker.
-        POLY_PROXY/signature_type=1 gives that payload shape.
+        Do not normalize deposit-wallet/POLY_1271 orders to proxy mode. The
+        CLOB rejects a deposit-wallet maker submitted as POLY_PROXY with:
+        "maker address not allowed, please use the deposit wallet flow".
+        Polymarket's documented Python flow is signature_type=3 with funder set.
         """
         try:
-            sig = int(signature_type)
+            return int(signature_type)
         except Exception:
             return signature_type
-        if client_version == "v2" and sig == 3 and funder:
-            return 1
-        return sig
 
     @staticmethod
     def _ensure_builder_code(order_args):
@@ -217,15 +210,6 @@ class ClobClientWrapper:
             self._client.set_api_creds(creds)
             self._client_version = client_version
             self._initialized = True
-            if self._order_signature_type != self._signature_type:
-                log.warning(
-                    "clob_order_signature_type_normalized",
-                    configured_signature_type=self._signature_type,
-                    order_signature_type=self._order_signature_type,
-                    funder=self._funder,
-                    msg="Using EOA signer for CLOB orders to match API-key owner; deposit-wallet sync still uses configured signature type",
-                )
-            
             # Verify auth is working
             addr = self._client.get_address()
             log.info("clob_client_initialized", address=addr,
