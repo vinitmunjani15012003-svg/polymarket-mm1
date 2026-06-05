@@ -6,6 +6,7 @@ All orders are BUY-only.
 """
 
 import asyncio
+import hashlib
 import time
 from typing import Optional
 from src.execution.clob.balances import parse_balance_allowance
@@ -44,6 +45,7 @@ class ClobClientWrapper:
         self._funder = funder
         self._client = None
         self._client_version = "unknown"
+        self._client_address = ""
         self._initialized = False
         # Track open orders: order_id -> {token_id, price, size, side}.
         # Keep a recent closed-order cache too: CLOB trade events can arrive
@@ -63,6 +65,32 @@ class ClobClientWrapper:
         """Run a blocking py-clob-client call in a worker thread."""
         async with self._client_lock:
             return await asyncio.to_thread(fn, *args, **kwargs)
+
+    @staticmethod
+    def _secret_fingerprint(value: str) -> str:
+        """Return a short non-reversible fingerprint for config diagnostics."""
+        if not value:
+            return ""
+        return hashlib.sha256(value.encode()).hexdigest()[:12]
+
+    def _expected_order_signer(self) -> str:
+        """Return the address expected in the CLOB order signer field."""
+        try:
+            signature_type = int(self._signature_type)
+        except Exception:
+            signature_type = self._signature_type
+        if signature_type == 3 and self._funder:
+            return self._funder
+        return self._client_address
+
+    def _auth_context_fields(self) -> dict:
+        return {
+            "client_address": self._client_address,
+            "order_signer": self._expected_order_signer(),
+            "signature_type": self._signature_type,
+            "funder": self._funder,
+            "api_key_fingerprint": self._secret_fingerprint(self._api_key),
+        }
 
     @staticmethod
     def _ensure_builder_code(order_args):
@@ -162,10 +190,10 @@ class ClobClientWrapper:
             self._initialized = True
             # Verify auth is working
             addr = self._client.get_address()
+            self._client_address = addr
             log.info("clob_client_initialized", address=addr,
                      client_version=client_version,
-                     signature_type=self._signature_type,
-                     funder=self._funder)
+                     **self._auth_context_fields())
         except ImportError:
             log.error("py_clob_client_not_installed",
                      msg="Install with: pip install py-clob-client")
@@ -339,7 +367,8 @@ class ClobClientWrapper:
 
         except Exception as e:
             log.error("order_place_error", error=str(e),
-                     price=price, size=size)
+                     price=price, size=size,
+                     **self._auth_context_fields())
             return None
 
     @staticmethod
@@ -421,7 +450,8 @@ class ClobClientWrapper:
             return placed
 
         except Exception as e:
-            log.error("batch_order_place_error", error=str(e), count=len(orders))
+            log.error("batch_order_place_error", error=str(e), count=len(orders),
+                      **self._auth_context_fields())
             # SDK compatibility fallback: py-clob-client variants have differed
             # around PostOrdersArgs / builder fields. For live safety, degrade to
             # sequential single-order placement instead of spinning failed batch
