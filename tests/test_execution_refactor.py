@@ -58,6 +58,33 @@ class NonePlacementExecutor:
         return {order["side"]: None for order in orders}
 
 
+class TransientNonePlacementExecutor:
+    def __init__(self):
+        self.batch_calls = []
+        self.reconcile_calls = 0
+        self.last_place_error = "PolyApiException[status_code=500, error_message={'error': 'order timed out'}]"
+        self.last_place_error_transient = True
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        return {order["side"]: None for order in orders}
+
+    async def reconcile_on_startup(self):
+        self.reconcile_calls += 1
+        return {"open_orders": 0, "recent_trades": 0, "ok": True}
+
+
+class NonTransientNonePlacementExecutor:
+    def __init__(self):
+        self.batch_calls = []
+        self.last_place_error = "the order signer address has to be the address of the API KEY"
+        self.last_place_error_transient = False
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        return {order["side"]: None for order in orders}
+
+
 class RaisingPlacementExecutor:
     def __init__(self):
         self.batch_calls = []
@@ -178,6 +205,41 @@ def test_order_manager_releases_failed_placement_intent_for_retry():
     assert len(executor.batch_calls) == 2
     assert manager.order_tracker.pending == {}
     assert intent_spec["intent"].intent_id in manager.order_tracker.failed_intents
+    assert manager.last_order_error is None
+    assert manager.last_order_warning == "order_placement_unconfirmed"
+
+
+def test_order_manager_treats_transient_place_timeout_as_nonfatal_and_reconciles():
+    executor = TransientNonePlacementExecutor()
+    manager = OrderManager(executor)
+    intent_spec = attach_place_intent(
+        {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"},
+        market_id="M1",
+        quote_version=10,
+    )
+
+    result = asyncio.run(manager._place_buys([intent_spec]))
+
+    assert result == {"yes": None}
+    assert executor.reconcile_calls == 1
+    assert manager.last_order_error is None
+    assert manager.last_order_warning == "order_placement_unconfirmed"
+
+
+def test_order_manager_keeps_nontransient_place_errors_fatal():
+    executor = NonTransientNonePlacementExecutor()
+    manager = OrderManager(executor)
+    intent_spec = attach_place_intent(
+        {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"},
+        market_id="M1",
+        quote_version=10,
+    )
+
+    result = asyncio.run(manager._place_buys([intent_spec]))
+
+    assert result == {"yes": None}
+    assert manager.last_order_error == "order_placement_failed"
+    assert manager.last_order_warning is None
 
 
 def test_order_manager_releases_raised_placement_intent_for_retry():

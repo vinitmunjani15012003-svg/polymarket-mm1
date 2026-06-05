@@ -88,6 +88,12 @@ def test_ensure_builder_code_mutates_when_missing_and_facade_delegates_static_he
     assert ClobClientWrapper._fill_dedupe_key({"id": "fill"}, "m") == "id:fill"
 
 
+def test_clob_place_error_classifier_marks_exchange_timeouts_transient():
+    assert ClobClientWrapper._is_transient_place_error("PolyApiException[status_code=500, error_message={'error': 'order timed out'}]")
+    assert ClobClientWrapper._is_transient_place_error("Read timeout while posting order")
+    assert not ClobClientWrapper._is_transient_place_error("the order signer address has to be the address of the API KEY")
+
+
 def test_balance_allowance_helper_and_clob_facade_imports_remain_available():
     assert zero_allowance_spenders({"spender-a": "0", "spender-b": 5}) == ["spender-a"]
     parsed = parse_balance_allowance({"balance": "12", "allowances": {"spender-a": "0", "spender-b": "9"}})

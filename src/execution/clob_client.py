@@ -46,6 +46,8 @@ class ClobClientWrapper:
         self._client = None
         self._client_version = "unknown"
         self._client_address = ""
+        self.last_place_error = ""
+        self.last_place_error_transient = False
         self._initialized = False
         # Track open orders: order_id -> {token_id, price, size, side}.
         # Keep a recent closed-order cache too: CLOB trade events can arrive
@@ -91,6 +93,35 @@ class ClobClientWrapper:
             "funder": self._funder,
             "api_key_fingerprint": self._secret_fingerprint(self._api_key),
         }
+
+    @staticmethod
+    def _is_transient_place_error(error: object) -> bool:
+        text = str(error).lower()
+        transient_markers = (
+            "order timed out",
+            "timed out",
+            "timeout",
+            "status_code=500",
+            "status=500",
+            "status_code=502",
+            "status=502",
+            "status_code=503",
+            "status=503",
+            "status_code=504",
+            "status=504",
+            "connection reset",
+            "connection aborted",
+            "read timeout",
+        )
+        return any(marker in text for marker in transient_markers)
+
+    def _record_place_error(self, error: object):
+        self.last_place_error = str(error)
+        self.last_place_error_transient = self._is_transient_place_error(error)
+
+    def _clear_place_error(self):
+        self.last_place_error = ""
+        self.last_place_error_transient = False
 
     @staticmethod
     def _ensure_builder_code(order_args):
@@ -316,6 +347,7 @@ class ClobClientWrapper:
         Returns:
             Order ID if placed, None if rejected (post_only rejection is expected).
         """
+        self._clear_place_error()
         if not self._initialized:
             log.error("client_not_initialized")
             return None
@@ -366,8 +398,10 @@ class ClobClientWrapper:
                 return None
 
         except Exception as e:
+            self._record_place_error(e)
             log.error("order_place_error", error=str(e),
                      price=price, size=size,
+                     transient=self.last_place_error_transient,
                      **self._auth_context_fields())
             return None
 
@@ -378,6 +412,7 @@ class ClobClientWrapper:
 
     async def place_buy_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Place multiple BUY orders in one CLOB post_orders request."""
+        self._clear_place_error()
         if not self._initialized:
             log.error("client_not_initialized")
             return {str(o.get("side", i)): None for i, o in enumerate(orders)}
@@ -450,7 +485,9 @@ class ClobClientWrapper:
             return placed
 
         except Exception as e:
+            self._record_place_error(e)
             log.error("batch_order_place_error", error=str(e), count=len(orders),
+                      transient=self.last_place_error_transient,
                       **self._auth_context_fields())
             # SDK compatibility fallback: py-clob-client variants have differed
             # around PostOrdersArgs / builder fields. For live safety, degrade to

@@ -66,6 +66,7 @@ class OrderManager:
             repair_crossed_bid_grace_seconds,
         )
         self.last_order_error: Optional[str] = None
+        self.last_order_warning: Optional[str] = None
         # Active quotes per market
         self.active: dict[str, ActiveQuotes] = {}
 
@@ -90,6 +91,7 @@ class OrderManager:
         active = self.get_active(market_id)
         updated = False
         self.last_order_error = None
+        self.last_order_warning = None
 
         # Allow per-side book snapshots (preferred). Fall back to shared
         # book_snapshot for legacy callers.
@@ -410,9 +412,66 @@ class OrderManager:
             self.last_order_error = "order_placement_failed"
             return {**skipped, **failed}
 
-        if self.order_tracker.record_submission_results(placed, intents_by_side):
-            self.last_order_error = "order_placement_failed"
+        failed_submission = self.order_tracker.record_submission_results(placed, intents_by_side)
+        if failed_submission:
+            await self._handle_unconfirmed_placement(intents_by_side)
         return {**skipped, **placed}
+
+    async def _handle_unconfirmed_placement(self, intents_by_side: dict) -> None:
+        """Handle a placement that returned no order id without killing the bot.
+
+        CLOB can return transient 5xx/timeouts after accepting or rejecting an
+        order. Treat those as ambiguous/non-fatal, reconcile open orders, and let
+        the next quote cycle decide. Non-transient SDK/auth errors remain fatal.
+        Plain no-id results without an executor error are usually post-only
+        rejections and are also non-fatal.
+        """
+        error = str(getattr(self.executor, "last_place_error", "") or "")
+        transient = bool(getattr(self.executor, "last_place_error_transient", False))
+        market_id = ""
+        if intents_by_side:
+            first_intent = next(iter(intents_by_side.values()))
+            market_id = getattr(first_intent, "market_id", "") or ""
+
+        if error and not transient:
+            log.error(
+                "order_placement_failed_nontransient",
+                market=market_id[:8],
+                error=error,
+                sides=list(intents_by_side),
+            )
+            self.last_order_error = "order_placement_failed"
+            return
+
+        self.last_order_warning = "order_placement_unconfirmed"
+        log.warning(
+            "order_placement_unconfirmed_nonfatal",
+            market=market_id[:8],
+            transient=transient,
+            error=error,
+            sides=list(intents_by_side),
+        )
+        if transient:
+            await self._reconcile_after_unconfirmed_placement(market_id)
+
+    async def _reconcile_after_unconfirmed_placement(self, market_id: str) -> None:
+        reconcile = getattr(self.executor, "reconcile_on_startup", None)
+        if not callable(reconcile):
+            return
+        try:
+            result = await reconcile()
+            log.info(
+                "order_placement_timeout_reconciled",
+                market=market_id[:8],
+                open_orders=(result or {}).get("open_orders"),
+                ok=(result or {}).get("ok"),
+            )
+        except Exception as exc:
+            log.warning(
+                "order_placement_timeout_reconcile_failed",
+                market=market_id[:8],
+                error=str(exc),
+            )
 
     def _crossed_bid_grace(self, sticky_repair: bool) -> float:
         return self.repair_crossed_bid_grace_seconds if sticky_repair else self.crossed_bid_grace_seconds
