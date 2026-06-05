@@ -2424,13 +2424,15 @@ class MarketCycler:
     def _max_spot_price_age_seconds(self) -> float:
         """Allowed active spot age for live quoting.
 
-        Exness/MT5 is expected to refresh per quote cycle; do not let a large
-        bridge stale_seconds setting keep stale FV tradable for many seconds.
+        Exness/MT5 bridge freshness is governed by its configured stale window.
+        The active price timestamp is the bridge receive time, not the raw MT5
+        tick timestamp, because MT5 ticks may repeat while the bridge is still
+        healthy and returning current bid/ask/mid data.
         """
         if bool(getattr(self.price_feed, "mt5_bridge_url", "")):
             configured = float(getattr(self.price_feed, "mt5_bridge_stale_seconds", MAX_EXNESS_PRICE_AGE_SECONDS)
                                or MAX_EXNESS_PRICE_AGE_SECONDS)
-            return min(configured, MAX_EXNESS_PRICE_AGE_SECONDS)
+            return max(0.5, configured)
         return MAX_SPOT_PRICE_AGE_SECONDS
 
     def _dashboard_sigma_for_stale_spot(self) -> float:

@@ -38,6 +38,11 @@ def update_dashboard_waiting(cycler) -> None:
         if hasattr(cycler.price_feed, "get_price_source")
         else "unknown"
     )
+    mt5_bridge_status = (
+        cycler.price_feed.get_mt5_bridge_status(cycler.ac.symbol)
+        if hasattr(cycler.price_feed, "get_mt5_bridge_status")
+        else {}
+    )
 
     state = {
         "asset": cycler.asset,
@@ -50,6 +55,7 @@ def update_dashboard_waiting(cycler) -> None:
         "chainlink_spread": 0,
         "price_age": price_age,
         "price_source": price_source,
+        "mt5_bridge": mt5_bridge_status,
         "fair_value": 0,
         "sigma": 0,
         "ws_ticks": getattr(cycler.price_feed, "ticks", 0),
@@ -144,6 +150,11 @@ def update_dashboard(cycler, market, spot, fv, sigma, phase,
         if hasattr(cycler.price_feed, "get_price_source")
         else "unknown"
     )
+    mt5_bridge_status = (
+        cycler.price_feed.get_mt5_bridge_status(cycler.ac.symbol)
+        if hasattr(cycler.price_feed, "get_mt5_bridge_status")
+        else {}
+    )
 
     state = {
         "asset": cycler.asset,
@@ -156,6 +167,7 @@ def update_dashboard(cycler, market, spot, fv, sigma, phase,
         "chainlink_spread": getattr(cycler, "chainlink_spread", 0),
         "price_age": price_age,
         "price_source": price_source,
+        "mt5_bridge": mt5_bridge_status,
         "fair_value": fv,
         "sigma": sigma,
         "ws_ticks": getattr(cycler.price_feed, "ticks", 0),

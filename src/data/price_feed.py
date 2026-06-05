@@ -16,6 +16,7 @@ from typing import Dict, Optional, Callable
 from urllib.parse import urlparse, urlunparse
 
 import websockets
+import httpx
 
 from src.market_data.feed_health import FeedFreshness, freshness
 from src.monitoring.logger import get_logger
@@ -47,6 +48,13 @@ class PriceFeed:
         self.mt5_bridge_url = self._normalize_mt5_bridge_url(mt5_bridge_url or "")
         self.mt5_bridge_api_key = mt5_bridge_api_key or ""
         self.mt5_bridge_stale_seconds = float(mt5_bridge_stale_seconds or 5.0)
+        # Keep the bridge poll timeout aligned with the accepted freshness
+        # window. A 1.5s hard timeout caused false STALE_SPOT periods when the
+        # MT5/Exness bridge was alive but a single HTTP poll was slow.
+        self.mt5_bridge_timeout_seconds = max(
+            1.5,
+            min(5.0, max(0.5, self.mt5_bridge_stale_seconds * 0.8)),
+        )
         self.symbols = [s.lower() for s in symbols]
         self.vol_lookback = vol_lookback
 
@@ -76,7 +84,14 @@ class PriceFeed:
         self._last_message_ts: float = 0.0
         self._message_timeout: float = 15.0
         self._mt5_bridge_unavailable_until: float = 0.0
-        self._mt5_bridge_unreachable_backoff_seconds: float = max(5.0, self.mt5_bridge_stale_seconds)
+        self._mt5_bridge_unreachable_backoff_seconds: float = 0.0
+        self._mt5_http_client: httpx.AsyncClient | None = None
+        self._mt5_fetch_attempts: Dict[str, int] = {}
+        self._mt5_fetch_successes: Dict[str, int] = {}
+        self._mt5_fetch_failures: Dict[str, int] = {}
+        self._mt5_last_fetch_ts: Dict[str, float] = {}
+        self._mt5_last_success_ts: Dict[str, float] = {}
+        self._mt5_last_error: Dict[str, str] = {}
         # Throttle: only record one price sample per second for vol calculation
         self._last_history_ts: Dict[str, float] = {}
 
@@ -334,6 +349,7 @@ class PriceFeed:
         if self._ws:
             await self._ws.close()
             self._ws = None
+        await self._reset_mt5_client()
         log.info("price_feed_stopped")
 
     def _mt5_symbol_for(self, symbol: str) -> str:
@@ -395,104 +411,166 @@ class PriceFeed:
         parsed = urlparse(url)
         return parsed.netloc or parsed.path or "unknown"
 
+    async def _mt5_client(self) -> httpx.AsyncClient:
+        """Return a reusable MT5 bridge HTTP client.
+
+        Creating a fresh HTTP client on every quote cycle can produce
+        intermittent bridge misses under load. Keep one client so TCP pooling
+        and DNS state are stable, and recreate it after transport errors.
+        """
+        if self._mt5_http_client is None or self._mt5_http_client.is_closed:
+            self._mt5_http_client = httpx.AsyncClient(timeout=self.mt5_bridge_timeout_seconds)
+        return self._mt5_http_client
+
+    async def _reset_mt5_client(self) -> None:
+        client = self._mt5_http_client
+        self._mt5_http_client = None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    def _record_mt5_fetch_attempt(self, symbol: str) -> None:
+        sym = symbol.upper()
+        self._mt5_fetch_attempts[sym] = int(self._mt5_fetch_attempts.get(sym, 0) or 0) + 1
+        self._mt5_last_fetch_ts[sym] = time.time()
+
+    def _record_mt5_fetch_success(self, symbol: str) -> None:
+        sym = symbol.upper()
+        self._mt5_fetch_successes[sym] = int(self._mt5_fetch_successes.get(sym, 0) or 0) + 1
+        self._mt5_last_success_ts[sym] = time.time()
+        self._mt5_last_error.pop(sym, None)
+
+    def _record_mt5_fetch_failure(self, symbol: str, error: str) -> None:
+        sym = symbol.upper()
+        self._mt5_fetch_failures[sym] = int(self._mt5_fetch_failures.get(sym, 0) or 0) + 1
+        self._mt5_last_error[sym] = error
+
+    def get_mt5_bridge_status(self, symbol: str) -> dict:
+        """Expose MT5 fetch diagnostics for dashboard/tests/logging."""
+        sym = symbol.upper()
+        now = time.time()
+        return {
+            "attempts": int(self._mt5_fetch_attempts.get(sym, 0) or 0),
+            "successes": int(self._mt5_fetch_successes.get(sym, 0) or 0),
+            "failures": int(self._mt5_fetch_failures.get(sym, 0) or 0),
+            "last_fetch_age": (now - self._mt5_last_fetch_ts[sym]) if sym in self._mt5_last_fetch_ts else float("inf"),
+            "last_success_age": (now - self._mt5_last_success_ts[sym]) if sym in self._mt5_last_success_ts else float("inf"),
+            "last_error": self._mt5_last_error.get(sym, ""),
+            "timeout_seconds": self.mt5_bridge_timeout_seconds,
+        }
+
     async def fetch_mt5_bridge_price(self, symbol: str) -> Optional[float]:
         """Fetch primary Exness/MT5 spot from local/remote bridge if configured."""
         if not self.mt5_bridge_url:
             log.debug("mt5_bridge_not_configured", symbol=symbol)
             return None
-        import httpx
         sym = symbol.upper()
         bridge_symbol = self._mt5_symbol_for(sym)
         url = f"{self.mt5_bridge_url}/price/{bridge_symbol}"
         host = self._url_host(self.mt5_bridge_url)
-        now = time.time()
-        if now < self._mt5_bridge_unavailable_until:
-            log.debug(
-                "mt5_bridge_unreachable_backoff",
-                symbol=bridge_symbol,
-                host=host,
-                retry_in=round(self._mt5_bridge_unavailable_until - now, 3),
-            )
-            return None
+        self._record_mt5_fetch_attempt(sym)
         try:
             headers = {}
             if self.mt5_bridge_api_key:
                 headers["X-API-Key"] = self.mt5_bridge_api_key
-            async with httpx.AsyncClient(timeout=1.5) as client:
-                resp = await client.get(url, headers=headers)
-                try:
-                    data = resp.json()
-                except ValueError:
-                    data = {}
-                if resp.status_code >= 400:
-                    bridge_error = str(data.get("error") or "").strip()
-                    detail = bridge_error or f"HTTP {resp.status_code}"
-                    log.warning(
-                        "mt5_bridge_price_error",
-                        symbol=bridge_symbol,
-                        error=detail,
-                        status_code=resp.status_code,
-                    )
-                    return None
+            client = await self._mt5_client()
+            resp = await client.get(url, headers=headers)
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if resp.status_code >= 400:
+                bridge_error = str(data.get("error") or "").strip()
+                detail = bridge_error or f"HTTP {resp.status_code}"
+                self._record_mt5_fetch_failure(sym, detail)
+                log.warning(
+                    "mt5_bridge_price_error",
+                    symbol=bridge_symbol,
+                    error=detail,
+                    status_code=resp.status_code,
+                    attempts=self._mt5_fetch_attempts.get(sym, 0),
+                    failures=self._mt5_fetch_failures.get(sym, 0),
+                )
+                return None
             price = float(data.get("mid") or data.get("price") or 0)
             ts = float(data.get("ts") or 0)
             now = time.time()
             if price <= 0:
+                self._record_mt5_fetch_failure(sym, "invalid_price")
                 return None
             age = max(0.0, now - ts) if ts else 0.0
             self._store_mt5_bridge_price(sym, price, ts or now, received_ts=now)
+            self._record_mt5_fetch_success(sym)
             if age > self.mt5_bridge_stale_seconds:
                 log.warning("mt5_bridge_price_stale",
                             symbol=bridge_symbol, age=round(age, 3),
-                            max_age=self.mt5_bridge_stale_seconds)
+                            max_age=self.mt5_bridge_stale_seconds,
+                            attempts=self._mt5_fetch_attempts.get(sym, 0),
+                            successes=self._mt5_fetch_successes.get(sym, 0))
                 return price
             log.info("mt5_bridge_price_ok",
                      symbol=bridge_symbol,
                      price=round(price, 4),
                      age=round(age, 3),
-                     source="exness_mt5")
+                     source="exness_mt5",
+                     attempts=self._mt5_fetch_attempts.get(sym, 0),
+                     successes=self._mt5_fetch_successes.get(sym, 0),
+                     failures=self._mt5_fetch_failures.get(sym, 0))
             for cb in self._callbacks:
                 try:
-                    cb(sym, price, ts or now)
+                    cb(sym, price, now)
                 except Exception as e:
                     log.debug("mt5_price_callback_error", error=str(e))
             return price
         except httpx.ConnectTimeout as e:
-            self._mt5_bridge_unavailable_until = time.time() + self._mt5_bridge_unreachable_backoff_seconds
+            detail = self._exception_detail(e)
+            self._record_mt5_fetch_failure(sym, detail)
+            await self._reset_mt5_client()
             log.warning(
                 "mt5_bridge_price_error",
                 symbol=bridge_symbol,
                 host=host,
-                error=self._exception_detail(e),
+                error=detail,
                 error_type=e.__class__.__name__,
-                connect_timeout_seconds=1.5,
-                retry_in=self._mt5_bridge_unreachable_backoff_seconds,
+                connect_timeout_seconds=self.mt5_bridge_timeout_seconds,
+                retry_in=0.0,
+                msg="retrying next quote cycle; no long MT5 fetch backoff",
             )
             return None
         except httpx.TimeoutException as e:
+            detail = self._exception_detail(e)
+            self._record_mt5_fetch_failure(sym, detail)
+            await self._reset_mt5_client()
             log.warning(
                 "mt5_bridge_price_timeout",
                 symbol=bridge_symbol,
                 host=host,
-                error=self._exception_detail(e),
+                error=detail,
                 error_type=e.__class__.__name__,
-                timeout_seconds=1.5,
+                timeout_seconds=self.mt5_bridge_timeout_seconds,
             )
             return None
         except httpx.HTTPError as e:
+            detail = self._exception_detail(e)
+            self._record_mt5_fetch_failure(sym, detail)
+            await self._reset_mt5_client()
             log.warning(
                 "mt5_bridge_price_error",
                 symbol=bridge_symbol,
-                error=self._exception_detail(e),
+                error=detail,
                 error_type=e.__class__.__name__,
                 host=host,
             )
             return None
         except Exception as e:
+            detail = self._exception_detail(e)
+            self._record_mt5_fetch_failure(sym, detail)
             log.warning(
                 "mt5_bridge_price_error",
                 symbol=bridge_symbol,
-                error=self._exception_detail(e),
+                error=detail,
                 error_type=e.__class__.__name__,
             )
             return None

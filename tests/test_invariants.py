@@ -1,6 +1,8 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from src.config import AssetConfig, BotConfig
@@ -1109,13 +1111,69 @@ def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     assert feed.get_price_source("BTCUSDT") == "bookTicker"
 
 
-def test_exness_spot_age_fails_closed_faster_than_bridge_stale_tolerance():
+def test_exness_spot_age_respects_bridge_stale_tolerance():
     cycler = MarketCycler.__new__(MarketCycler)
     cycler.price_feed = SimpleNamespace(mt5_bridge_url="http://bridge:8765", mt5_bridge_stale_seconds=15.0)
-    assert cycler._max_spot_price_age_seconds() == pytest.approx(1.0)
+    assert cycler._max_spot_price_age_seconds() == pytest.approx(15.0)
 
     cycler.price_feed = SimpleNamespace(mt5_bridge_url="", mt5_bridge_stale_seconds=15.0)
     assert cycler._max_spot_price_age_seconds() == pytest.approx(3.0)
+
+
+def test_mt5_bridge_poll_timeout_tracks_stale_window_without_being_too_large():
+    fast = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=1.0,
+    )
+    normal = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=5.0,
+    )
+    slow = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=30.0,
+    )
+
+    assert fast.mt5_bridge_timeout_seconds == pytest.approx(1.5)
+    assert normal.mt5_bridge_timeout_seconds == pytest.approx(4.0)
+    assert slow.mt5_bridge_timeout_seconds == pytest.approx(5.0)
+
+
+def test_mt5_bridge_connect_timeout_does_not_skip_future_fetches():
+    pf = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=5.0,
+    )
+
+    class TimeoutClient:
+        is_closed = False
+
+        async def get(self, *args, **kwargs):
+            raise httpx.ConnectTimeout("connect timed out")
+
+        async def aclose(self):
+            self.is_closed = True
+
+    async def fake_client():
+        return TimeoutClient()
+
+    pf._mt5_client = fake_client
+
+    assert asyncio.run(pf.fetch_mt5_bridge_price("BTCUSDT")) is None
+    assert asyncio.run(pf.fetch_mt5_bridge_price("BTCUSDT")) is None
+
+    status = pf.get_mt5_bridge_status("BTCUSDT")
+    assert status["attempts"] == 2
+    assert status["failures"] == 2
+    assert pf._mt5_bridge_unavailable_until == 0.0
 
 
 def test_stale_spot_dashboard_sigma_does_not_collapse_to_zero():

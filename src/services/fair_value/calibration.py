@@ -3,7 +3,7 @@
 # Live FV safety. If the external spot feed is stale, all model prices are
 # suspect; remove active quotes rather than trading on frozen FV.
 MAX_SPOT_PRICE_AGE_SECONDS = 3.0
-MAX_EXNESS_PRICE_AGE_SECONDS = 1.0
+MAX_EXNESS_PRICE_AGE_SECONDS = 5.0
 
 # Model-vs-market disagreement controls.
 BASIS_GUARD_MAX_FV_DEVIATION = 0.08
