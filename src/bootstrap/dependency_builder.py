@@ -93,3 +93,19 @@ def balance_monitor_address(credentials: Any) -> str:
     if getattr(credentials, "signature_type", None) in (1, 2, 3):
         return getattr(credentials, "funder", "") or ""
     return ""
+
+
+def clob_signing_private_key(credentials: Any) -> str:
+    """Return the key CLOB should use for order signing/auth.
+
+    For POLY_1271 deposit-wallet orders, the CLOB order payload is signed by
+    the deposit-wallet owner/session signer while maker/signer fields point at
+    the deposit wallet. Some live configs keep a separate owner_private_key for
+    deposit-wallet relayer batches; when present, use that same owner/session
+    signer for type-3 CLOB signing instead of an unrelated relayer/API key.
+    """
+    signature_type = int(getattr(credentials, "signature_type", 0) or 0)
+    owner_key = getattr(credentials, "owner_private_key", "") or ""
+    if signature_type == 3 and owner_key:
+        return owner_key
+    return getattr(credentials, "private_key", "") or ""

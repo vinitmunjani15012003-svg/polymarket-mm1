@@ -9,6 +9,7 @@ from src.bootstrap.dependency_builder import (
     active_symbols,
     balance_monitor_address,
     build_container,
+    clob_signing_private_key,
     mt5_bridge_log_fields,
     select_active_assets,
     should_disable_onchain_ctf_fallback,
@@ -44,6 +45,8 @@ def test_dependency_builder_preserves_wallet_mode_address_and_mt5_log_shape():
     credentials = SimpleNamespace(
         signature_type=3,
         funder="0xfunder",
+        private_key="trading-key",
+        owner_private_key="owner-key",
         mt5_bridge_url="http://bridge.local:8765/path",
         mt5_bridge_api_key="secret-value",
         mt5_bridge_stale_seconds=5.0,
@@ -54,6 +57,10 @@ def test_dependency_builder_preserves_wallet_mode_address_and_mt5_log_shape():
 
     assert should_disable_onchain_ctf_fallback(credentials) is True
     assert balance_monitor_address(credentials) == "0xfunder"
+    assert clob_signing_private_key(credentials) == "owner-key"
+    credentials.signature_type = 0
+    assert clob_signing_private_key(credentials) == "trading-key"
+    credentials.signature_type = 3
     assert fields == {
         "configured": True,
         "url_host": "bridge.local:8765",
