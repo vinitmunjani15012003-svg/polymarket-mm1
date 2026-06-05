@@ -42,7 +42,6 @@ class ClobClientWrapper:
         self._api_passphrase = api_passphrase
         self._signature_type = signature_type
         self._funder = funder
-        self._order_signature_type = signature_type
         self._client = None
         self._client_version = "unknown"
         self._initialized = False
@@ -60,54 +59,10 @@ class ClobClientWrapper:
         # not guaranteed to be thread-safe.
         self._client_lock = asyncio.Lock()
 
-    async def _run_client_call(self, fn, *args, signature_type=None, **kwargs):
-        """Run a blocking py-clob-client call in a worker thread.
-
-        py-clob-client stores signature mode on the mutable order builder. Keep
-        calls serialized and, when needed, temporarily switch the builder mode
-        so order placement and deposit-wallet balance sync cannot leak signer
-        modes into each other.
-        """
+    async def _run_client_call(self, fn, *args, **kwargs):
+        """Run a blocking py-clob-client call in a worker thread."""
         async with self._client_lock:
-            restore = self._temporarily_set_client_signature_type(signature_type)
-            try:
-                return await asyncio.to_thread(fn, *args, **kwargs)
-            finally:
-                restore()
-
-    def _temporarily_set_client_signature_type(self, signature_type):
-        if signature_type is None or not self._client:
-            return lambda: None
-        builder = getattr(self._client, "builder", None)
-        if builder is None or not hasattr(builder, "signature_type"):
-            return lambda: None
-        previous = getattr(builder, "signature_type", None)
-        try:
-            builder.signature_type = signature_type
-        except Exception:
-            return lambda: None
-
-        def _restore():
-            try:
-                builder.signature_type = previous
-            except Exception:
-                pass
-
-        return _restore
-
-    @staticmethod
-    def _order_signature_type_for_client(client_version: str, signature_type: int, funder: str = "") -> int:
-        """Return the signature mode to use for CLOB order signing.
-
-        Do not normalize deposit-wallet/POLY_1271 orders to proxy mode. The
-        CLOB rejects a deposit-wallet maker submitted as POLY_PROXY with:
-        "maker address not allowed, please use the deposit wallet flow".
-        Polymarket's documented Python flow is signature_type=3 with funder set.
-        """
-        try:
-            return int(signature_type)
-        except Exception:
-            return signature_type
+            return await asyncio.to_thread(fn, *args, **kwargs)
 
     @staticmethod
     def _ensure_builder_code(order_args):
@@ -184,17 +139,12 @@ class ClobClientWrapper:
                 api_secret=self._api_secret,
                 api_passphrase=self._api_passphrase,
             )
-            self._order_signature_type = self._order_signature_type_for_client(
-                client_version,
-                self._signature_type,
-                self._funder,
-            )
             client_kwargs = {
                 "host": self.host,
                 "chain_id": self._chain_id,
                 "key": self._private_key,
                 "creds": creds,
-                "signature_type": self._order_signature_type,
+                "signature_type": self._signature_type,
             }
             if self._funder:
                 client_kwargs["funder"] = self._funder
@@ -215,7 +165,6 @@ class ClobClientWrapper:
             log.info("clob_client_initialized", address=addr,
                      client_version=client_version,
                      signature_type=self._signature_type,
-                     order_signature_type=self._order_signature_type,
                      funder=self._funder)
         except ImportError:
             log.error("py_clob_client_not_installed",
@@ -281,14 +230,11 @@ class ClobClientWrapper:
                 except Exception as e:
                     log.warning("balance_allowance_params_v1_unavailable", error=str(e))
 
-            # Call update to refresh CLOB's indexed view. For deposit-wallet
-            # mode, temporarily restore the configured signature_type=3 because
-            # the SDK builds the balance endpoint's query params from the
-            # mutable client builder signature type.
+            # Call update to refresh CLOB's indexed view
             if params is not None:
-                await self._run_client_call(update_fn, params, signature_type=self._signature_type)
+                await self._run_client_call(update_fn, params)
             else:
-                await self._run_client_call(update_fn, signature_type=self._signature_type)
+                await self._run_client_call(update_fn)
 
             # Verify the sync worked by checking allowances are non-zero.
             # The CLOB tracks 3 spender contracts; if any has allowance=0,
@@ -297,7 +243,7 @@ class ClobClientWrapper:
             get_fn = getattr(self._client, "get_balance_allowance", None)
             if callable(get_fn):
                 try:
-                    result = await self._run_client_call(get_fn, params, signature_type=self._signature_type) if params else await self._run_client_call(get_fn, signature_type=self._signature_type)
+                    result = await self._run_client_call(get_fn, params) if params else await self._run_client_call(get_fn)
                     if isinstance(result, dict):
                         parsed = parse_balance_allowance(result)
                         allowances = parsed["allowances"]
@@ -367,10 +313,7 @@ class ClobClientWrapper:
                 # post_only where supported by the installed SDK.
                 return self._post_order_compat(signed_order, OrderType.GTC)
 
-            response = await self._run_client_call(
-                _create_and_post,
-                signature_type=self._order_signature_type,
-            )
+            response = await self._run_client_call(_create_and_post)
 
             order_id = response.get("orderID") or response.get("id")
 
@@ -445,10 +388,7 @@ class ClobClientWrapper:
 
                 return self._client.post_orders(post_args)
 
-            response = await self._run_client_call(
-                _create_and_post_batch,
-                signature_type=self._order_signature_type,
-            )
+            response = await self._run_client_call(_create_and_post_batch)
             results = self._normalize_post_orders_response(response, len(orders))
 
             placed: dict[str, Optional[str]] = {side: None for side in sides}
