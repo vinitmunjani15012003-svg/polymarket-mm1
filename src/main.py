@@ -41,7 +41,6 @@ from src.bootstrap.dependency_builder import (
     active_symbols,
     balance_monitor_address,
     build_container,
-    clob_signing_private_key,
     mt5_bridge_log_fields,
     select_active_assets,
     should_disable_onchain_ctf_fallback,
@@ -241,16 +240,9 @@ async def run_bot(
             return RunResult(False, mode, target_windows, 0, 0, 0.0, f"missing live credentials: {', '.join(missing)}")
 
         from src.execution.clob_client import ClobClientWrapper
-        clob_private_key = clob_signing_private_key(config.credentials)
-        if config.credentials.signature_type == 3 and config.credentials.owner_private_key:
-            log.info(
-                "deposit_wallet_clob_owner_key_selected",
-                reason="signature_type_3_uses_owner_or_session_signer",
-                funder=config.credentials.funder,
-            )
         executor = ClobClientWrapper(
             host=config.credentials.host,
-            private_key=clob_private_key,
+            private_key=config.credentials.private_key,
             chain_id=config.credentials.chain_id,
             api_key=config.credentials.api_key,
             api_secret=config.credentials.api_secret,
