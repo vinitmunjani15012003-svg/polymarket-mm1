@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 from src.execution.clob import ClobBalances, ClobOrders
@@ -86,6 +87,45 @@ def test_ensure_builder_code_mutates_when_missing_and_facade_delegates_static_he
     assert ClobClientWrapper._ensure_builder_code(order_args) is order_args
     assert ClobClientWrapper._normalize_post_orders_response({"data": [{"id": "x"}]}, 1) == [{"id": "x"}]
     assert ClobClientWrapper._fill_dedupe_key({"id": "fill"}, "m") == "id:fill"
+
+
+def test_v2_deposit_wallet_order_signing_uses_api_key_owner_not_funder():
+    assert ClobClientWrapper._order_signature_type_for_client("v2", 3, "0xfunder") == 1
+    assert ClobClientWrapper._order_signature_type_for_client("v2", 1, "0xfunder") == 1
+    assert ClobClientWrapper._order_signature_type_for_client("v2", 3, "") == 3
+    assert ClobClientWrapper._order_signature_type_for_client("v1", 3, "0xfunder") == 3
+
+
+async def _temporary_signature_type_roundtrip():
+    class Builder:
+        signature_type = 1
+
+    class Client:
+        builder = Builder()
+
+    wrapper = ClobClientWrapper(
+        host="https://clob.polymarket.com",
+        private_key="0xabc",
+        chain_id=137,
+        api_key="key",
+        api_secret="secret",
+        api_passphrase="pass",
+        signature_type=3,
+        funder="0xfunder",
+    )
+    wrapper._client = Client()
+    observed = await wrapper._run_client_call(
+        lambda: wrapper._client.builder.signature_type,
+        signature_type=3,
+    )
+    return observed, wrapper._client.builder.signature_type
+
+
+def test_client_call_temporarily_switches_and_restores_signature_type():
+    observed, restored = asyncio.run(_temporary_signature_type_roundtrip())
+
+    assert observed == 3
+    assert restored == 1
 
 
 def test_balance_allowance_helper_and_clob_facade_imports_remain_available():
