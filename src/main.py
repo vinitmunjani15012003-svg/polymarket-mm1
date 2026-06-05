@@ -743,6 +743,7 @@ def main():
     # Setup logging
     setup_logging(level=args.log_level)
     log = get_logger("main")
+    log.info("config_loaded", config_path=args.config, override_path=override or "")
     alert_webhook = (
         args.alert_webhook
         or os.environ.get("POLYMARKET_ALERT_WEBHOOK_URL")

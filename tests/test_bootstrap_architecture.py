@@ -21,6 +21,7 @@ from src.bootstrap.startup_checks import (
     validate_credentials,
     validate_live_credentials,
 )
+from src.config import load_config
 
 
 def asset(symbol, enabled=True):
@@ -78,6 +79,22 @@ def test_startup_checks_validate_live_credentials_read_only():
     assert missing_live_credentials(cfg) == ("api_key", "api_passphrase")
     with pytest.raises(ValueError, match="api_key, api_passphrase"):
         validate_credentials(cfg)
+
+
+def test_load_config_rejects_empty_base_or_override_files(tmp_path):
+    empty_base = tmp_path / "empty.yaml"
+    empty_base.write_text("")
+
+    with pytest.raises(ValueError, match="config file is empty"):
+        load_config(str(empty_base))
+
+    base = tmp_path / "base.yaml"
+    override = tmp_path / "override.yaml"
+    base.write_text("mode: dry-run\ncredentials: {}\nassets: {}\n")
+    override.write_text("")
+
+    with pytest.raises(ValueError, match="override config file is empty"):
+        load_config(str(base), str(override))
 
 
 def test_run_startup_checks_returns_structured_failures():

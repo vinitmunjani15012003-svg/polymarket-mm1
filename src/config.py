@@ -353,13 +353,24 @@ def load_config(config_path: str = "config/default.yaml",
 
     with open(config_path, 'r') as f:
         raw = yaml.safe_load(f)
+    if raw is None:
+        raise ValueError(f"config file is empty: {config_path}")
+    if not isinstance(raw, dict):
+        raise ValueError(f"config file must contain a YAML mapping: {config_path}")
 
-    # Apply overrides if provided
-    if override_path and os.path.exists(override_path):
+    # Apply overrides if provided. A provided but empty/missing override is
+    # almost always a live-trading misconfiguration, so fail loudly instead of
+    # silently using defaults/env vars.
+    if override_path:
+        if not os.path.exists(override_path):
+            raise FileNotFoundError(f"override config file not found: {override_path}")
         with open(override_path, 'r') as f:
             overrides = yaml.safe_load(f)
-        if overrides:
-            raw = _deep_merge(raw, overrides)
+        if overrides is None:
+            raise ValueError(f"override config file is empty: {override_path}")
+        if not isinstance(overrides, dict):
+            raise ValueError(f"override config file must contain a YAML mapping: {override_path}")
+        raw = _deep_merge(raw, overrides)
 
     # Substitute environment variables
     raw = _recursive_env_sub(raw)
