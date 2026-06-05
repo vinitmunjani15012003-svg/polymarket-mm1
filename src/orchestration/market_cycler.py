@@ -347,6 +347,9 @@ class MarketCycler:
     def _small_capital_should_hold_opening_quote(self, state: dict, has_resting_opening_quote: bool, matched_pairs: int) -> bool:
         return self._small_capital_lifecycle()._small_capital_should_hold_opening_quote(state, has_resting_opening_quote, matched_pairs)
 
+    def _apply_small_capital_opening_reprice_guard(self, market_id: str, quotes, state: dict, min_order_size: int) -> str:
+        return self._small_capital_lifecycle()._apply_small_capital_opening_reprice_guard(market_id, quotes, state, min_order_size)
+
     def _small_capital_opening_spent(self, state: dict) -> bool:
         return self._small_capital_lifecycle()._small_capital_opening_spent(state)
 
@@ -2025,19 +2028,34 @@ class MarketCycler:
                     has_resting_opening_quote,
                     int(pos.matched_pairs() or 0),
                 ):
-                    log.info(
-                        "small_capital_holding_opening_quote",
-                        asset=self.asset,
-                        market=market.market_id[:8],
-                        msg="opening quote already placed; holding without normal repricing",
+                    reprice_side = self._apply_small_capital_opening_reprice_guard(
+                        market.market_id,
+                        quotes,
+                        sct_state,
+                        min_order_size,
                     )
+                    if not reprice_side:
+                        log.warning(
+                            "small_capital_opening_reprice_side_unknown",
+                            asset=self.asset,
+                            market=market.market_id[:8],
+                            msg="opening quote is resting but side could not be inferred; holding without reprice",
+                        )
+                        self._set_dashboard_event(
+                            "info",
+                            "SMALL_CAP_HOLD_OPENING",
+                            "opening quote already placed; waiting for fill/cancel",
+                        )
+                        self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_HOLD_OPENING", remaining)
+                        return
                     self._set_dashboard_event(
                         "info",
-                        "SMALL_CAP_HOLD_OPENING",
-                        "opening quote already placed; waiting for fill/cancel",
+                        "SMALL_CAP_REPRICE_OPENING",
+                        f"repricing existing {reprice_side} opening quote",
                     )
-                    self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_HOLD_OPENING", remaining)
-                    return
+                    # Continue to universal guards and update_quotes.
+                    # OrderManager will cancel/replace only if the target price
+                    # materially changed; otherwise existing queue priority stays.
                 elif not has_resting_opening_quote:
                     log.warning(
                         "small_capital_no_second_opening_quote",

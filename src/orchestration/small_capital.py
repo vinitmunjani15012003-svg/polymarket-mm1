@@ -285,6 +285,52 @@ class SmallCapitalLifecycle:
             and int(matched_pairs or 0) == 0
         )
 
+    @staticmethod
+    def _small_capital_opening_side(state: dict, active) -> str:
+        side = str(state.get("initial_side") or "").lower()
+        if side in ("yes", "up"):
+            return "yes"
+        if side in ("no", "down"):
+            return "no"
+        if bool(getattr(active, "yes_order_id", "")) and not bool(getattr(active, "no_order_id", "")):
+            return "yes"
+        if bool(getattr(active, "no_order_id", "")) and not bool(getattr(active, "yes_order_id", "")):
+            return "no"
+        return ""
+
+    def _apply_small_capital_opening_reprice_guard(self, market_id: str, quotes, state: dict, min_order_size: int) -> str:
+        """Constrain an unfilled opening reprice to the original side only.
+
+        One-cycle small-cap mode should not freeze a stale opening bid forever.
+        If the quote is still unfilled/resting, let OrderManager cancel/replace
+        it to the latest target price, but only on the same opening side. This
+        preserves the one-opening invariant while avoiding dead stale orders.
+        """
+        active = self.order_mgr.get_active(market_id)
+        side = self._small_capital_opening_side(state, active)
+        if side == "yes":
+            quotes.no_buy_size = 0
+            if quotes.yes_buy_price:
+                quotes.yes_buy_size = max(int(quotes.yes_buy_size or 0), int(min_order_size or 0))
+        elif side == "no":
+            quotes.yes_buy_size = 0
+            if quotes.no_buy_price:
+                quotes.no_buy_size = max(int(quotes.no_buy_size or 0), int(min_order_size or 0))
+        else:
+            return ""
+        log.info(
+            "small_capital_opening_reprice_allowed",
+            asset=self.asset,
+            market=market_id[:8],
+            side=side,
+            current_yes_price=getattr(active, "yes_price", None),
+            current_no_price=getattr(active, "no_price", None),
+            target_yes_price=getattr(quotes, "yes_buy_price", None),
+            target_no_price=getattr(quotes, "no_buy_price", None),
+            msg="reprice same-side unfilled opening quote without opening extra exposure",
+        )
+        return side
+
     def _small_capital_opening_spent(self, state: dict) -> bool:
         return bool(state.get("opening_attempt_spent") or state.get("quote_cycle_started"))
 
@@ -327,16 +373,12 @@ class SmallCapitalLifecycle:
             )
         if has_resting and not state.get("initial_filled"):
             log.info(
-                "small_capital_holding_opening_quote_pre_generation",
+                "small_capital_opening_quote_reprice_path_pre_generation",
                 asset=self.asset,
                 market=market.market_id[:8],
-                msg="opening quote already spent; blocking reverse-move normal quote generation",
+                msg="opening quote already spent; allowing same-side reprice path",
             )
-            self._set_dashboard_event("info", "SMALL_CAP_HOLD_OPENING", "opening quote already placed; waiting")
-            self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
-                                   fv or self.last_fair_value or 0, sigma or self.last_sigma or 0,
-                                   "SMALL_CAP_HOLD_OPENING", remaining)
-            return True
+            return False
 
         if not state.get("initial_filled") and bool(getattr(getattr(self, "small_capital_config", None), "retry_unfilled_opening", True)):
             # Compatibility/workflow restore: an opening order that was canceled

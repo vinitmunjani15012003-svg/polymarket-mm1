@@ -950,6 +950,37 @@ def test_small_capital_holds_active_unfilled_opening_quote_without_repricing():
     assert cycler._small_capital_opening_spent({"opening_attempt_spent": True, "quote_cycle_started": False}) is True
 
 
+def test_small_capital_resting_opening_quote_reprices_same_side_only():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    active = SimpleNamespace(
+        yes_order_id="",
+        no_order_id="NO-1",
+        yes_price=None,
+        no_price=0.52,
+    )
+    cycler.order_mgr = SimpleNamespace(get_active=lambda market_id: active)
+    quotes = SimpleNamespace(
+        yes_buy_price=0.19,
+        no_buy_price=0.80,
+        yes_buy_size=5,
+        no_buy_size=0,
+    )
+    state = {
+        "quote_cycle_started": True,
+        "opening_attempt_spent": True,
+        "initial_filled": False,
+        "initial_side": "no",
+    }
+
+    side = cycler._apply_small_capital_opening_reprice_guard("M1", quotes, state, min_order_size=5)
+
+    assert side == "no"
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 5
+    assert quotes.no_buy_price == 0.80
+
+
 def test_small_capital_canceled_unfilled_opening_can_retry_by_default():
     class StateManager:
         def __init__(self):

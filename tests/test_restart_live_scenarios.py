@@ -84,7 +84,7 @@ def flat_pos():
     return SimpleNamespace(matched_pairs=lambda: 0, share_imbalance=lambda: 0)
 
 
-def test_restart_mid_cycle_holds_persisted_opening_quote_without_requoting():
+def test_restart_mid_cycle_allows_same_side_opening_quote_reprice():
     state = MemorySmallCapitalState({
         "quote_cycle_started": True,
         "opening_attempt_spent": True,
@@ -101,10 +101,10 @@ def test_restart_mid_cycle_holds_persisted_opening_quote_without_requoting():
         market(), flat_pos(), wallet_snapshot=None, fv=0.53, sigma=0.2, remaining=100
     ))
 
-    assert blocked is True
+    assert blocked is False
     assert restarted.order_mgr.cancelled_markets == []
     assert state.state["opening_attempt_spent"] is True
-    assert restarted.dashboard_updates[-1][4] == "SMALL_CAP_HOLD_OPENING"
+    assert restarted.dashboard_updates == []
 
 
 def test_partial_fill_observed_after_cancel_still_forces_opposite_balancing_side():
