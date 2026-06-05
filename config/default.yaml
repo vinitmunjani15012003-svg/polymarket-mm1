@@ -36,7 +36,7 @@ assets:
   BTC:
     enabled: true
     symbol: "BTCUSDT"
-    default_sigma: 0.20
+    default_sigma: 0.60
     gamma: 0.40             # Increased from 0.15: much more aggressive skew
     gamma_near_expiry: 0.80
     min_spread: 0.01    # 0.5 ticks ($0.005) per side to get 0.99 combined cost

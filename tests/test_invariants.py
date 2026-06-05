@@ -36,6 +36,7 @@ from src.risk.risk_engine import pre_trade_checks
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
 from src.strategy.inventory import InventoryManager, InventoryState
 from src.strategy.quote_engine import MAX_COMBINED_COST, QuoteEngine
+from src.strategy.volatility import MIN_BINARY_MODEL_SIGMA, VolatilityEstimator
 
 
 class DummyExecutor:
@@ -118,6 +119,20 @@ def test_dashboard_fair_value_peek_does_not_mutate_authoritative_state():
     assert peek < 0.5
     assert model.last_fair_value == authoritative
     assert model._last_update_ts == last_ts
+
+
+def test_binary_volatility_floor_prevents_raw_model_pin_to_certain():
+    model = UpDownFairValue(event_start_ts=1000, resolve_ts=1900, start_price=100_000.0)
+    # A 0.20% move with 10m left is enough to pin raw FV near certainty if the
+    # annualized sigma is configured at 20%.
+    too_low_sigma_fv = model.fair_value(100_200.0, sigma_annualized=0.20, now_ts=1300, update_state=False)
+    estimator = VolatilityEstimator(default_sigma=0.20)
+    floored_sigma = estimator.sigma_for_model()
+    floored_fv = model.fair_value(100_200.0, sigma_annualized=floored_sigma, now_ts=1300, update_state=False)
+
+    assert too_low_sigma_fv > 0.98
+    assert floored_sigma == pytest.approx(MIN_BINARY_MODEL_SIGMA)
+    assert floored_fv < 0.82
 
 
 def test_blended_fair_value_prevents_early_window_overconfidence():
