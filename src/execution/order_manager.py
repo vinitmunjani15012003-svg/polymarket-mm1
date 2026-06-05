@@ -7,37 +7,20 @@ RULES:
   3. Smart reprice: only cancel+replace if price moved > threshold
 """
 
-import asyncio
-import inspect
 import time
 from typing import Optional
-from dataclasses import dataclass
 
 from src.strategy.quote_engine import QuoteResult
+from src.execution.order_state import ActiveQuotes
+from src.execution.repricing import RepricePolicy, is_crossed_buy
 from src.monitoring.logger import get_logger
+from src.services.execution.cancel_manager import CancelManager
+from src.services.execution.order_intents import attach_place_intent, next_quote_version
+from src.services.execution.order_submitter import OrderSubmitter
+from src.services.execution.order_tracker import OrderTracker
+from src.services.execution.reconciliation import find_stray_order_ids, find_token_order_ids
 
 log = get_logger("order_manager")
-
-
-@dataclass
-class ActiveQuotes:
-    """Currently active quotes for a market."""
-    yes_order_id: Optional[str] = None
-    no_order_id: Optional[str] = None
-    yes_price: Optional[float] = None
-    no_price: Optional[float] = None
-    yes_size: int = 0
-    no_size: int = 0
-    last_update: float = 0.0
-
-
-def _order_token_id(info) -> str:
-    """Return an order token id from live dicts or dry-run order objects."""
-    if info is None:
-        return ""
-    if isinstance(info, dict):
-        return str(info.get("token_id") or info.get("asset_id") or "")
-    return str(getattr(info, "token_id", "") or getattr(info, "asset_id", "") or "")
 
 
 class OrderManager:
@@ -60,19 +43,19 @@ class OrderManager:
         self.executor = executor
         self.reprice_threshold = reprice_threshold
         self.min_update_interval = min_update_interval
-        # Cache whether executor.place_buy_order accepts a 'side' param
-        # (DryRunExecutor does, ClobClientWrapper also does now).
-        # Avoids calling inspect.signature on every order placement.
-        self._executor_accepts_side = False
-        if hasattr(executor, 'place_buy_order'):
-            import inspect
-            sig = inspect.signature(executor.place_buy_order)
-            self._executor_accepts_side = 'side' in sig.parameters
+        self.order_submitter = OrderSubmitter(executor)
+        self.cancel_manager = CancelManager(executor)
+        self.order_tracker = OrderTracker()
+        self._quote_versions: dict[str, int] = {}
         # Repair quotes are intentionally sticky. The bot is buy-only/post-only,
         # so imbalance repair depends on resting the light-side bid long enough
         # to earn queue priority. Chasing every FV/book wiggle cancels exactly
         # the order we need filled and leaves one-sided inventory into expiry.
         self.repair_reprice_threshold = max(0.05, reprice_threshold)
+        self.reprice_policy = RepricePolicy(
+            reprice_threshold=self.reprice_threshold,
+            repair_reprice_threshold=self.repair_reprice_threshold,
+        )
         self.repair_min_update_interval = max(10.0, min_update_interval)
         # Normal BUY maker orders that touch/cross the best ask are adverse-risk
         # candidates; cancel immediately. Repair quotes can still use a short
@@ -83,6 +66,7 @@ class OrderManager:
             repair_crossed_bid_grace_seconds,
         )
         self.last_order_error: Optional[str] = None
+        self.last_order_warning: Optional[str] = None
         # Active quotes per market
         self.active: dict[str, ActiveQuotes] = {}
 
@@ -107,6 +91,7 @@ class OrderManager:
         active = self.get_active(market_id)
         updated = False
         self.last_order_error = None
+        self.last_order_warning = None
 
         # Allow per-side book snapshots (preferred). Fall back to shared
         # book_snapshot for legacy callers.
@@ -139,14 +124,14 @@ class OrderManager:
         yes_repair_side = repair_mode == "repair_up"
         no_repair_side = repair_mode == "repair_down"
 
-        yes_needs, yes_urgent = self._reprice_decision(
+        yes_needs, yes_urgent = self.reprice_policy.decision(
             active.yes_price, quotes.yes_buy_price,
             active.yes_size, quotes.yes_buy_size,
             yes_book_snapshot,
             sticky_repair=yes_repair_side,
         )
 
-        no_needs, no_urgent = self._reprice_decision(
+        no_needs, no_urgent = self.reprice_policy.decision(
             active.no_price, quotes.no_buy_price,
             active.no_size, quotes.no_buy_size,
             no_book_snapshot,
@@ -175,25 +160,27 @@ class OrderManager:
         cancel_yes = bool(yes_needs and active.yes_order_id)
         cancel_no = bool(no_needs and active.no_order_id)
 
-        if cancel_yes and self._is_crossed_buy(active.yes_price, yes_book_snapshot):
-            deferred = await self._maybe_defer_crossed_bid_cancel(
+        if cancel_yes and is_crossed_buy(active.yes_price, yes_book_snapshot):
+            deferred = await self.cancel_manager.crossed_bid_cancel_should_defer(
                 market_id=market_id,
                 side="yes",
                 order_id=active.yes_order_id,
-                active=active,
+                grace_seconds=self._crossed_bid_grace(yes_repair_side),
                 sticky_repair=yes_repair_side,
+                clear_active_side=lambda: self._clear_active_side(active, "yes"),
             )
             if deferred:
                 cancel_yes = False
                 yes_needs = False
 
-        if cancel_no and self._is_crossed_buy(active.no_price, no_book_snapshot):
-            deferred = await self._maybe_defer_crossed_bid_cancel(
+        if cancel_no and is_crossed_buy(active.no_price, no_book_snapshot):
+            deferred = await self.cancel_manager.crossed_bid_cancel_should_defer(
                 market_id=market_id,
                 side="no",
                 order_id=active.no_order_id,
-                active=active,
+                grace_seconds=self._crossed_bid_grace(no_repair_side),
                 sticky_repair=no_repair_side,
+                clear_active_side=lambda: self._clear_active_side(active, "no"),
             )
             if deferred:
                 cancel_no = False
@@ -210,12 +197,7 @@ class OrderManager:
 
         if cancel_ids:
             cancel_start = time.perf_counter()
-            cancel_ok = True
-            if hasattr(self.executor, 'cancel_orders'):
-                cancel_ok = await self.executor.cancel_orders(cancel_ids)
-            else:
-                for order_id in cancel_ids:
-                    cancel_ok = bool(await self.executor.cancel_order(order_id)) and cancel_ok
+            cancel_ok = await self.cancel_manager.cancel_orders(cancel_ids)
             cancel_ms = (time.perf_counter() - cancel_start) * 1000
             if not cancel_ok:
                 log.error("quote_cancel_failed_halt_reprice",
@@ -232,28 +214,33 @@ class OrderManager:
                 active.no_price = None
                 active.no_size = 0
 
+        quote_version = None
         place_specs = []
         if yes_needs and quotes.yes_buy_price and quotes.yes_buy_size > 0:
-            place_specs.append({
+            if quote_version is None:
+                quote_version = self._advance_quote_version(market_id)
+            place_specs.append(attach_place_intent({
                 "token_id": token_id_yes,
                 "price": quotes.yes_buy_price,
                 "size": quotes.yes_buy_size,
                 "side": "yes",
                 "book_snapshot": yes_book_snapshot,
-            })
+            }, market_id=market_id, quote_version=quote_version))
         elif yes_needs:
             active.yes_order_id = None
             active.yes_price = None
             active.yes_size = 0
 
         if no_needs and quotes.no_buy_price and quotes.no_buy_size > 0:
-            place_specs.append({
+            if quote_version is None:
+                quote_version = self._advance_quote_version(market_id)
+            place_specs.append(attach_place_intent({
                 "token_id": token_id_no,
                 "price": quotes.no_buy_price,
                 "size": quotes.no_buy_size,
                 "side": "no",
                 "book_snapshot": no_book_snapshot,
-            })
+            }, market_id=market_id, quote_version=quote_version))
         elif no_needs:
             active.no_order_id = None
             active.no_price = None
@@ -305,14 +292,11 @@ class OrderManager:
         if not isinstance(open_orders, dict):
             return True
 
-        tracked = {oid for oid in (active.yes_order_id, active.no_order_id) if oid}
-        token_ids = {str(token_id_yes), str(token_id_no)}
-        stray_ids = []
-        for oid, info in list(open_orders.items()):
-            if oid in tracked:
-                continue
-            if _order_token_id(info) in token_ids:
-                stray_ids.append(oid)
+        stray_ids = find_stray_order_ids(
+            active,
+            open_orders,
+            {str(token_id_yes), str(token_id_no)},
+        )
 
         if not stray_ids:
             return True
@@ -323,12 +307,7 @@ class OrderManager:
             count=len(stray_ids),
             order_ids=[oid[:8] for oid in stray_ids[:8]],
         )
-        ok = True
-        if hasattr(self.executor, "cancel_orders"):
-            ok = bool(await self.executor.cancel_orders(stray_ids))
-        else:
-            for oid in stray_ids:
-                ok = bool(await self.executor.cancel_order(oid)) and ok
+        ok = await self.cancel_manager.cancel_orders(stray_ids)
         if not ok:
             log.error(
                 "stray_live_order_cancel_failed",
@@ -349,19 +328,13 @@ class OrderManager:
 
         open_orders = getattr(self.executor, "open_orders", None)
         if isinstance(open_orders, dict):
-            for oid, info in list(open_orders.items()):
-                if _order_token_id(info) == str(token_id) and oid not in cancel_ids:
-                    cancel_ids.append(oid)
+            for oid in find_token_order_ids(open_orders, token_id, exclude=set(cancel_ids)):
+                cancel_ids.append(oid)
 
         if not cancel_ids:
             return True
 
-        ok = True
-        if hasattr(self.executor, "cancel_orders"):
-            ok = bool(await self.executor.cancel_orders(cancel_ids))
-        else:
-            for oid in cancel_ids:
-                ok = bool(await self.executor.cancel_order(oid)) and ok
+        ok = await self.cancel_manager.cancel_orders(cancel_ids)
 
         if ok and active:
             if side in ("yes", "up"):
@@ -394,11 +367,9 @@ class OrderManager:
         if not active:
             return True
 
-        ok = True
-        if active.yes_order_id:
-            ok = bool(await self.executor.cancel_order(active.yes_order_id)) and ok
-        if active.no_order_id:
-            ok = bool(await self.executor.cancel_order(active.no_order_id)) and ok
+        ok = await self.cancel_manager.cancel_orders(
+            [oid for oid in (active.yes_order_id, active.no_order_id) if oid]
+        )
 
         if ok:
             self.active[market_id] = ActiveQuotes()
@@ -409,7 +380,7 @@ class OrderManager:
 
     async def cancel_all(self) -> bool:
         """Cancel all orders across all markets."""
-        ok = bool(await self.executor.cancel_all())
+        ok = bool(await self.cancel_manager.cancel_all())
         if ok:
             self.active.clear()
         else:
@@ -417,139 +388,93 @@ class OrderManager:
             self.last_order_error = "cancel_all_failed"
         return ok
 
-    async def _place_buy(self, token_id: str, price: float,
-                          size: float, side: str,
-                          book_snapshot=None) -> Optional[str]:
-        """
-        Place a BUY order. This is the single enforcement point.
-        """
-        if hasattr(self.executor, 'place_buy_order'):
-            if self._executor_accepts_side:
-                return await self.executor.place_buy_order(
-                    token_id, price, size, side=side,
-                    book_snapshot=book_snapshot
-                )
-            else:
-                return await self.executor.place_buy_order(
-                    token_id, price, size
-                )
-        return None
+    def _advance_quote_version(self, market_id: str) -> int:
+        version = next_quote_version(self._quote_versions.get(market_id, 0))
+        self._quote_versions[market_id] = version
+        return version
 
     async def _place_buys(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Place one or more BUY orders, using executor batch API when available."""
-        if hasattr(self.executor, 'place_buy_orders'):
-            return await self.executor.place_buy_orders(orders)
+        filtered, skipped, intents_by_side = self.order_tracker.claim_place_orders(orders)
 
-        placed = {}
-        for order in orders:
-            placed[order["side"]] = await self._place_buy(
-                order["token_id"], order["price"], order["size"],
-                order["side"], order.get("book_snapshot")
+        if not filtered:
+            return skipped
+
+        try:
+            placed = await self.order_submitter.place_buys(filtered)
+        except Exception as exc:
+            failed = self.order_tracker.mark_submission_exception(intents_by_side)
+            log.error(
+                "order_placement_failed",
+                error=str(exc),
+                sides=list(intents_by_side),
             )
-        return placed
+            self.last_order_error = "order_placement_failed"
+            return {**skipped, **failed}
 
-    def _needs_reprice(self, existing_price: Optional[float],
-                       new_price: Optional[float],
-                       existing_size: int,
-                       new_size: int) -> bool:
-        """Check if a quote needs to be repriced.
+        failed_submission = self.order_tracker.record_submission_results(placed, intents_by_side)
+        if failed_submission:
+            await self._handle_unconfirmed_placement(intents_by_side)
+        return {**skipped, **placed}
 
-        Uses >= (not >) so that half-cent changes trigger repricing in a
-        1-cent tick market.  Also reprices on significant size changes in
-        EITHER direction — stale large orders accumulate adverse fills.
+    async def _handle_unconfirmed_placement(self, intents_by_side: dict) -> None:
+        """Handle a placement that returned no order id without killing the bot.
+
+        CLOB can return transient 5xx/timeouts after accepting or rejecting an
+        order. Treat those as ambiguous/non-fatal, reconcile open orders, and let
+        the next quote cycle decide. Non-transient SDK/auth errors remain fatal.
+        Plain no-id results without an executor error are usually post-only
+        rejections and are also non-fatal.
         """
-        # Always reprice if no existing quote
-        if existing_price is None:
-            return new_price is not None and new_size > 0
+        error = str(getattr(self.executor, "last_place_error", "") or "")
+        transient = bool(getattr(self.executor, "last_place_error_transient", False))
+        market_id = ""
+        if intents_by_side:
+            first_intent = next(iter(intents_by_side.values()))
+            market_id = getattr(first_intent, "market_id", "") or ""
 
-        # Remove quote if new is None or zero size
-        if new_price is None or new_size <= 0:
-            return True
+        if error and not transient:
+            log.error(
+                "order_placement_failed_nontransient",
+                market=market_id[:8],
+                error=error,
+                sides=list(intents_by_side),
+            )
+            self.last_order_error = "order_placement_failed"
+            return
 
-        # Reprice if price moved more than threshold (>= not >)
-        if abs(new_price - existing_price) >= self.reprice_threshold:
-            return True
+        self.last_order_warning = "order_placement_unconfirmed"
+        log.warning(
+            "order_placement_unconfirmed_nonfatal",
+            market=market_id[:8],
+            transient=transient,
+            error=error,
+            sides=list(intents_by_side),
+        )
+        if transient:
+            await self._reconcile_after_unconfirmed_placement(market_id)
 
-        # Reprice on significant size change in EITHER direction (>50%)
-        if existing_size > 0:
-            ratio = new_size / existing_size
-            if ratio < 0.5 or ratio > 1.5:
-                return True
+    async def _reconcile_after_unconfirmed_placement(self, market_id: str) -> None:
+        reconcile = getattr(self.executor, "reconcile_on_startup", None)
+        if not callable(reconcile):
+            return
+        try:
+            result = await reconcile()
+            log.info(
+                "order_placement_timeout_reconciled",
+                market=market_id[:8],
+                open_orders=(result or {}).get("open_orders"),
+                ok=(result or {}).get("ok"),
+            )
+        except Exception as exc:
+            log.warning(
+                "order_placement_timeout_reconcile_failed",
+                market=market_id[:8],
+                error=str(exc),
+            )
 
-        return False
-
-    def _reprice_decision(self, existing_price: Optional[float],
-                          new_price: Optional[float],
-                          existing_size: int,
-                          new_size: int,
-                          book_snapshot=None,
-                          sticky_repair: bool = False) -> tuple[bool, bool]:
-        """Return (needs_reprice, urgent)."""
-        # Always place if no existing quote; not urgent because there is no
-        # stale risk, but no cooldown applies before first placement anyway.
-        if existing_price is None:
-            return (new_price is not None and new_size > 0), False
-
-        # Remove quote if new is None or zero size. This is urgent because a
-        # risk phase/capital guard decided the quote should not exist.
-        if new_price is None or new_size <= 0:
-            return True, True
-
-        # If our BUY bid crosses/touches best ask, it needs attention, but the
-        # async update path confirms exchange state and applies a short grace
-        # before actually cancelling. A crossed maker bid may be in-flight fill.
-        if book_snapshot is not None and existing_price >= book_snapshot.best_ask:
-            return True, True
-
-        price_delta = new_price - existing_price
-
-        if sticky_repair:
-            # In repair mode, queue priority is the product. Keep the existing
-            # light-side bid resting unless it is dangerously stale. Small FV
-            # wiggles should not cancel the only order that can flatten us.
-            if abs(price_delta) > self.repair_reprice_threshold:
-                return True, price_delta < 0
-            if existing_size > 0 and new_size > existing_size * 2.0:
-                return True, False
-            return False, False
-
-        if abs(price_delta) > self.reprice_threshold:
-            # Lowering a BUY bid reduces adverse selection / overpaying risk.
-            # Raising a BUY bid is just chasing/improving and can be throttled.
-            return True, price_delta < 0
-
-        # To preserve queue position, DO NOT reprice if size merely decreases.
-        # Only reprice if we need significantly MORE size (>50% increase), and
-        # treat that as non-urgent so it can be rate-limited.
-        if existing_size > 0 and new_size > existing_size * 1.5:
-            return True, False
-
-        return False, False
-
-    @staticmethod
-    def _is_crossed_buy(existing_price: Optional[float], book_snapshot=None) -> bool:
-        if existing_price is None or book_snapshot is None:
-            return False
-        best_ask = getattr(book_snapshot, "best_ask", None)
-        if best_ask is None or best_ask <= 0:
-            return False
-        return existing_price >= best_ask
-
-    async def _order_still_open(self, order_id: str) -> bool:
-        """Best-effort exchange/local check for whether an order is still open."""
-        checker = getattr(self.executor, "is_order_open", None)
-        if callable(checker):
-            result = checker(order_id)
-            if inspect.isawaitable(result):
-                result = await result
-            return bool(result)
-
-        open_orders = getattr(self.executor, "open_orders", None)
-        if isinstance(open_orders, dict):
-            return order_id in open_orders
-
-        # Unknown executor: fail conservative and assume it is still open.
-        return True
+    def _crossed_bid_grace(self, sticky_repair: bool) -> float:
+        return self.repair_crossed_bid_grace_seconds if sticky_repair else self.crossed_bid_grace_seconds
 
     def _clear_active_side(self, active: ActiveQuotes, side: str):
         if side == "yes":
@@ -560,60 +485,6 @@ class OrderManager:
             active.no_order_id = None
             active.no_price = None
             active.no_size = 0
-
-    async def _maybe_defer_crossed_bid_cancel(self, market_id: str, side: str,
-                                              order_id: str,
-                                              active: ActiveQuotes,
-                                              sticky_repair: bool) -> bool:
-        """Return True when the caller should skip cancel/repost this cycle.
-
-        A BUY maker bid at/above best ask is ambiguous: it may be stale, but it
-        may also be filled or partially filled while local state lags. We first
-        check whether the order still exists, then wait a short grace window and
-        check again. If it disappeared, avoid cancel/repost so the next
-        pre-quote fill sync can update inventory before new exposure is placed.
-        """
-        if not await self._order_still_open(order_id):
-            self._clear_active_side(active, side)
-            log.warning(
-                "crossed_bid_already_closed_before_cancel",
-                market=market_id[:8],
-                side=side,
-                order_id=order_id[:8],
-            )
-            return True
-
-        grace = self.repair_crossed_bid_grace_seconds if sticky_repair else self.crossed_bid_grace_seconds
-        if grace > 0:
-            log.info(
-                "crossed_bid_grace_wait",
-                market=market_id[:8],
-                side=side,
-                order_id=order_id[:8],
-                grace_ms=round(grace * 1000),
-                repair=sticky_repair,
-            )
-            await asyncio.sleep(grace)
-
-        if not await self._order_still_open(order_id):
-            self._clear_active_side(active, side)
-            log.warning(
-                "crossed_bid_closed_during_grace",
-                market=market_id[:8],
-                side=side,
-                order_id=order_id[:8],
-                repair=sticky_repair,
-            )
-            return True
-
-        log.warning(
-            "crossed_bid_cancel_after_grace",
-            market=market_id[:8],
-            side=side,
-            order_id=order_id[:8],
-            repair=sticky_repair,
-        )
-        return False
 
     def check_stale_quotes(self, market_id: str,
                             yes_book=None, no_book=None) -> bool:

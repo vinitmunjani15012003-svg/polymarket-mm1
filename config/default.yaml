@@ -36,7 +36,7 @@ assets:
   BTC:
     enabled: true
     symbol: "BTCUSDT"
-    default_sigma: 0.20
+    default_sigma: 0.60
     gamma: 0.40             # Increased from 0.15: much more aggressive skew
     gamma_near_expiry: 0.80
     min_spread: 0.01    # 0.5 ticks ($0.005) per side to get 0.99 combined cost
@@ -167,6 +167,22 @@ small_capital_test:
   emergency_hedge_after_seconds: 20.0
   emergency_hedge_max_pair_loss: 0.20
   retry_unfilled_opening: true
+
+# --- Balanced Repair Engine ---
+# Adds equal YES/NO repair pairs only when existing FIFO-matched pairs have
+# negative edge and the new pair cost is safely profitable. Disabled by default;
+# enable deliberately after dry-run/smoke testing because it deploys additional
+# capital after adverse selection.
+balanced_repair:
+  enabled: false
+  min_repair_debt: 0.02       # start only after at least 2c locked pair debt
+  max_repair_debt: 5.0        # above this, fall back to merge/clear recovery
+  min_pair_edge: 0.02         # require new YES+NO pair cost <= 0.98
+  max_pair_cost: 0.98
+  target_net_profit: 0.0      # recover to breakeven; raise for positive offset
+  max_order_size: 0           # 0 = use per-asset/quote-engine max size
+  max_abs_imbalance: 0.5      # balanced repair only when YES/NO shares are flat
+  min_seconds_remaining: 90   # avoid starting balanced repair near expiry
 
 # --- Balance Monitor (live mode only) ---
 # Auto-merges matched pairs when USDC wallet balance drops low.

@@ -15,6 +15,12 @@ from src.monitoring.logger import get_logger
 
 log = get_logger("volatility")
 
+# Short-horizon binary markets are extremely sensitive to sigma. A BTC annual
+# vol of 20% makes ordinary 15m moves look nearly certain and pins raw FV at
+# 0.99, even when the live Polymarket book is around 0.70. Use a conservative
+# model floor so the raw model remains usable for basis/risk decisions.
+MIN_BINARY_MODEL_SIGMA = 0.60
+
 
 class VolatilityEstimator:
     """
@@ -30,7 +36,7 @@ class VolatilityEstimator:
             default_sigma: Default annualized vol when insufficient data.
         """
         self.lookback = lookback_seconds
-        self.default_sigma = default_sigma
+        self.default_sigma = max(MIN_BINARY_MODEL_SIGMA, float(default_sigma or MIN_BINARY_MODEL_SIGMA))
 
         self._prices: deque = deque(maxlen=lookback_seconds)
         self._timestamps: deque = deque(maxlen=lookback_seconds)
@@ -78,9 +84,9 @@ class VolatilityEstimator:
                 (time.time() - self._deribit_iv_ts) < 60):
             # Trust forward-looking IV more (70/30 blend)
             blended = 0.3 * realized + 0.7 * self._deribit_iv
-            return max(0.10, min(3.0, blended))
+            return max(MIN_BINARY_MODEL_SIGMA, min(3.0, blended))
 
-        return realized
+        return max(MIN_BINARY_MODEL_SIGMA, realized)
 
     @property
     def has_sufficient_data(self) -> bool:

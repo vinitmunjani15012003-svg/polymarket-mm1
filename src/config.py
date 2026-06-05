@@ -157,6 +157,26 @@ class SmallCapitalTestConfig:
 
 
 @dataclass
+class BalancedRepairConfig:
+    """Negative-edge balanced repair controls.
+
+    When enabled, the bot may add equal YES/NO pairs with positive pair edge
+    to offset prior matched-pair losses instead of immediately clearing the
+    market. Disabled by default because it intentionally deploys additional
+    capital after a bad pair.
+    """
+    enabled: bool = False
+    min_repair_debt: float = 0.02
+    max_repair_debt: float = 5.0
+    min_pair_edge: float = 0.02
+    max_pair_cost: float = 0.98
+    target_net_profit: float = 0.0
+    max_order_size: int = 0
+    max_abs_imbalance: float = 0.5
+    min_seconds_remaining: float = 90.0
+
+
+@dataclass
 class BotConfig:
     """Root configuration object."""
     mode: str = "dry-run"
@@ -169,6 +189,7 @@ class BotConfig:
     polymarket_ws: PolymarketWSConfig = field(default_factory=PolymarketWSConfig)
     dry_run: DryRunConfig = field(default_factory=DryRunConfig)
     small_capital_test: SmallCapitalTestConfig = field(default_factory=SmallCapitalTestConfig)
+    balanced_repair: BalancedRepairConfig = field(default_factory=BalancedRepairConfig)
 
     def validate(self):
         """Validate all configuration invariants."""
@@ -205,6 +226,12 @@ class BotConfig:
                 
         if self.global_params.stop_quoting_seconds <= 0:
             raise ValueError("stop_quoting_seconds must be positive")
+        if self.balanced_repair.max_pair_cost <= 0 or self.balanced_repair.max_pair_cost > 1.0:
+            raise ValueError("balanced_repair.max_pair_cost must be in (0, 1]")
+        if self.balanced_repair.min_pair_edge < 0:
+            raise ValueError("balanced_repair.min_pair_edge must be non-negative")
+        if self.balanced_repair.max_abs_imbalance < 0:
+            raise ValueError("balanced_repair.max_abs_imbalance must be non-negative")
 
 
 def _substitute_env_vars(value: str) -> str:
@@ -326,13 +353,24 @@ def load_config(config_path: str = "config/default.yaml",
 
     with open(config_path, 'r') as f:
         raw = yaml.safe_load(f)
+    if raw is None:
+        raise ValueError(f"config file is empty: {config_path}")
+    if not isinstance(raw, dict):
+        raise ValueError(f"config file must contain a YAML mapping: {config_path}")
 
-    # Apply overrides if provided
-    if override_path and os.path.exists(override_path):
+    # Apply overrides if provided. A provided but empty/missing override is
+    # almost always a live-trading misconfiguration, so fail loudly instead of
+    # silently using defaults/env vars.
+    if override_path:
+        if not os.path.exists(override_path):
+            raise FileNotFoundError(f"override config file not found: {override_path}")
         with open(override_path, 'r') as f:
             overrides = yaml.safe_load(f)
-        if overrides:
-            raw = _deep_merge(raw, overrides)
+        if overrides is None:
+            raise ValueError(f"override config file is empty: {override_path}")
+        if not isinstance(overrides, dict):
+            raise ValueError(f"override config file must contain a YAML mapping: {override_path}")
+        raw = _deep_merge(raw, overrides)
 
     # Substitute environment variables
     raw = _recursive_env_sub(raw)
@@ -478,6 +516,20 @@ def load_config(config_path: str = "config/default.yaml",
         emergency_hedge_max_pair_loss=float(sct.get("emergency_hedge_max_pair_loss", 0.20)),
         emergency_hedge_enabled=bool(sct.get("emergency_hedge_enabled", True)),
         retry_unfilled_opening=bool(sct.get("retry_unfilled_opening", True)),
+    )
+
+    # Balanced repair controls
+    br = raw.get("balanced_repair", {})
+    config.balanced_repair = BalancedRepairConfig(
+        enabled=bool(br.get("enabled", False)),
+        min_repair_debt=float(br.get("min_repair_debt", 0.02)),
+        max_repair_debt=float(br.get("max_repair_debt", 5.0)),
+        min_pair_edge=float(br.get("min_pair_edge", 0.02)),
+        max_pair_cost=float(br.get("max_pair_cost", 1.0 - float(br.get("min_pair_edge", 0.02)))),
+        target_net_profit=float(br.get("target_net_profit", 0.0)),
+        max_order_size=int(br.get("max_order_size", 0) or 0),
+        max_abs_imbalance=float(br.get("max_abs_imbalance", 0.5)),
+        min_seconds_remaining=float(br.get("min_seconds_remaining", 90.0)),
     )
 
     # Validate config invariants

@@ -1,0 +1,23 @@
+"""Fair-value calibration constants and pure helpers."""
+
+# Live FV safety. If the external spot feed is stale, all model prices are
+# suspect; remove active quotes rather than trading on frozen FV.
+MAX_SPOT_PRICE_AGE_SECONDS = 3.0
+MAX_EXNESS_PRICE_AGE_SECONDS = 1.0
+
+# Model-vs-market disagreement controls.
+BASIS_GUARD_MAX_FV_DEVIATION = 0.08
+MAX_TRADING_FV_MARKET_DEVIATION = 0.06
+FV_MIN_MODEL_CONFIDENCE = 0.10
+FV_MAX_MODEL_CONFIDENCE = 0.85
+FV_DISAGREEMENT_CONFIDENCE_CAP = 0.05
+FV_HARD_DISAGREEMENT = 0.15
+FV_TAIL_BLEND_GUARD = 0.10
+FV_TAIL_MAX_MARKET_PULL = 0.02
+
+# Exness/MT5 fast-feed confidence floors.
+FAST_FEED_CONFIDENCE_MOVE_THRESHOLD = 0.20
+FAST_FEED_CONFIDENCE_STRONG_MOVE_THRESHOLD = 0.45
+FAST_FEED_CONFIDENCE_FLOOR = 0.65
+FAST_FEED_CONFIDENCE_STRONG_FLOOR = 0.85
+FAST_ADVERSE_CANCEL_MIN_EDGE = 0.02

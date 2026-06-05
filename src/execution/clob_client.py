@@ -7,9 +7,20 @@ All orders are BUY-only.
 
 import asyncio
 import hashlib
-import json
 import time
 from typing import Optional
+from src.execution.clob.balances import parse_balance_allowance
+from src.execution.clob.fill_ids import fill_dedupe_key
+from src.execution.clob.fills import maker_order_id, maker_orders_for_fill
+from src.execution.clob.order_context import (
+    cache_open_order_context,
+    get_order_context,
+    normalize_open_orders,
+    normalize_orders_response,
+    order_id_from_record,
+    order_is_closed,
+)
+from src.execution.clob.sdk_compat import ensure_builder_code, normalize_post_orders_response, post_order_compat
 from src.monitoring.logger import get_logger
 
 log = get_logger("clob_client")
@@ -34,6 +45,9 @@ class ClobClientWrapper:
         self._funder = funder
         self._client = None
         self._client_version = "unknown"
+        self._client_address = ""
+        self.last_place_error = ""
+        self.last_place_error_transient = False
         self._initialized = False
         # Track open orders: order_id -> {token_id, price, size, side}.
         # Keep a recent closed-order cache too: CLOB trade events can arrive
@@ -55,22 +69,64 @@ class ClobClientWrapper:
             return await asyncio.to_thread(fn, *args, **kwargs)
 
     @staticmethod
-    def _ensure_builder_code(order_args):
-        """SDK compatibility for py-clob-client-v2 builds.
+    def _secret_fingerprint(value: str) -> str:
+        """Return a short non-reversible fingerprint for config diagnostics."""
+        if not value:
+            return ""
+        return hashlib.sha256(value.encode()).hexdigest()[:12]
 
-        Some Polymarket SDK builds expect OrderArgs.builder_code during
-        signing but ship an OrderArgs type that does not define it. A blank
-        builder code is the safe default: no builder attribution, same order.
-        """
-        if not hasattr(order_args, "builder_code"):
-            try:
-                setattr(order_args, "builder_code", "")
-            except Exception:
-                try:
-                    object.__setattr__(order_args, "builder_code", "")
-                except Exception:
-                    pass
-        return order_args
+    def _expected_order_signer(self) -> str:
+        """Return the address expected in the CLOB order signer field."""
+        try:
+            signature_type = int(self._signature_type)
+        except Exception:
+            signature_type = self._signature_type
+        if signature_type == 3 and self._funder:
+            return self._funder
+        return self._client_address
+
+    def _auth_context_fields(self) -> dict:
+        return {
+            "client_address": self._client_address,
+            "order_signer": self._expected_order_signer(),
+            "signature_type": self._signature_type,
+            "funder": self._funder,
+            "api_key_fingerprint": self._secret_fingerprint(self._api_key),
+        }
+
+    @staticmethod
+    def _is_transient_place_error(error: object) -> bool:
+        text = str(error).lower()
+        transient_markers = (
+            "order timed out",
+            "timed out",
+            "timeout",
+            "status_code=500",
+            "status=500",
+            "status_code=502",
+            "status=502",
+            "status_code=503",
+            "status=503",
+            "status_code=504",
+            "status=504",
+            "connection reset",
+            "connection aborted",
+            "read timeout",
+        )
+        return any(marker in text for marker in transient_markers)
+
+    def _record_place_error(self, error: object):
+        self.last_place_error = str(error)
+        self.last_place_error_transient = self._is_transient_place_error(error)
+
+    def _clear_place_error(self):
+        self.last_place_error = ""
+        self.last_place_error_transient = False
+
+    @staticmethod
+    def _ensure_builder_code(order_args):
+        """SDK compatibility for py-clob-client-v2 builds."""
+        return ensure_builder_code(order_args)
 
     def _order_type_imports(self):
         """Return SDK types matching the initialized CLOB client version."""
@@ -91,10 +147,7 @@ class ClobClientWrapper:
         v1 supports post_only as a request flag. Official v2 examples post the
         signed GTC order directly; if a build rejects post_only, retry without it.
         """
-        try:
-            return self._client.post_order(signed_order, order_type, post_only=True)
-        except TypeError:
-            return self._client.post_order(signed_order, order_type)
+        return post_order_compat(self._client, signed_order, order_type)
 
     def set_state_manager(self, state_manager):
         self.state_manager = state_manager
@@ -112,25 +165,14 @@ class ClobClientWrapper:
             log.info("loaded_processed_fills", count=len(self._processed_fills))
 
     def _remember_order_context(self, order_id: str):
-        ctx = self.open_orders.get(order_id)
-        if not ctx:
-            return
-        cached = dict(ctx)
-        cached["closed_at"] = time.time()
-        self._recent_order_context[order_id] = cached
-        # Keep cache bounded and fresh enough for delayed fill/trade events.
-        cutoff = time.time() - 900
-        if len(self._recent_order_context) > 500:
-            for oid, info in list(self._recent_order_context.items()):
-                if float(info.get("closed_at", 0) or 0) < cutoff:
-                    self._recent_order_context.pop(oid, None)
+        cache_open_order_context(self.open_orders, self._recent_order_context, order_id)
 
     def _pop_open_order(self, order_id: str):
         self._remember_order_context(order_id)
         self.open_orders.pop(order_id, None)
 
     def _order_context(self, order_id: str) -> dict:
-        return self.open_orders.get(order_id) or self._recent_order_context.get(order_id, {})
+        return get_order_context(self.open_orders, self._recent_order_context, order_id)
 
     def _save_orders_state(self):
         if self.state_manager:
@@ -177,13 +219,12 @@ class ClobClientWrapper:
             self._client.set_api_creds(creds)
             self._client_version = client_version
             self._initialized = True
-            
             # Verify auth is working
             addr = self._client.get_address()
+            self._client_address = addr
             log.info("clob_client_initialized", address=addr,
                      client_version=client_version,
-                     signature_type=self._signature_type,
-                     funder=self._funder)
+                     **self._auth_context_fields())
         except ImportError:
             log.error("py_clob_client_not_installed",
                      msg="Install with: pip install py-clob-client")
@@ -263,12 +304,10 @@ class ClobClientWrapper:
                 try:
                     result = await self._run_client_call(get_fn, params) if params else await self._run_client_call(get_fn)
                     if isinstance(result, dict):
-                        allowances = result.get("allowances", {})
-                        balance = result.get("balance", "0")
-                        zero_allowances = [
-                            addr for addr, val in allowances.items()
-                            if str(val) == "0"
-                        ]
+                        parsed = parse_balance_allowance(result)
+                        allowances = parsed["allowances"]
+                        balance = parsed["balance"]
+                        zero_allowances = parsed["zero_allowances"]
                         if zero_allowances:
                             log.warning(
                                 "balance_allowance_zero_detected",
@@ -308,6 +347,7 @@ class ClobClientWrapper:
         Returns:
             Order ID if placed, None if rejected (post_only rejection is expected).
         """
+        self._clear_place_error()
         if not self._initialized:
             log.error("client_not_initialized")
             return None
@@ -358,33 +398,21 @@ class ClobClientWrapper:
                 return None
 
         except Exception as e:
+            self._record_place_error(e)
             log.error("order_place_error", error=str(e),
-                     price=price, size=size)
+                     price=price, size=size,
+                     transient=self.last_place_error_transient,
+                     **self._auth_context_fields())
             return None
 
     @staticmethod
     def _normalize_post_orders_response(response, expected_count: int) -> list[dict]:
         """Normalize py-clob-client post_orders responses across SDK versions."""
-        if isinstance(response, list):
-            return [item if isinstance(item, dict) else {} for item in response[:expected_count]]
-        if isinstance(response, dict):
-            raw = (
-                response.get("orders")
-                or response.get("data")
-                or response.get("results")
-                or response.get("responses")
-            )
-            if isinstance(raw, list):
-                return [item if isinstance(item, dict) else {} for item in raw[:expected_count]]
-            # Some SDKs return a single-order response dict when len==1.
-            if expected_count == 1 and (response.get("orderID") or response.get("id")):
-                return [response]
-            if response.get("error") or response.get("status") in ("error", "failed", "rejected"):
-                return [response for _ in range(expected_count)]
-        return [{} for _ in range(expected_count)]
+        return normalize_post_orders_response(response, expected_count)
 
     async def place_buy_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Place multiple BUY orders in one CLOB post_orders request."""
+        self._clear_place_error()
         if not self._initialized:
             log.error("client_not_initialized")
             return {str(o.get("side", i)): None for i, o in enumerate(orders)}
@@ -457,7 +485,10 @@ class ClobClientWrapper:
             return placed
 
         except Exception as e:
-            log.error("batch_order_place_error", error=str(e), count=len(orders))
+            self._record_place_error(e)
+            log.error("batch_order_place_error", error=str(e), count=len(orders),
+                      transient=self.last_place_error_transient,
+                      **self._auth_context_fields())
             # SDK compatibility fallback: py-clob-client variants have differed
             # around PostOrdersArgs / builder fields. For live safety, degrade to
             # sequential single-order placement instead of spinning failed batch
@@ -563,19 +594,12 @@ class ClobClientWrapper:
                 resp = await self._run_client_call(get_orders)
             except TypeError:
                 resp = await self._run_client_call(get_orders, None)
-            orders = resp if isinstance(resp, list) else resp.get("data", []) if isinstance(resp, dict) else []
+            orders = normalize_orders_response(resp)
             for order in orders:
-                oid = order.get("id") or order.get("orderID") or order.get("order_id")
+                oid = order_id_from_record(order)
                 if oid != order_id:
                     continue
-                status = str(order.get("status") or order.get("state") or "").lower()
-                if status in ("cancelled", "canceled", "filled", "matched", "closed"):
-                    self._pop_open_order(order_id)
-                    self._save_orders_state()
-                    return False
-                original = float(order.get("original_size") or order.get("size") or 0)
-                matched = float(order.get("size_matched") or order.get("matched_size") or 0)
-                if original > 0 and matched >= original:
+                if order_is_closed(order):
                     self._pop_open_order(order_id)
                     self._save_orders_state()
                     return False
@@ -646,7 +670,7 @@ class ClobClientWrapper:
                     open_resp = await self._run_client_call(get_orders)
                 except TypeError:
                     open_resp = await self._run_client_call(get_orders, None)
-                open_orders = open_resp if isinstance(open_resp, list) else open_resp.get("data", []) if isinstance(open_resp, dict) else []
+                open_orders = normalize_orders_response(open_resp)
             else:
                 # SDK compatibility: some py-clob-client builds do not expose
                 # get_orders. Startup reconciliation is best-effort; do not
@@ -658,24 +682,7 @@ class ClobClientWrapper:
                     client_type=type(self._client).__name__,
                 )
 
-            refreshed = {}
-            for order in open_orders:
-                order_id = order.get("id") or order.get("orderID") or order.get("order_id")
-                if not order_id:
-                    continue
-                original = float(order.get("original_size") or order.get("size") or 0)
-                matched = float(order.get("size_matched") or order.get("matched_size") or 0)
-                remaining = max(0.0, original - matched)
-                outcome = str(order.get("outcome") or "").strip().lower()
-                token_side = "yes" if outcome in ("yes", "up") else "no" if outcome in ("no", "down") else None
-                refreshed[order_id] = {
-                    "token_id": str(order.get("asset_id") or order.get("token_id") or ""),
-                    "price": float(order.get("price") or 0),
-                    "size": remaining,
-                    "side": order.get("side", "BUY"),
-                    "token_side": token_side,
-                    "placed_at": float(order.get("created_at") or time.time()),
-                }
+            refreshed = normalize_open_orders(open_orders)
 
             if refreshed:
                 self.open_orders.update(refreshed)
@@ -685,7 +692,7 @@ class ClobClientWrapper:
             if callable(get_trades):
                 try:
                     trades_resp = await self._run_client_call(get_trades)
-                    trades = trades_resp if isinstance(trades_resp, list) else trades_resp.get("data", []) if isinstance(trades_resp, dict) else []
+                    trades = normalize_orders_response(trades_resp)
                 except Exception:
                     trades = []
             else:
@@ -756,18 +763,13 @@ class ClobClientWrapper:
             # trade. Book every matching maker leg independently; otherwise a
             # 2x5-share fill can appear as only +5 inventory, leaving the bot
             # thinking it is flatter than the wallet really is.
-            maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
-            if isinstance(maker_orders, list) and len(maker_orders) > 1:
+            maker_orders = maker_orders_for_fill(fill)
+            if len(maker_orders) > 1:
                 expanded = []
                 for mo in maker_orders:
                     if not isinstance(mo, dict):
                         continue
-                    mo_id = (
-                        mo.get("order_id")
-                        or mo.get("orderID")
-                        or mo.get("orderId")
-                        or mo.get("id")
-                    )
+                    mo_id = maker_order_id(mo)
                     if not self._order_context(mo_id):
                         continue
                     clone = dict(fill)
@@ -801,19 +803,14 @@ class ClobClientWrapper:
             # v2 trade objects can describe the whole trade and include our
             # contribution under maker_orders. Use the matching maker order so
             # we do not book someone else's size (e.g. 13 shares vs our 5 quote).
-            maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
+            maker_orders = maker_orders_for_fill(fill)
             matched_maker_token_id = ""
-            if isinstance(maker_orders, list) and maker_orders:
+            if maker_orders:
                 matched = None
                 for mo in maker_orders:
                     if not isinstance(mo, dict):
                         continue
-                    mo_id = (
-                        mo.get("order_id")
-                        or mo.get("orderID")
-                        or mo.get("orderId")
-                        or mo.get("id")
-                    )
+                    mo_id = maker_order_id(mo)
                     if self._order_context(mo_id):
                         matched = mo
                         order_id = mo_id
@@ -945,30 +942,5 @@ class ClobClientWrapper:
 
     @staticmethod
     def _fill_dedupe_key(fill: dict, market_id: str = "") -> str:
-        """Build a robust idempotency key for CLOB fills/trades.
-
-        Prefer provider IDs when available. If the SDK omits IDs, include enough
-        stable fields to distinguish partial fills on the same order.
-        """
-        for key in ("id", "trade_id", "transaction_hash", "tx_hash", "hash"):
-            value = fill.get(key)
-            if value:
-                return f"{key}:{value}"
-
-        material = {
-            "market": market_id,
-            "order_id": fill.get("order_id") or fill.get("orderID") or fill.get("maker_order_id") or "",
-            "asset_id": fill.get("asset_id") or fill.get("token_id") or fill.get("assetId") or "",
-            "price": str(fill.get("price", "")),
-            "size": str(fill.get("size", "")),
-            "side": str(fill.get("side", "")),
-            "timestamp": str(
-                fill.get("timestamp")
-                or fill.get("created_at")
-                or fill.get("match_time")
-                or fill.get("time")
-                or ""
-            ),
-        }
-        encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
-        return "synthetic:" + hashlib.sha256(encoded.encode()).hexdigest()
+        """Build a robust idempotency key for CLOB fills/trades."""
+        return fill_dedupe_key(fill, market_id)

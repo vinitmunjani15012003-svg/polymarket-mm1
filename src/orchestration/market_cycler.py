@@ -19,570 +19,87 @@ from src.strategy.volatility import VolatilityEstimator
 from src.strategy.quote_engine import QuoteEngine, MAX_COMBINED_COST
 from src.strategy.inventory import InventoryManager
 from src.execution.order_manager import OrderManager
-from src.execution.ctf_ops import (
-    CTFOperations, GaslessMerger, BalanceMonitor,
-    infer_collateral_token_for_market,
-)
+from src.execution.ctf_ops import CTFOperations, GaslessMerger, BalanceMonitor
 from src.risk.regime_filter import RegimeFilter
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
 from src.risk.risk_engine import (RiskEngine, determine_phase,
                                    apply_phase_params, pre_trade_checks)
 from src.monitoring.pnl_tracker import PnLTracker
 from src.monitoring.logger import get_logger
+from src.orchestration.quote_cycle import (
+    QuoteCycleContext,
+    decide_basis_risk,
+    decide_inventory_risk,
+    decide_negative_pair_edge,
+    decide_stale_spot,
+    package_book_snapshot,
+    package_fair_value_result,
+)
+from src.orchestration.small_capital import SmallCapitalLifecycle
+from src.orchestration.dashboard_state import (
+    clear_dashboard_event,
+    dashboard_sigma_for_stale_spot,
+    set_dashboard_event,
+    update_dashboard,
+    update_dashboard_waiting,
+)
+from src.orchestration.settlement import (
+    settle_market,
+    wait_and_settle_unmatched,
+    wait_and_settle_unmatched_by_fields,
+)
 
 log = get_logger("market_cycler")
 
-# Live repair must leave a real buffer. One cent was too thin after tick
-# rounding, CLOB/API price normalization, and partial fill sequencing; live
-# pairs repeatedly landed at/above 1.00. Two cents is still tight, but stops the
-# bot from recycling capital into guaranteed-loss pairs.
-MIN_LIVE_PAIR_EDGE = 0.02
+# Roadmap extraction: strategy helpers now live in service packages.  They are
+# imported here for backward compatibility with existing tests/callers while
+# MarketCycler is gradually reduced to lifecycle orchestration.
 PRE_EXPIRY_AUTO_MERGE_SECONDS = 120
 
-# When flat and the model has a meaningful directional lean, enter on the side
-# favored by fair value first, then let the existing inventory-repair path quote
-# only the opposite side after a fill. This avoids opening with the adverse/cheap
-# side just because both sides are atomically quotable.
-# In live flat entry, never rest both sides at once. Pick the side with
-# stronger model edge first, then let close-only repair quote the complement
-# after that leg fills. A neutral tie is held flat instead of opening inventory.
-FV_FAVORED_ENTRY_THRESHOLD = 0.50
-FV_FAVORED_ENTRY_MIN_EDGE = 0.0
-FV_FAVORED_ENTRY_MAX_SIZE = 5
-FV_FAVORED_ENTRY_STOP_SECONDS = 600
-
-# Live FV safety. If the external spot feed is stale, all model prices are
-# suspect; remove active quotes rather than trading on frozen FV. The basis guard
-# compares model P(Up) against Polymarket's current implied P(Up); a large gap
-# means the Binance→Chainlink fixed-spread assumption is probably drifting.
-MAX_SPOT_PRICE_AGE_SECONDS = 3.0
-BASIS_GUARD_MAX_FV_DEVIATION = 0.12
-# FV blending: the raw sigma model is useful but too jumpy by itself early in
-# 15m windows. Blend it with Polymarket-implied probability when books are
-# available, and otherwise temper model confidence by elapsed time + move size.
-FV_MIN_MODEL_CONFIDENCE = 0.10
-FV_MAX_MODEL_CONFIDENCE = 0.85
-FV_DISAGREEMENT_CONFIDENCE_CAP = 0.05
-FV_HARD_DISAGREEMENT = 0.15
-# When the sigma model is already deep in the tail, a thin/noisy Polymarket
-# book can briefly pull FV back toward neutral (e.g. 0.05 -> 0.12) even with no
-# spot move. Keep that market input diagnostic, but cap small tail pulls.
-FV_TAIL_BLEND_GUARD = 0.10
-FV_TAIL_MAX_MARKET_PULL = 0.02
-# Exness/MT5 is the fastest oracle input we have. During real spot moves,
-# blending too heavily toward Polymarket's own book makes FV lag exactly when
-# adverse selection risk is highest.
-FAST_FEED_CONFIDENCE_MOVE_THRESHOLD = 0.20
-FAST_FEED_CONFIDENCE_STRONG_MOVE_THRESHOLD = 0.45
-FAST_FEED_CONFIDENCE_FLOOR = 0.65
-FAST_FEED_CONFIDENCE_STRONG_FLOOR = 0.85
-# Cancel resting BUYs as soon as the raw fast-feed model no longer gives enough
-# edge versus our active bid. This runs before book fetch/requote work.
-FAST_ADVERSE_CANCEL_MIN_EDGE = 0.02
-
-
-def clamp_probability(value: float, lo: float = 0.01, hi: float = 0.99) -> float:
-    try:
-        return max(lo, min(hi, float(value)))
-    except Exception:
-        return 0.50
-
-
-def fv_model_confidence(model_fv: float,
-                        elapsed_fraction: float,
-                        standardized_move: float,
-                        market_fv: Optional[float] = None,
-                        min_confidence: float = FV_MIN_MODEL_CONFIDENCE,
-                        max_confidence: float = FV_MAX_MODEL_CONFIDENCE) -> float:
-    """Confidence weight for raw model FV in a 15m binary window.
-
-    Edge cases:
-    - first seconds: stay near market/neutral
-    - large standardized move: trust model more
-    - hard model-vs-market disagreement: cap confidence, don't blindly follow it
-    """
-    elapsed = max(0.0, min(1.0, float(elapsed_fraction or 0.0)))
-    move = max(0.0, float(standardized_move or 0.0))
-    time_component = 0.60 * (elapsed ** 0.75)
-    move_component = 0.25 * min(1.0, move / 1.5)
-    confidence = min_confidence + time_component + move_component
-    confidence = max(min_confidence, min(max_confidence, confidence))
-
-    if market_fv is not None and abs(clamp_probability(model_fv) - clamp_probability(market_fv)) >= FV_HARD_DISAGREEMENT:
-        confidence = min(confidence, FV_DISAGREEMENT_CONFIDENCE_CAP)
-    return max(0.0, min(1.0, confidence))
-
-
-def apply_fast_feed_confidence_floor(confidence: float,
-                                     price_source: str,
-                                     standardized_move: float) -> float:
-    """Trust Exness/MT5 more during real moves so FV does not lag the book."""
-    conf = max(0.0, min(1.0, float(confidence or 0.0)))
-    if price_source != "exness_mt5":
-        return conf
-    move = max(0.0, float(standardized_move or 0.0))
-    if move >= FAST_FEED_CONFIDENCE_STRONG_MOVE_THRESHOLD:
-        return max(conf, FAST_FEED_CONFIDENCE_STRONG_FLOOR)
-    if move >= FAST_FEED_CONFIDENCE_MOVE_THRESHOLD:
-        return max(conf, FAST_FEED_CONFIDENCE_FLOOR)
-    return conf
-
-
-def spot_from_binary_probability(start_price: float,
-                                 p_up: float,
-                                 sigma: float,
-                                 time_remaining: float) -> Optional[float]:
-    """Invert binary P(Up) into the live spot implied by market probability."""
-    if not start_price or p_up is None or not sigma or time_remaining <= 0:
-        return None
-    try:
-        from scipy.stats import norm
-        import math
-        p = max(0.02, min(0.98, float(p_up)))
-        t_years = max(1.0, float(time_remaining)) / (365.25 * 86400)
-        return float(start_price) * math.exp(norm.ppf(p) * float(sigma) * math.sqrt(t_years))
-    except Exception:
-        return None
-
-
-def blended_fair_value(model_fv: float,
-                       market_fv: Optional[float],
-                       confidence: float) -> float:
-    model = clamp_probability(model_fv)
-    conf = max(0.0, min(1.0, float(confidence or 0.0)))
-    if market_fv is None:
-        # No book: temper raw model toward neutral using the same confidence.
-        return clamp_probability(0.5 + (model - 0.5) * conf)
-    market = clamp_probability(market_fv)
-    if model <= FV_TAIL_BLEND_GUARD and market > model and (market - model) <= FV_HARD_DISAGREEMENT:
-        # Low-tail model says UP is very unlikely. Do not let a transient/thin
-        # book pull the trading FV materially upward while spot is unchanged.
-        return clamp_probability(model + min(FV_TAIL_MAX_MARKET_PULL, (market - model) * (1.0 - conf)))
-    if model >= 1.0 - FV_TAIL_BLEND_GUARD and market < model and (model - market) <= FV_HARD_DISAGREEMENT:
-        # Symmetric high-tail guard for DOWN-side noisy book pulls.
-        return clamp_probability(model - min(FV_TAIL_MAX_MARKET_PULL, (model - market) * (1.0 - conf)))
-    return clamp_probability(conf * model + (1.0 - conf) * market)
-
-
-def polymarket_implied_up_mid(book_up, book_down) -> Optional[float]:
-    """Estimate Polymarket-implied P(Up) from YES and NO order books."""
-    mids = []
-    if book_up and getattr(book_up, "best_bid", 0) > 0 and getattr(book_up, "best_ask", 0) > 0:
-        mids.append((float(book_up.best_bid) + float(book_up.best_ask)) / 2.0)
-    if book_down and getattr(book_down, "best_bid", 0) > 0 and getattr(book_down, "best_ask", 0) > 0:
-        down_mid = (float(book_down.best_bid) + float(book_down.best_ask)) / 2.0
-        mids.append(1.0 - down_mid)
-    if not mids:
-        return None
-    return max(0.0, min(1.0, sum(mids) / len(mids)))
-
-
-def basis_guard_triggered(fair_value: float,
-                          polymarket_mid_up: Optional[float],
-                          threshold: float = BASIS_GUARD_MAX_FV_DEVIATION) -> bool:
-    if polymarket_mid_up is None:
-        return False
-    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
-    return abs(fv - polymarket_mid_up) >= threshold
-
-
-def start_price_disagrees_with_market(start_price: float,
-                                      current_spot: float,
-                                      sigma: float,
-                                      event_start_ts: float,
-                                      resolve_ts: float,
-                                      market_fv: Optional[float],
-                                      threshold: float = 0.25,
-                                      now_ts: Optional[float] = None) -> bool:
-    """Return True when a candidate price-to-beat is implausible vs live books."""
-    if market_fv is None or not start_price or not current_spot:
-        return False
-    model_fv = UpDownFairValue(
-        event_start_ts=event_start_ts,
-        resolve_ts=resolve_ts,
-        start_price=start_price,
-    ).fair_value(current_spot, sigma, now_ts=now_ts, update_state=False)
-    return abs(clamp_probability(model_fv) - clamp_probability(market_fv)) >= threshold
-
-
-def apply_fv_favored_entry_mode(quotes, fair_value: float, share_imbalance: float,
-                                min_order_size: int,
-                                threshold: float = FV_FAVORED_ENTRY_THRESHOLD,
-                                best_ask_yes: Optional[float] = None,
-                                best_ask_no: Optional[float] = None,
-                                best_bid_yes: Optional[float] = None,
-                                best_bid_no: Optional[float] = None,
-                                min_pair_edge: float = MIN_LIVE_PAIR_EDGE,
-                                min_entry_edge: float = FV_FAVORED_ENTRY_MIN_EDGE,
-                                max_entry_size: int = FV_FAVORED_ENTRY_MAX_SIZE) -> str | None:
-    """Quote only the best FV-edge side while flat, if it is repairable.
-
-    Returns "yes" or "no" when it converted normal flat quoting to one-sided
-    FV entry, "blocked" when opening a one-sided leg is too risky, otherwise
-    returns None.
-    """
-    if abs(share_imbalance) >= min_order_size:
-        return None
-    if quotes.yes_buy_size <= 0 and quotes.no_buy_size <= 0:
-        return None
-
-    yes_price = float(quotes.yes_buy_price or 0)
-    no_price = float(quotes.no_buy_price or 0)
-    if yes_price <= 0 or no_price <= 0:
-        return None
-
-    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
-    yes_edge = fv - yes_price
-    no_edge = (1.0 - fv) - no_price
-
-    side = None
-    edge_epsilon = 1e-9
-    if (fv > threshold + edge_epsilon
-            and yes_edge >= min_entry_edge
-            and quotes.yes_buy_size > 0):
-        side = "yes"
-    elif (fv < (1.0 - threshold) - edge_epsilon
-            and no_edge >= min_entry_edge
-            and quotes.no_buy_size > 0):
-        side = "no"
-
-    if not side:
-        quotes.yes_buy_size = 0
-        quotes.no_buy_size = 0
-        return "blocked"
-
-    # Before opening a one-sided leg, require that the complementary repair leg
-    # is not far behind the current maker queue while preserving pair edge.
-    # Checking against best_ask was too strict and stopped quoting entirely in
-    # normal 59/40 style books; repair is a BUY bid, so best_bid proximity is the
-    # right maker-feasibility check.
-    max_repair_bid_lag = 0.02
-    if side == "yes":
-        repair_cap = 1.0 - yes_price - min_pair_edge
-        if best_bid_no is not None:
-            repair_too_far = repair_cap < float(best_bid_no) - max_repair_bid_lag
-        else:
-            repair_too_far = best_ask_no is not None and (float(best_ask_no) - 0.01) > repair_cap
-        if repair_too_far:
-            quotes.yes_buy_size = 0
-            quotes.no_buy_size = 0
-            return "blocked"
-        quotes.yes_buy_size = min(int(quotes.yes_buy_size), max(min_order_size, int(max_entry_size)))
-        quotes.no_buy_size = 0
-        return "yes"
-
-    repair_cap = 1.0 - no_price - min_pair_edge
-    if best_bid_yes is not None:
-        repair_too_far = repair_cap < float(best_bid_yes) - max_repair_bid_lag
-    else:
-        repair_too_far = best_ask_yes is not None and (float(best_ask_yes) - 0.01) > repair_cap
-    if repair_too_far:
-        quotes.yes_buy_size = 0
-        quotes.no_buy_size = 0
-        return "blocked"
-    quotes.no_buy_size = min(int(quotes.no_buy_size), max(min_order_size, int(max_entry_size)))
-    quotes.yes_buy_size = 0
-    return "no"
-
-
-def repair_min_edge_for_remaining(remaining: float, repair_mode: str) -> float:
-    """Relax pair edge only for close-only repair as expiry approaches.
-
-    Carrying a naked wrong-side tail is often worse than completing a scratch
-    pair. Normal quoting keeps the full live buffer; repair-only quotes can use
-    a smaller buffer near expiry.
-    """
-    if repair_mode not in ("repair_up", "repair_down"):
-        return MIN_LIVE_PAIR_EDGE
-    if remaining <= 90:
-        return 0.0
-    if remaining <= 240:
-        return 0.005
-    if remaining <= 480:
-        return 0.01
-    return MIN_LIVE_PAIR_EDGE
-
-
-class UpDownFairValue:
-    """
-    Fair value for "Up or Down" markets.
-
-    P(Up) = P(price at end >= price at start)
-    Uses drift + vol from CEX data. At-the-money ~ 0.50.
-
-    For short horizons with no drift: P(Up) ≈ 0.50
-    With observed drift: P(Up) = Φ(drift / (sigma * sqrt(T)))
-    """
-
-    def __init__(self, event_start_ts: float, resolve_ts: float,
-                 start_price: float = None):
-        self.event_start_ts = event_start_ts
-        self.resolve_ts = resolve_ts
-        self.start_price = start_price  # Price at window open
-        self._last_fair_value = 0.50
-        self._last_update_ts = 0.0
-
-    def fair_value(self, current_price: float, sigma_annualized: float,
-                   now_ts: float = None, update_state: bool = True) -> float:
-        """
-        Compute P(Up) = P(price_end >= price_start).
-
-        If we know the start price: uses log(current/start) as drift signal.
-        If we don't: defaults to 0.50 (no edge from price level).
-        """
-        from scipy.stats import norm
-        import math
-
-        now_ts = now_ts or _time.time()
-        t_remaining = max(1, self.resolve_ts - now_ts)
-        t_years = t_remaining / (365.25 * 86400)
-
-        if self.start_price and self.start_price > 0 and current_price > 0:
-            # We know the start price — compute drift-based fair value
-            log_return_so_far = math.log(current_price / self.start_price)
-
-            vol_sqrt_t = sigma_annualized * math.sqrt(t_years)
-            if vol_sqrt_t < 1e-10:
-                # Near zero vol remaining: deterministic
-                return 0.99 if log_return_so_far >= 0 else 0.01
-
-            # If price is currently above start, it's more likely to end above
-            # d = drift_so_far / remaining_vol
-            d = log_return_so_far / vol_sqrt_t
-            prob = norm.cdf(d)
-        else:
-            # No start price: assume 50/50
-            prob = 0.50
-
-        prob = max(0.01, min(0.99, prob))
-        if update_state:
-            self._last_fair_value = prob
-            self._last_update_ts = now_ts
-        return prob
-
-    def set_start_price(self, price: float):
-        """Set the opening price once known."""
-        if self.start_price is None and price > 0:
-            self.start_price = price
-            log.info("start_price_set", price=price)
-
-    def time_remaining_seconds(self, now_ts: float = None) -> float:
-        now_ts = now_ts or _time.time()
-        return max(0, self.resolve_ts - now_ts)
-
-    def normalized_time(self, now_ts: float = None) -> float:
-        now_ts = now_ts or _time.time()
-        total = self.resolve_ts - self.event_start_ts
-        if total <= 0:
-            return 0.0
-        remaining = self.resolve_ts - now_ts
-        return max(0.0, min(1.0, remaining / total))
-
-    @property
-    def last_fair_value(self) -> float:
-        return self._last_fair_value
-
-    @property
-    def is_stale(self) -> bool:
-        return (_time.time() - self._last_update_ts) > 5.0
-
-
-def compute_inventory_repair_sizes(imbalance: float,
-                                   min_order_size: int,
-                                   max_order_size: int) -> tuple[int, int, str]:
-    """Return (up_size, down_size, mode) for guarded repair quoting.
-
-    Repair quotes only the light side. A sub-minimum tail cannot be repaired
-    exactly on Polymarket because live orders must be at least min_order_size
-    shares, so quote the light side at the minimum valid order size. That may
-    overshoot by a few shares, but it never tops up the already-heavy side.
-
-    Example: Down 3 / Up 0 => imbalance=-3. Quote Up 5 only; do not quote more
-    Down just to make the arithmetic pretty. Pretty arithmetic leaks money.
-    """
-    min_order_size = max(1, int(min_order_size or 1))
-    max_order_size = max(min_order_size, int(max_order_size or min_order_size))
-    tail = abs(float(imbalance or 0))
-
-    if tail <= 0:
-        return 0, 0, "flat"
-
-    if tail < min_order_size:
-        # Live invariant: never top up the already-filled/heavy side. Even for
-        # sub-minimum partial tails, quote only the light side at the minimum
-        # valid order size. This may overshoot by a few shares, but it avoids
-        # digging the imbalance deeper.
-        if imbalance > 0:
-            # Too many Up: quote Down only.
-            return 0, min_order_size, "repair_down"
-        # Too many Down: quote Up only.
-        return min_order_size, 0, "repair_up"
-
-    repair_size = min(max_order_size, int(round(tail)))
-    if imbalance > 0:
-        return 0, repair_size, "repair_down"
-    return repair_size, 0, "repair_up"
-
-
-def compute_fv_aware_dust_repair_sizes(imbalance: float,
-                                       fair_value: float,
-                                       min_order_size: int,
-                                       max_order_size: int,
-                                       neutral_band: float = 0.02) -> tuple[int, int, str]:
-    """Handle sub-minimum tails with a two-step dust ladder.
-
-    Polymarket minimum order size means a 4-share tail cannot be repaired by
-    buying exactly 4 shares. For larger dust tails, quote ``tail + min_size`` on
-    the light side. Example: +4 UP → buy 9 DOWN → leaves -5 DOWN, then normal
-    repair buys 5 UP and lands exactly flat.
-
-    For tiny 1-2 share dust, avoid creating a much larger temporary residual;
-    hold if the tail side is not clearly disfavored by fair value.
-    """
-    min_order_size = max(1, int(min_order_size or 1))
-    max_order_size = max(min_order_size, int(max_order_size or min_order_size))
-    tail = abs(float(imbalance or 0))
-    if tail <= 0:
-        return 0, 0, "flat"
-    if tail >= min_order_size:
-        return compute_inventory_repair_sizes(imbalance, min_order_size, max_order_size)
-
-    fv = max(0.0, min(1.0, float(fair_value or 0.5)))
-    ladder_threshold = max(3, int((min_order_size + 1) // 2))
-    if tail >= ladder_threshold:
-        ladder_size = min(max_order_size, int(round(tail)) + min_order_size)
-        if imbalance > 0:
-            return 0, ladder_size, "repair_down"
-        return ladder_size, 0, "repair_up"
-
-    # Positive imbalance = extra UP. For 1-2 share dust, hold if UP is still at
-    # least roughly favored; otherwise flip with the minimum DOWN clip.
-    if imbalance > 0:
-        if fv >= 0.5 - neutral_band:
-            return 0, 0, "dust_hold_up"
-        return 0, min_order_size, "repair_down"
-
-    # Negative imbalance = extra DOWN. For 1-2 share dust, hold if DOWN is still
-    # at least roughly favored; otherwise flip with the minimum UP clip.
-    if fv <= 0.5 + neutral_band:
-        return 0, 0, "dust_hold_down"
-    return min_order_size, 0, "repair_up"
-
-
-def apply_dust_price_guardrails(quotes, mode: str,
-                                best_ask_yes: Optional[float] = None,
-                                best_ask_no: Optional[float] = None):
-    """Favor the repair side and make the dust top-up side less aggressive.
-
-    Dust normalization is not risk-free: if only the heavy-side top-up fills,
-    the bot makes the tail worse. Biasing prices makes the desired opposite-side
-    fill more likely while preserving the combined-cost invariant.
-    """
-    if mode not in ("dust_up", "dust_down"):
-        return quotes
-
-    yes = float(quotes.yes_buy_price or 0)
-    no = float(quotes.no_buy_price or 0)
-    if yes <= 0 or no <= 0:
-        return quotes
-
-    if mode == "dust_up":
-        # Too many Up: Down is the repair side. Pay up for Down, shade Up down.
-        yes -= 0.01
-        no += 0.01
-    else:
-        # Too many Down: Up is the repair side. Pay up for Up, shade Down down.
-        yes += 0.01
-        no -= 0.01
-
-    if best_ask_yes is not None and yes >= best_ask_yes:
-        yes = best_ask_yes - 0.01
-    if best_ask_no is not None and no >= best_ask_no:
-        no = best_ask_no - 0.01
-
-    yes = max(0.01, min(0.99, round(yes, 2)))
-    no = max(0.01, min(0.99, round(no, 2)))
-
-    # Keep the pair edge. If the repair-side bump pushed combined cost too high,
-    # lower the dust/top-up side first, because that is the dangerous fill.
-    if yes + no >= 1.0:
-        if mode == "dust_up":
-            yes = max(0.01, round(0.99 - no, 2))
-        else:
-            no = max(0.01, round(0.99 - yes, 2))
-
-    quotes.yes_buy_price = yes
-    quotes.no_buy_price = no
-    quotes.combined_cost = round(yes + no, 4)
-    quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
-    return quotes
-
-
-def repair_price_cap(pos, side: str, size: float, fair_value: float,
-                     min_edge: float = 0.01,
-                     adverse_buffer: float = 0.02) -> tuple[float, str]:
-    """Return the max repair bid that preserves positive pair edge.
-
-    Repair mode must not manufacture guaranteed-loss pairs. Earlier live
-    hardening allowed a wrong-way tail to be hedged up to expected value; that
-    reduced naked inventory but created the exact failure Vinit observed: pair
-    average cost > 1. For this strategy, if the missing side cannot be bought
-    under ``1 - opposite_fill_price - min_edge``, we wait/cancel instead of
-    buying a locked-in loser.
-    """
-    side = (side or "").lower()
-    profitable_cap = float(pos.max_profitable_repair_price(side, size, min_edge=min_edge))
-    return profitable_cap, "pair_edge"
-
-
-def aggressive_repair_price(current_price: float | None,
-                            cap: float,
-                            best_ask: Optional[float] = None,
-                            best_bid: Optional[float] = None) -> float | None:
-    """Move repair bids as high as safely possible without crossing.
-
-    Repair mode is not normal rebate farming. If we can complete a pair with
-    combined cost < 1, sitting 5c below the market is just choosing to keep the
-    naked tail. For post-only orders, the most aggressive safe bid is one tick
-    below best ask, capped by the pair/risk cap.
-    """
-    if cap < 0.01:
-        return None
-
-    price = float(current_price or 0.01)
-    target = float(cap)
-
-    if best_ask is not None and float(best_ask or 0) > 0:
-        target = min(target, float(best_ask) - 0.01)
-    if best_bid is not None and float(best_bid or 0) > 0:
-        # At least join the best bid when cap allows. This preserves queue
-        # competitiveness if the book is wide or best_ask is unavailable.
-        target = max(target, min(float(best_bid), float(cap)))
-
-    target = max(0.01, min(0.99, target))
-
-    # This function is also the final pair-edge safety clamp for repair mode.
-    # If the current quote is above the profitable cap, keeping it resting can
-    # fill a guaranteed-loss pair before the next loop. Lower it immediately.
-    if price > float(cap):
-        return round(target, 2)
-
-    if target <= price:
-        return round(price, 2)
-    return round(target, 2)
-
-
-def has_negative_matched_pair_edge(pos, tolerance: float = 0.005) -> bool:
-    """True when FIFO-matched pairs have locked in negative edge.
-
-    This is a circuit breaker, not a quoting input. A pair-matching maker whose
-    matched pairs are already negative is no longer market-making; it is paying
-    to recycle volume. Stop the market instead of compounding.
-    """
-    try:
-        return float(pos.matched_pairs() or 0) > 0 and float(pos.matched_pair_profit()) < -float(tolerance)
-    except Exception:
-        return False
+from src.services.fair_value import (
+    BASIS_GUARD_MAX_FV_DEVIATION,
+    FAST_ADVERSE_CANCEL_MIN_EDGE,
+    MAX_EXNESS_PRICE_AGE_SECONDS,
+    MAX_SPOT_PRICE_AGE_SECONDS,
+    MAX_TRADING_FV_MARKET_DEVIATION,
+    FairValueEngine,
+    FairValueInputs,
+    UpDownFairValue,
+    apply_fast_feed_confidence_floor,
+    basis_guard_triggered,
+    blended_fair_value,
+    cap_fair_value_to_market,
+    clamp_probability,
+    fv_model_confidence,
+    polymarket_implied_up_mid,
+    spot_from_binary_probability,
+    start_price_disagrees_with_market,
+)
+from src.services.inventory import (
+    aggressive_repair_price,
+    apply_dust_price_guardrails,
+    balanced_repair_debt_eligible,
+    compute_fv_aware_dust_repair_sizes,
+    compute_inventory_repair_sizes,
+    has_negative_matched_pair_edge,  # compatibility re-export; live cycler uses quote_cycle decisions
+    plan_balanced_negative_edge_repair,
+    plan_repair_price_cap,
+    repair_min_edge_for_remaining,
+    repair_price_cap,  # compatibility re-export; live repair planning owns behavior
+)
+from src.services.quoting import (
+    FV_FAVORED_ENTRY_MAX_SIZE,
+    FV_FAVORED_ENTRY_MIN_EDGE,
+    FV_FAVORED_ENTRY_STOP_SECONDS,
+    FV_FAVORED_ENTRY_THRESHOLD,
+    MIN_LIVE_PAIR_EDGE,
+    QuotePolicy,
+    apply_directional_market_guard,
+    apply_fv_favored_entry_mode,
+    apply_pair_cost_precheck,
+    normalize_quote_sizes,
+    repair_size_or_zero,
+)
 
 
 class MarketCycler:
@@ -606,7 +123,8 @@ class MarketCycler:
                  ctf_ops: Optional[CTFOperations] = None,
                  gasless_merger: Optional[GaslessMerger] = None,
                  balance_monitor: Optional[BalanceMonitor] = None,
-                 small_capital_config=None):
+                 small_capital_config=None,
+                 balanced_repair_config=None):
 
         self.asset = asset
         self.ac = asset_config
@@ -626,6 +144,8 @@ class MarketCycler:
         self.gasless_merger: Optional[GaslessMerger] = gasless_merger
         self.balance_monitor: Optional[BalanceMonitor] = balance_monitor
         self.small_capital_config = small_capital_config
+        self.balanced_repair_config = balanced_repair_config
+        self.small_capital = SmallCapitalLifecycle(self)
         log.info(
             "market_cycler_small_capital_mode",
             asset=self.asset,
@@ -695,24 +215,25 @@ class MarketCycler:
         self._quote_event = asyncio.Event()
 
     def _set_dashboard_event(self, level: str, reason: str, detail: str = "") -> None:
-        self._dashboard_event = {
-            "event_level": level,
-            "event_reason": reason,
-            "event_detail": detail,
-            "event_ts": _time.time(),
-        }
+        set_dashboard_event(self, level, reason, detail)
 
     def _clear_dashboard_event(self) -> None:
-        self._dashboard_event = {}
+        clear_dashboard_event(self)
 
     def notify_price_update(self):
         """Wake the quote loop on a fresh price tick, with rate limit in loop."""
         if self._running and self.current_market:
             self._quote_event.set()
 
+    def _small_capital_lifecycle(self) -> SmallCapitalLifecycle:
+        lifecycle = getattr(self, "small_capital", None)
+        if lifecycle is None:
+            lifecycle = SmallCapitalLifecycle(self)
+            self.small_capital = lifecycle
+        return lifecycle
+
     def _small_capital_enabled(self) -> bool:
-        cfg = getattr(self, "small_capital_config", None)
-        return bool(cfg and getattr(cfg, "enabled", False) and getattr(cfg, "one_cycle_per_window", False))
+        return self._small_capital_lifecycle()._small_capital_enabled()
 
     def _should_pre_expiry_auto_merge(self, remaining: float, matched_pairs: int) -> bool:
         return (
@@ -721,53 +242,10 @@ class MarketCycler:
         )
 
     def _wallet_truth_snapshot(self, wallet_truth) -> dict | None:
-        if wallet_truth is None:
-            return None
-        yes = float(wallet_truth[0] or 0)
-        no = float(wallet_truth[1] or 0)
-        return {
-            "yes_shares": yes,
-            "no_shares": no,
-            "matched_pairs": min(yes, no),
-            "share_imbalance": yes - no,
-            "source": "wallet",
-            "updated_ts": _time.time(),
-        }
+        return self._small_capital_lifecycle()._wallet_truth_snapshot(wallet_truth)
 
     def _apply_wallet_truth_to_small_capital_state(self, market_id: str, wallet_snapshot: dict | None) -> None:
-        if not self._small_capital_enabled() or not wallet_snapshot:
-            return
-        yes = float(wallet_snapshot.get("yes_shares", 0) or 0)
-        no = float(wallet_snapshot.get("no_shares", 0) or 0)
-        state = self._small_capital_state(market_id)
-        changed = False
-        if yes > 0 or no > 0:
-            if not state.get("quote_cycle_started"):
-                state["quote_cycle_started"] = True
-                state["quote_cycles_started"] = int(state.get("quote_cycles_started", 0) or 0) + 1
-                state["opening_attempt_spent"] = True
-                changed = True
-            if not state.get("initial_filled"):
-                state["initial_filled"] = True
-                state["initial_side"] = "yes" if yes > 0 and yes >= no else "no"
-                state.setdefault("initial_order_id", "wallet_truth")
-                state.setdefault("initial_fill_ts", _time.time())
-                changed = True
-        if yes > 0 and no > 0 and not state.get("balancing_filled"):
-            state["balancing_filled"] = True
-            state["balancing_side"] = "yes" if yes < no else "no"
-            state.setdefault("balancing_order_id", "wallet_truth")
-            changed = True
-        if changed:
-            state["wallet_truth_reconciled"] = True
-            self._save_small_capital_state(market_id, state)
-            log.warning(
-                "small_capital_state_reconciled_from_wallet",
-                asset=self.asset,
-                market=market_id[:8],
-                yes=round(yes, 4),
-                no=round(no, 4),
-            )
+        return self._small_capital_lifecycle()._apply_wallet_truth_to_small_capital_state(market_id, wallet_snapshot)
 
     async def _maybe_pre_expiry_auto_merge(self, market: MarketInfo, pos, remaining: float, wallet_truth=None) -> dict:
         wallet_pairs = 0
@@ -837,261 +315,43 @@ class MarketCycler:
         return merge_result
 
     def _small_capital_balancing_side(self, market_id: str, pos, wallet_imbalance: float | None = None) -> str:
-        """Return the only side small-capital mode may quote after first fill.
-
-        Normal sizing can briefly see stale/flat inventory while the lifecycle
-        state already knows the opening side. In one-cycle mode, once the first
-        side is filled, every follow-up quote must be the opposite side; placing
-        the same opening side again duplicates exposure.
-        """
-        if not self._small_capital_enabled():
-            return ""
-        state = self._small_capital_state(market_id)
-        imbalance = float(wallet_imbalance if wallet_imbalance is not None else (pos.share_imbalance() or 0))
-        if imbalance > 0:
-            return "no"
-        if imbalance < 0:
-            return "yes"
-        if state.get("initial_filled") and not state.get("balancing_filled"):
-            initial_side = str(state.get("initial_side") or "").lower()
-            if initial_side in ("no", "down"):
-                return "yes"
-            if initial_side in ("yes", "up"):
-                return "no"
-        return ""
+        return self._small_capital_lifecycle()._small_capital_balancing_side(market_id, pos, wallet_imbalance)
 
     def _apply_small_capital_balancing_override(self, market_id: str, pos, quotes, repair_mode: str, min_order_size: int, wallet_imbalance: float | None = None) -> str:
-        balancing_side = self._small_capital_balancing_side(market_id, pos, wallet_imbalance)
-        effective_imbalance = float(wallet_imbalance if wallet_imbalance is not None else (pos.share_imbalance() or 0))
-        if balancing_side == "yes":
-            quotes.no_buy_size = 0
-            quotes.yes_buy_size = max(int(quotes.yes_buy_size or 0), int(min_order_size or 0))
-            log.warning(
-                "small_capital_balancing_quote_forced",
-                asset=self.asset,
-                market=market_id[:8],
-                side="yes",
-                imbalance=round(effective_imbalance, 4),
-                source="wallet" if wallet_imbalance is not None else "local",
-                msg="forcing opposite side after initial small-capital fill",
-            )
-            return "repair_up"
-        if balancing_side == "no":
-            quotes.yes_buy_size = 0
-            quotes.no_buy_size = max(int(quotes.no_buy_size or 0), int(min_order_size or 0))
-            log.warning(
-                "small_capital_balancing_quote_forced",
-                asset=self.asset,
-                market=market_id[:8],
-                side="no",
-                imbalance=round(effective_imbalance, 4),
-                source="wallet" if wallet_imbalance is not None else "local",
-                msg="forcing opposite side after initial small-capital fill",
-            )
-            return "repair_down"
-        return repair_mode
+        return self._small_capital_lifecycle()._apply_small_capital_balancing_override(market_id, pos, quotes, repair_mode, min_order_size, wallet_imbalance)
 
     def _apply_small_capital_opening_one_side(self, market_id: str, quotes, repair_mode: str, fair_value: float) -> str | None:
-        """In small-capital mode, the opening attempt may place only one side.
-
-        The normal strategy can be atomic/two-sided while flat. That is correct
-        for normal capital, but it violates one-cycle small-capital semantics by
-        spending two opening orders before the state can mark the cycle started.
-        Pick the better model-edge side and let the existing close-only repair
-        path quote the complement after a fill.
-        """
-        if not self._small_capital_enabled() or repair_mode != "normal":
-            return None
-        state = self._small_capital_state(market_id)
-        if self._small_capital_opening_spent(state):
-            return None
-        yes_size = int(getattr(quotes, "yes_buy_size", 0) or 0)
-        no_size = int(getattr(quotes, "no_buy_size", 0) or 0)
-        if yes_size <= 0 or no_size <= 0:
-            return None
-
-        fv = max(0.0, min(1.0, float(fair_value or 0.5)))
-        yes_price = float(getattr(quotes, "yes_buy_price", 0) or 0)
-        no_price = float(getattr(quotes, "no_buy_price", 0) or 0)
-        yes_edge = fv - yes_price
-        no_edge = (1.0 - fv) - no_price
-
-        # Deterministic tie-breaker: favor the side indicated by FV. At exactly
-        # neutral, YES is arbitrary but stable; only one order is the invariant.
-        side = "yes" if yes_edge >= no_edge else "no"
-        if side == "yes":
-            quotes.no_buy_size = 0
-        else:
-            quotes.yes_buy_size = 0
-        log.warning(
-            "small_capital_opening_forced_one_side",
-            asset=self.asset,
-            market=market_id[:8],
-            side=side,
-            fair_value=round(fv, 4),
-            yes_edge=round(yes_edge, 4),
-            no_edge=round(no_edge, 4),
-            msg="small-capital opening cannot rest both YES and NO",
-        )
-        return side
+        return self._small_capital_lifecycle()._apply_small_capital_opening_one_side(market_id, quotes, repair_mode, fair_value)
 
     def _small_capital_saved_repair_cap(self, state: dict, repair_side: str, min_edge: float) -> float | None:
-        """Return max balancing bid from saved opening limit price, if known.
-
-        Live wallet truth can observe shares before local CLOB fill history has
-        the FIFO price. In that gap, the universal pair-cost guard sees no
-        opposite fill and would allow an unsafe repair bid. The opening buy
-        limit is a conservative cost-basis upper bound: a buy fill cannot be
-        worse than our own limit.
-        """
-        repair_side = (repair_side or "").lower()
-        initial_side = str(state.get("initial_side") or "").lower()
-        if initial_side in ("up", "yes"):
-            initial_side = "yes"
-        elif initial_side in ("down", "no"):
-            initial_side = "no"
-        else:
-            return None
-
-        if repair_side == initial_side:
-            return None
-
-        price_key = "initial_yes_price" if initial_side == "yes" else "initial_no_price"
-        try:
-            initial_price = float(state.get(price_key) or state.get("initial_price") or 0)
-        except Exception:
-            initial_price = 0.0
-        if initial_price <= 0:
-            return None
-        return max(0.0, round(1.0 - initial_price - float(min_edge or 0), 4))
+        return self._small_capital_lifecycle()._small_capital_saved_repair_cap(state, repair_side, min_edge)
 
     def _small_capital_emergency_hedge_cap(self, state: dict, repair_side: str) -> tuple[float | None, bool, float]:
-        """Return bounded-loss hedge cap after the emergency timer expires.
-
-        Small-cap buy-only mode cannot sell wrong-side inventory. After waiting
-        for the profitable balancing leg, this allows completing the pair at a
-        bounded loss instead of risking the entire naked leg going to zero.
-        """
-        cfg = getattr(self, "small_capital_config", None)
-        if not getattr(cfg, "emergency_hedge_enabled", True):
-            return None, False, 0.0
-        if not state.get("initial_filled") or state.get("balancing_filled"):
-            return None, False, 0.0
-        try:
-            fill_ts = float(state.get("initial_fill_ts") or 0)
-        except Exception:
-            fill_ts = 0.0
-        if fill_ts <= 0:
-            return None, False, 0.0
-        elapsed = max(0.0, _time.time() - fill_ts)
-        wait_s = max(0.0, float(getattr(cfg, "emergency_hedge_after_seconds", 20.0) or 20.0))
-        if elapsed < wait_s:
-            return None, False, elapsed
-
-        repair_side = (repair_side or "").lower()
-        initial_side = str(state.get("initial_side") or "").lower()
-        if initial_side in ("up", "yes"):
-            initial_side = "yes"
-        elif initial_side in ("down", "no"):
-            initial_side = "no"
-        else:
-            return None, True, elapsed
-        if repair_side == initial_side:
-            return None, True, elapsed
-
-        try:
-            initial_price = float(state.get("initial_yes_price" if initial_side == "yes" else "initial_no_price")
-                                  or state.get("initial_price") or 0)
-        except Exception:
-            initial_price = 0.0
-        if initial_price <= 0:
-            return None, True, elapsed
-        max_pair_loss = max(0.0, float(getattr(cfg, "emergency_hedge_max_pair_loss", 0.20) or 0.0))
-        cap = max(0.0, min(0.99, 1.0 + max_pair_loss - initial_price))
-        return round(cap, 4), True, elapsed
+        return self._small_capital_lifecycle()._small_capital_emergency_hedge_cap(state, repair_side)
 
     async def _wallet_position_truth(self, market: MarketInfo) -> tuple[float, float] | None:
-        """Return authoritative YES/NO wallet balances for the current market.
-
-        Local fills are still used for cost basis/P&L, but quote side selection
-        should use wallet/ERC1155 balances when available because CLOB trade
-        history can lag immediately after a fill.
-        """
-        yes_token_id = str(getattr(market, "token_id_up", "") or "")
-        no_token_id = str(getattr(market, "token_id_down", "") or "")
-        if not yes_token_id or not no_token_id:
-            return None
-
-        ctf_contract = None
-        address = ""
-        bm = getattr(self, "balance_monitor", None)
-        if bm and getattr(bm, "_ctf", None) is not None and getattr(bm, "_address", ""):
-            ctf_contract = bm._ctf
-            address = bm._address
-        elif self.ctf and getattr(self.ctf, "_ctf", None) is not None and getattr(self.ctf, "_account", None):
-            ctf_contract = self.ctf._ctf
-            address = self.ctf._account.address
-        if ctf_contract is None or not address:
-            return None
-
-        try:
-            yes_raw = int(ctf_contract.functions.balanceOf(address, int(yes_token_id)).call())
-            no_raw = int(ctf_contract.functions.balanceOf(address, int(no_token_id)).call())
-            return yes_raw / 1e6, no_raw / 1e6
-        except Exception as e:
-            log.warning("wallet_position_truth_error", asset=self.asset, error=str(e))
-            return None
+        return await self._small_capital_lifecycle()._wallet_position_truth(market)
 
     async def _refresh_wallet_truth_for_market(self, market: MarketInfo) -> tuple[tuple[float, float] | None, dict | None]:
-        wallet_truth = await self._wallet_position_truth(market)
-        wallet_snapshot = self._wallet_truth_snapshot(wallet_truth)
-        if wallet_snapshot is not None:
-            self._wallet_truth_by_market[market.market_id] = wallet_snapshot
-            self._apply_wallet_truth_to_small_capital_state(market.market_id, wallet_snapshot)
-        return wallet_truth, wallet_snapshot
+        return await self._small_capital_lifecycle()._refresh_wallet_truth_for_market(market)
 
     def _small_capital_state(self, market_id: str) -> dict:
-        sm = getattr(self.inventory, "state_manager", None)
-        if sm and hasattr(sm, "get_small_capital_window"):
-            return sm.get_small_capital_window(market_id)
-        return {}
+        return self._small_capital_lifecycle()._small_capital_state(market_id)
 
     def _save_small_capital_state(self, market_id: str, state: dict):
-        sm = getattr(self.inventory, "state_manager", None)
-        if sm and hasattr(sm, "update_small_capital_window"):
-            sm.update_small_capital_window(market_id, state)
+        return self._small_capital_lifecycle()._save_small_capital_state(market_id, state)
 
     def _repair_small_capital_unfilled_opening_state(self, market_id: str, state: dict, has_resting_opening_quote: bool, matched_pairs: int) -> bool:
-        if (
-            state.get("quote_cycle_started")
-            and not has_resting_opening_quote
-            and not state.get("initial_filled")
-            and int(matched_pairs or 0) == 0
-        ):
-            retry_unfilled = bool(getattr(getattr(self, "small_capital_config", None), "retry_unfilled_opening", True))
-            state["stale_quote_cycle_repaired"] = True
-            state["initial_order_id"] = ""
-            state["initial_side"] = ""
-            if retry_unfilled:
-                state["quote_cycle_started"] = False
-                state["opening_attempt_spent"] = False
-                state["initial_price"] = 0.0
-                state["initial_yes_price"] = 0.0
-                state["initial_no_price"] = 0.0
-            self._save_small_capital_state(market_id, state)
-            return True
-        return False
+        return self._small_capital_lifecycle()._repair_small_capital_unfilled_opening_state(market_id, state, has_resting_opening_quote, matched_pairs)
 
     def _small_capital_should_hold_opening_quote(self, state: dict, has_resting_opening_quote: bool, matched_pairs: int) -> bool:
-        return bool(
-            self._small_capital_opening_spent(state)
-            and has_resting_opening_quote
-            and not state.get("initial_filled")
-            and int(matched_pairs or 0) == 0
-        )
+        return self._small_capital_lifecycle()._small_capital_should_hold_opening_quote(state, has_resting_opening_quote, matched_pairs)
+
+    def _apply_small_capital_opening_reprice_guard(self, market_id: str, quotes, state: dict, min_order_size: int) -> str:
+        return self._small_capital_lifecycle()._apply_small_capital_opening_reprice_guard(market_id, quotes, state, min_order_size)
 
     def _small_capital_opening_spent(self, state: dict) -> bool:
-        return bool(state.get("opening_attempt_spent") or state.get("quote_cycle_started"))
+        return self._small_capital_lifecycle()._small_capital_opening_spent(state)
 
     async def _cancel_fast_adverse_active_quotes(self, market: MarketInfo, fast_fv: float,
                                                 min_edge: float = FAST_ADVERSE_CANCEL_MIN_EDGE) -> bool:
@@ -1152,215 +412,16 @@ class MarketCycler:
         return cancelled
 
     async def _small_capital_fail_closed_before_quotes(self, market: MarketInfo, pos, wallet_snapshot: dict | None, fv: float, sigma: float, remaining: float) -> bool:
-        """Block all opening quote generation after small-cap opening is spent.
-
-        This runs before directional/FV/reverse-move quote branches. Those
-        branches can intentionally switch out of normal mode, so a late guard is
-        not sufficient for one-cycle-per-window semantics.
-        """
-        if not self._small_capital_enabled():
-            return False
-        state = self._small_capital_state(market.market_id)
-        if state.get("stopped_for_window"):
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-            self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
-                                   fv or self.last_fair_value or 0, sigma or self.last_sigma or 0,
-                                   "SMALL_CAP_DONE", remaining)
-            return True
-        if not self._small_capital_opening_spent(state):
-            return False
-
-        active = self.order_mgr.get_active(market.market_id)
-        has_resting = bool(active.yes_order_id or active.no_order_id)
-        wallet_imbalance = None
-        wallet_pairs = 0
-        if wallet_snapshot:
-            wallet_imbalance = float(wallet_snapshot.get("share_imbalance", 0) or 0)
-            wallet_pairs = int(float(wallet_snapshot.get("matched_pairs", 0) or 0))
-        effective_imbalance = wallet_imbalance if wallet_imbalance is not None else float(pos.share_imbalance() or 0)
-        effective_pairs = max(int(pos.matched_pairs() or 0), wallet_pairs)
-
-        # If one side exists, allow the later balancing/repair logic. If both
-        # sides are balanced, completion handler handles it first.
-        if abs(effective_imbalance) > 0.0001:
-            return False
-        if effective_pairs > 0:
-            return await self._small_capital_maybe_stop_completed(
-                market, pos, "pre_quote_wallet_balanced", wallet_snapshot=wallet_snapshot
-            )
-        if has_resting and not state.get("initial_filled"):
-            log.info(
-                "small_capital_holding_opening_quote_pre_generation",
-                asset=self.asset,
-                market=market.market_id[:8],
-                msg="opening quote already spent; blocking reverse-move normal quote generation",
-            )
-            self._set_dashboard_event("info", "SMALL_CAP_HOLD_OPENING", "opening quote already placed; waiting")
-            self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
-                                   fv or self.last_fair_value or 0, sigma or self.last_sigma or 0,
-                                   "SMALL_CAP_HOLD_OPENING", remaining)
-            return True
-
-        if not state.get("initial_filled") and bool(getattr(getattr(self, "small_capital_config", None), "retry_unfilled_opening", True)):
-            # Compatibility/workflow restore: an opening order that was canceled
-            # before any fill did not create market risk. Do not let stale
-            # opening_attempt_spent state freeze the whole window before the
-            # later quote-generation path can repair it.
-            state["quote_cycle_started"] = False
-            state["opening_attempt_spent"] = False
-            state["initial_order_id"] = ""
-            state["initial_side"] = ""
-            state["initial_price"] = 0.0
-            state["initial_yes_price"] = 0.0
-            state["initial_no_price"] = 0.0
-            state["stale_quote_cycle_repaired"] = True
-            self._save_small_capital_state(market.market_id, state)
-            log.warning(
-                "small_capital_pre_generation_unfilled_retry_enabled",
-                asset=self.asset,
-                market=market.market_id[:8],
-                msg="cleared stale opening-spent state with no fill/inventory; allowing opening quote retry",
-            )
-            self._set_dashboard_event(
-                "info",
-                "SMALL_CAP_RETRY_UNFILLED_OPENING",
-                "cleared stale unfilled opening state; retrying",
-            )
-            return False
-
-        log.warning(
-            "small_capital_opening_spent_pre_generation",
-            asset=self.asset,
-            market=market.market_id[:8],
-            msg="opening attempt already spent; blocking all new opening quotes this window",
-        )
-        self._set_dashboard_event("skip", "SMALL_CAP_OPENING_SPENT", "opening attempt already spent this window")
-        await self.order_mgr.cancel_market_quotes(market.market_id)
-        self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
-                               fv or self.last_fair_value or 0, sigma or self.last_sigma or 0,
-                               "SMALL_CAP_WAIT_NEXT", remaining)
-        return True
+        return await self._small_capital_lifecycle()._small_capital_fail_closed_before_quotes(market, pos, wallet_snapshot, fv, sigma, remaining)
 
     def _mark_small_capital_quote_started(self, market: MarketInfo, quotes, repair_mode: str):
-        """Persist that this window has spent its one opening quote cycle."""
-        if not self._small_capital_enabled() or repair_mode != "normal":
-            return
-        if not ((quotes.yes_buy_size or 0) > 0 or (quotes.no_buy_size or 0) > 0):
-            return
-        state = self._small_capital_state(market.market_id)
-        if state.get("quote_cycle_started"):
-            return
-        active = self.order_mgr.get_active(market.market_id)
-        initial_order_id = active.yes_order_id or active.no_order_id or ""
-        if not initial_order_id:
-            log.warning(
-                "small_capital_quote_cycle_not_marked",
-                asset=self.asset,
-                market=market.market_id[:8],
-                msg="opening quote was generated but no live order id exists",
-            )
-            return
-        state.update({
-            "quote_cycle_started": True,
-            "opening_attempt_spent": True,
-            "quote_cycles_started": int(state.get("quote_cycles_started", 0) or 0) + 1,
-            "initial_order_id": initial_order_id,
-            "initial_side": "yes" if (quotes.yes_buy_size or 0) > 0 else "no",
-            "slug": market.slug,
-            "asset": self.asset,
-        })
-        if state["initial_side"] == "yes":
-            state["initial_yes_price"] = float(getattr(quotes, "yes_buy_price", 0) or 0)
-            state["initial_price"] = state["initial_yes_price"]
-        else:
-            state["initial_no_price"] = float(getattr(quotes, "no_buy_price", 0) or 0)
-            state["initial_price"] = state["initial_no_price"]
-        self._save_small_capital_state(market.market_id, state)
-        log.info(
-            "small_capital_quote_cycle_started",
-            asset=self.asset,
-            market=market.market_id[:8],
-            quote_cycles_started=state["quote_cycles_started"],
-            yes_size=quotes.yes_buy_size,
-            no_size=quotes.no_buy_size,
-        )
+        return self._small_capital_lifecycle()._mark_small_capital_quote_started(market, quotes, repair_mode)
 
     def _small_capital_record_fills(self, market: MarketInfo, fills: list[dict]):
-        if not self._small_capital_enabled() or not fills:
-            return
-        state = self._small_capital_state(market.market_id)
-        if not state.get("quote_cycle_started"):
-            return
-        for fill in fills:
-            side = str(fill.get("side") or "").lower()
-            order_id = str(fill.get("order_id") or "")
-            if side in ("up", "yes"):
-                side = "yes"
-            elif side in ("down", "no"):
-                side = "no"
-            if not state.get("initial_filled"):
-                state["initial_filled"] = True
-                state["initial_side"] = side
-                state["initial_order_id"] = order_id
-                state["initial_fill_ts"] = _time.time()
-                fill_price = float(fill.get("price") or 0)
-                if fill_price > 0:
-                    if side == "yes":
-                        state["initial_yes_price"] = fill_price
-                    else:
-                        state["initial_no_price"] = fill_price
-                    state["initial_price"] = fill_price
-            elif side and side != state.get("initial_side"):
-                state["balancing_filled"] = True
-                state["balancing_side"] = side
-                state["balancing_order_id"] = order_id
-        self._save_small_capital_state(market.market_id, state)
+        return self._small_capital_lifecycle()._small_capital_record_fills(market, fills)
 
     async def _small_capital_maybe_stop_completed(self, market: MarketInfo, pos, reason: str = "", wallet_snapshot: dict | None = None) -> bool:
-        """Stop quoting this window after the first balanced pair cycle completes."""
-        if not self._small_capital_enabled():
-            return False
-        state = self._small_capital_state(market.market_id)
-        if state.get("stopped_for_window"):
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-            self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
-                                   self.last_fair_value or 0, self.last_sigma or 0,
-                                   "SMALL_CAP_DONE", market.time_remaining)
-            return True
-        matched_pairs = int(pos.matched_pairs() or 0)
-        imbalance = float(pos.share_imbalance() or 0)
-        if wallet_snapshot:
-            matched_pairs = int(float(wallet_snapshot.get("matched_pairs", matched_pairs) or 0))
-            imbalance = float(wallet_snapshot.get("share_imbalance", imbalance) or 0)
-        state_completed = bool(
-            state.get("quote_cycle_started")
-            and state.get("initial_filled")
-            and state.get("balancing_filled")
-        )
-        inventory_completed = bool(matched_pairs > 0 and abs(imbalance) < 0.0001)
-        if (state.get("quote_cycle_started")
-                and getattr(self.small_capital_config, "stop_after_balanced_fill", True)
-                and (state_completed or inventory_completed)):
-            state["balancing_filled"] = True
-            state["stopped_for_window"] = True
-            state["stop_reason"] = reason or ("state_balanced_fill_complete" if state_completed else "balanced_fill_complete")
-            self._save_small_capital_state(market.market_id, state)
-            if getattr(self.small_capital_config, "cancel_remaining_orders_on_stop", True):
-                await self.order_mgr.cancel_market_quotes(market.market_id)
-            log.warning(
-                "small_capital_window_complete",
-                asset=self.asset,
-                market=market.market_id[:8],
-                slug=market.slug,
-                matched_pairs=matched_pairs,
-                reason=state["stop_reason"],
-                inventory_source="wallet" if wallet_snapshot else "local",
-            )
-            self._update_dashboard(market, getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0),
-                                   self.last_fair_value or 0, self.last_sigma or 0,
-                                   "SMALL_CAP_DONE", market.time_remaining)
-            return True
-        return False
+        return await self._small_capital_lifecycle()._small_capital_maybe_stop_completed(market, pos, reason, wallet_snapshot)
 
     async def run(self):
         """Main loop: cycle through markets continuously."""
@@ -1463,247 +524,18 @@ class MarketCycler:
         log.info("cycler_stopped", asset=self.asset)
 
     async def _settle_market(self):
-        """Clean up after a market expires, merge pairs and redeem winnings."""
-        if self.current_market:
-            market = self.current_market
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-
-            # Get final position
-            pos = self.inventory.get_or_create(market.market_id, self.asset)
-            pairs = pos.matched_pairs()
-
-            log.info("market_settling",
-                     asset=self.asset,
-                     slug=market.slug,
-                     up_shares=pos.yes_shares,
-                     down_shares=pos.no_shares,
-                     matched_pairs=pairs)
-
-            # --- CTF Operations ---
-            if pairs > 0:
-                # Use gasless merger if available, else on-chain
-                condition_id = getattr(market, 'condition_id', None)
-                if condition_id:
-                    amount = int(pairs * 1e6)  # Convert to USDC base units
-                    tx = None
-                    collateral_token = getattr(self.gasless_merger, "_collateral_token", "")
-                    if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
-                        collateral_token = infer_collateral_token_for_market(
-                            self.balance_monitor._w3,
-                            self.balance_monitor._ctf,
-                            condition_id,
-                            getattr(market, "token_id_up", ""),
-                            getattr(market, "token_id_down", ""),
-                            collateral_token,
-                        )
-
-                    # Prefer gasless merge
-                    if self.gasless_merger and self.gasless_merger.is_available:
-                        tx = await self.gasless_merger.merge_positions(
-                            condition_id, amount, collateral_token=collateral_token
-                        )
-
-                    # Fallback to on-chain
-                    if not tx and self.ctf:
-                        tx = await self.ctf.merge_positions(
-                            condition_id, amount, collateral_token=collateral_token
-                        )
-
-                    if tx:
-                        # ERC20 approvals are permanent (MAX_UINT256) and set at
-                        # startup. Post-merge we only need to sync the CLOB's
-                        # indexed view so the returned USDC.e is credited as cash.
-                        sync_balance = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
-                        if callable(sync_balance):
-                            # Wait for CLOB indexer to catch up with on-chain
-                            # merge state before syncing balance/allowance.
-                            await asyncio.sleep(3)
-                            sync_ok = False
-                            for attempt in range(1, 6):
-                                try:
-                                    sync_ok = bool(await sync_balance())
-                                except Exception as e:
-                                    log.warning("post_settle_merge_balance_sync_error",
-                                                asset=self.asset, attempt=attempt, error=str(e))
-                                    sync_ok = False
-                                if sync_ok:
-                                    break
-                                await asyncio.sleep(min(2 * attempt, 8))
-                            if sync_ok:
-                                log.info("post_settle_merge_balance_allowance_synced", asset=self.asset)
-                            else:
-                                log.warning("post_settle_merge_balance_allowance_sync_failed", asset=self.asset)
-                        pair_profit = pos.matched_pair_profit()
-                        self.pnl.record_settlement(pair_profit, market.market_id)
-                        self.pnl.record_capital_recovery(pairs * 1.0)
-                        pos.acknowledge_settlement()
-                        log.info("pairs_merged",
-                                 pairs=pairs,
-                                 profit=f"${pair_profit:.4f}",
-                                 tx=str(tx)[:16] if tx else "none")
-
-            # Try to redeem any remaining tokens (if market resolved)
-            if self.ctf or self.gasless_merger:
-                condition_id = getattr(market, 'condition_id', None)
-                if condition_id:
-                    resolved = await self.ctf.is_market_resolved(condition_id) if self.ctf else False
-                    if resolved:
-                        tx = None
-                        if self.gasless_merger and self.gasless_merger.is_available:
-                            tx = await self.gasless_merger.redeem_positions(condition_id)
-                        elif self.ctf:
-                            log.error("gasless_redeem_unavailable",
-                                      msg="Gasless redeem unavailable; on-chain fallback disabled by policy")
-                        if tx:
-                            # Calculate redemption value for unmatched tokens
-                            unmatched_up = pos.yes_shares - pairs
-                            unmatched_down = pos.no_shares - pairs
-                            log.info("tokens_redeemed",
-                                     unmatched_up=unmatched_up,
-                                     unmatched_down=unmatched_down,
-                                     tx=tx[:16] if tx else "none")
-
-            # Simulate redemption of unmatched tokens in Dry-Run
-            elif not self.ctf and not self.gasless_merger:
-                if pairs > 0:
-                    pair_profit = pos.matched_pair_profit()
-                    self.pnl.record_settlement(pair_profit, market.market_id)
-                    self.pnl.record_capital_recovery(pairs * 1.0)
-                    pos.acknowledge_settlement()
-                    log.info("dry_run_pairs_merged",
-                             pairs=pairs,
-                             profit=f"${pair_profit:.4f}")
-
-                unmatched_up = pos.yes_shares - pairs
-                unmatched_down = pos.no_shares - pairs
-
-                # Always track/record the real outcome (even if flat).
-                # This is useful for analyzing market behavior and verifying the model.
-                pos_snapshot = {
-                    "yes_avg_entry": pos.yes_avg_entry,
-                    "no_avg_entry": pos.no_avg_entry,
-                    "unmatched_up": unmatched_up,
-                    "unmatched_down": unmatched_down,
-                }
-
-                # Persist a pending resolution record so the next run can finish it even if
-                # this process exits (timeout/restart).
-                sm = getattr(self.inventory, "state_manager", None)
-                if sm:
-                    try:
-                        sm.add_pending_resolution({
-                            "slug": market.slug,
-                            "asset": market.asset,
-                            "window_start_ts": int(market.window_start_ts),
-                            "market_id": market.market_id,
-                            "yes_avg_entry": pos_snapshot["yes_avg_entry"],
-                            "no_avg_entry": pos_snapshot["no_avg_entry"],
-                            "unmatched_up": pos_snapshot["unmatched_up"],
-                            "unmatched_down": pos_snapshot["unmatched_down"],
-                            "created_ts": _time.time(),
-                        })
-                    except Exception as ex:
-                        log.debug("pending_resolution_persist_failed", slug=market.slug, error=str(ex))
-
-                # Kick off background task to wait for actual resolution from Gamma API
-                asyncio.create_task(self._wait_and_settle_unmatched(market, pos_snapshot))
-
-            # Clear position from inventory state
-            self.inventory.clear_market(market.market_id)
-            
-            self.current_market = None
-
-        # Reset per-market state for next cycle
-        self.quote_engine.reset_params()
-        if not self.portfolio_pnl_getter:
-            self.risk_engine.reset_for_new_market(self.pnl.net_pnl)
+        await settle_market(self)
 
     async def _wait_and_settle_unmatched(self, market: MarketInfo, pos_snapshot: dict):
-        """Background task to poll Gamma API and wait for actual market resolution.
-        
-        Args:
-            market: MarketInfo for the expired market.
-            pos_snapshot: Frozen dict with keys: yes_avg_entry, no_avg_entry,
-                          unmatched_up, unmatched_down.
-        """
-        unmatched_up = pos_snapshot["unmatched_up"]
-        unmatched_down = pos_snapshot["unmatched_down"]
-        yes_avg = pos_snapshot["yes_avg_entry"]
-        no_avg = pos_snapshot["no_avg_entry"]
-        
-        await self._wait_and_settle_unmatched_by_fields(
-            asset=market.asset,
-            slug=market.slug,
-            window_start_ts=int(market.window_start_ts),
-            market_id=market.market_id,
-            pos_snapshot=pos_snapshot,
-        )
+        await wait_and_settle_unmatched(self, market, pos_snapshot)
 
     async def _wait_and_settle_unmatched_by_fields(self, asset: str, slug: str,
                                                    window_start_ts: int,
                                                    market_id: str,
                                                    pos_snapshot: dict):
-        """Poll Gamma until the market is inactive, then record outcome.
-
-        NOTE: We require m.active == False to avoid false positives.
-        """
-        unmatched_up = pos_snapshot["unmatched_up"]
-        unmatched_down = pos_snapshot["unmatched_down"]
-        yes_avg = pos_snapshot["yes_avg_entry"]
-        no_avg = pos_snapshot["no_avg_entry"]
-
-        log.info("waiting_for_actual_resolution", slug=slug)
-
-        while self._running:
-            await asyncio.sleep(30)
-            try:
-                m = await self.discovery._fetch_market(asset, int(window_start_ts))
-                if not m:
-                    continue
-
-                # Require actual Gamma closed/inactive/archived status to prevent
-                # volatility false positives while still supporting markets that
-                # remain active=True after close.
-                resolved = bool(getattr(m, "closed", False) or getattr(m, "archived", False) or not m.active)
-                if not resolved:
-                    continue
-
-                up = m.up_price
-                down = m.down_price
-                won_up = up >= down
-
-                winning_shares = unmatched_up if won_up else unmatched_down
-                losing_shares = unmatched_down if won_up else unmatched_up
-                winner_str = "UP" if won_up else "DOWN"
-
-                cost_of_winning = winning_shares * (yes_avg if won_up else no_avg)
-                cost_of_losing = losing_shares * (no_avg if won_up else yes_avg)
-
-                revenue = winning_shares * 1.0
-                net_profit = revenue - cost_of_winning - cost_of_losing
-
-                self.pnl.record_outcome_resolution(net_profit, market_id)
-                self.pnl.record_capital_recovery(revenue)
-
-                log.info(
-                    "dry_run_actual_resolution",
-                    slug=slug,
-                    winner=winner_str,
-                    winning_shares=winning_shares,
-                    losing_shares=losing_shares,
-                    outcome_pnl=round(net_profit, 4),
-                    pnl=f"${net_profit:.4f}",
-                )
-
-                sm = getattr(self.inventory, "state_manager", None)
-                if sm:
-                    try:
-                        sm.remove_pending_resolution(slug)
-                    except Exception as ex:
-                        log.debug("pending_resolution_remove_failed", slug=slug, error=str(ex))
-                break
-            except Exception as e:
-                log.error("wait_and_settle_error", slug=slug, error=str(e))
+        await wait_and_settle_unmatched_by_fields(
+            self, asset, slug, window_start_ts, market_id, pos_snapshot
+        )
 
     async def _find_next_market(self) -> Optional[MarketInfo]:
         """Find the next eligible market for this asset."""
@@ -2078,10 +910,20 @@ class MarketCycler:
             log.error("pre_quote_live_fill_sync_error", error=str(e))
             return False
 
+    def _quote_cycle_context(self, market: MarketInfo, now: float | None = None) -> QuoteCycleContext:
+        return QuoteCycleContext.from_market(market, now=_time.time() if now is None else now)
+
+    def _package_book_snapshot(self, books, market: MarketInfo):
+        return package_book_snapshot(books, market)
+
+    def _package_fair_value_result(self, fv_result, polymarket_mid_up):
+        return package_fair_value_result(fv_result, polymarket_mid_up)
+
     async def _quote_cycle(self, market: MarketInfo):
         """Single quote cycle iteration."""
-        now = _time.time()
-        remaining = market.time_remaining
+        ctx = self._quote_cycle_context(market)
+        now = ctx.now
+        remaining = ctx.remaining
 
         # 1. Get live spot price. Prefer Exness/MT5 bridge when configured;
         # it has tracked the Polymarket oracle faster than Binance in live tests.
@@ -2114,14 +956,15 @@ class MarketCycler:
                 price_source = (self.price_feed.get_price_source(self.ac.symbol)
                                 if hasattr(self.price_feed, "get_price_source") else "unknown")
 
-        if not raw_spot:
+        stale_spot_decision = decide_stale_spot(raw_spot, price_age, max_spot_age)
+        if stale_spot_decision.should_stop and stale_spot_decision.dashboard_reason == "NO_SPOT":
             log.warning("no_spot_price", symbol=self.ac.symbol)
             self._set_dashboard_event("skip", "NO_SPOT_PRICE", f"{self.ac.symbol} unavailable")
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, 0, self.last_fair_value or 0, self._dashboard_sigma_for_stale_spot(), "NO_SPOT", remaining)
             return
 
-        if price_age > max_spot_age:
+        if stale_spot_decision.should_stop and stale_spot_decision.dashboard_reason == "STALE_SPOT":
             log.warning(
                 "spot_price_stale_stop_quoting",
                 asset=self.asset,
@@ -2133,7 +976,7 @@ class MarketCycler:
             self._set_dashboard_event(
                 "skip",
                 "STALE_SPOT",
-                f"age {price_age:.2f}s > max {max_spot_age:.2f}s",
+                stale_spot_decision.event_message or f"age {price_age:.2f}s > max {max_spot_age:.2f}s",
             )
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(
@@ -2215,13 +1058,14 @@ class MarketCycler:
         # raw/model FV while the UI/book price was already far away (e.g. UP 15c
         # but dashboard stuck near 54c).
         books = await self.book_reader.get_books([market.token_id_up, market.token_id_down])
-        book_up = books.get(market.token_id_up)
-        book_down = books.get(market.token_id_down)
-        best_ask_yes = book_up.best_ask if book_up else None
-        best_bid_yes = book_up.best_bid if book_up else None
-        best_ask_no = book_down.best_ask if book_down else None
-        best_bid_no = book_down.best_bid if book_down else None
-        polymarket_mid_up = polymarket_implied_up_mid(book_up, book_down)
+        book_snapshot = self._package_book_snapshot(books, market)
+        book_up = book_snapshot.book_up
+        book_down = book_snapshot.book_down
+        best_ask_yes = book_snapshot.best_ask_yes
+        best_bid_yes = book_snapshot.best_bid_yes
+        best_ask_no = book_snapshot.best_ask_no
+        best_bid_no = book_snapshot.best_bid_no
+        polymarket_mid_up = book_snapshot.polymarket_mid_up
 
         # Dynamic live oracle/Polymarket spot estimate. Only use this to adjust
         # Binance/fallback feeds. If Exness/MT5 is active, it is the primary live
@@ -2270,18 +1114,33 @@ class MarketCycler:
         except Exception:
             standardized_move = 0.0
 
-        model_confidence = fv_model_confidence(
-            model_fv,
-            elapsed_fraction,
-            standardized_move,
-            polymarket_mid_up,
+        fv_result = FairValueEngine(self.fair_value_model).compute(
+            FairValueInputs(
+                spot=spot,
+                sigma=sigma,
+                now_ts=now,
+                elapsed_fraction=elapsed_fraction,
+                standardized_move=standardized_move,
+                market_fv=polymarket_mid_up,
+                price_source=price_source,
+            ),
+            update_state=False,
         )
-        model_confidence = apply_fast_feed_confidence_floor(
-            model_confidence,
-            price_source,
-            standardized_move,
-        )
-        fv = blended_fair_value(model_fv, polymarket_mid_up, model_confidence)
+        fv_package = self._package_fair_value_result(fv_result, polymarket_mid_up)
+        model_fv = fv_package.model_fv
+        model_confidence = fv_package.model_confidence
+        uncapped_fv = fv_package.uncapped_fv
+        fv = fv_package.tradable_fv
+        if polymarket_mid_up is not None and abs(float(fv or 0) - float(uncapped_fv or 0)) >= 0.0001:
+            log.warning(
+                "fair_value_market_deviation_capped",
+                asset=self.asset,
+                uncapped_fv=round(float(uncapped_fv or 0), 4),
+                capped_fv=round(float(fv or 0), 4),
+                market_fv=round(float(polymarket_mid_up or 0), 4),
+                max_deviation=MAX_TRADING_FV_MARKET_DEVIATION,
+                msg="model FV too far from current Polymarket UP price; capping tradable FV",
+            )
         self.last_fair_value = fv
         # The final blended FV is the authoritative trading FV. Refresh the
         # model freshness timestamp here; otherwise pre_trade_checks sees the
@@ -2292,7 +1151,7 @@ class MarketCycler:
         if hasattr(self.order_mgr.executor, 'update_fair_value'):
             self.order_mgr.executor.update_fair_value(fv, spot)
 
-        basis_delta = abs(model_fv - polymarket_mid_up) if polymarket_mid_up is not None else None
+        basis_delta = fv_package.basis_delta
         log.info(
             "fair_value_inputs",
             asset=self.asset,
@@ -2304,6 +1163,7 @@ class MarketCycler:
             model_fv=round(float(model_fv or 0), 4),
             market_fv=(round(polymarket_mid_up, 4) if polymarket_mid_up is not None else None),
             model_confidence=round(float(model_confidence or 0), 4),
+            uncapped_fv=round(float(uncapped_fv or 0), 4),
             final_fv=round(float(fv or 0), 4),
             basis_delta=(round(basis_delta, 4) if basis_delta is not None else None),
         )
@@ -2317,25 +1177,6 @@ class MarketCycler:
         # Reduced from 300s to 240s to give more time for normal pair-matching.
         balance_only = remaining <= 240
         min_order_size = max(1, int(getattr(self.ac, "min_order_size", 5)))
-
-        def _repair_size(raw_size: int) -> int:
-            """Return a valid close-only repair size or 0 if below live minimum."""
-            raw_size = int(raw_size or 0)
-            if raw_size < min_order_size:
-                return 0
-            return raw_size
-
-        def _normalize_quote_sizes(yes_size: int, no_size: int, allow_round_up: bool = True) -> tuple[int, int]:
-            """Enforce Polymarket minimum order size on active quote sides."""
-            yes_size = int(yes_size or 0)
-            no_size = int(no_size or 0)
-            if allow_round_up:
-                yes_size = min_order_size if 0 < yes_size < min_order_size else yes_size
-                no_size = min_order_size if 0 < no_size < min_order_size else no_size
-            else:
-                yes_size = 0 if 0 < yes_size < min_order_size else yes_size
-                no_size = 0 if 0 < no_size < min_order_size else no_size
-            return yes_size, no_size
 
         # Get inventory position early for the DEAD_ZONE check. Attach live CTF
         # identifiers for mid-market merge calls; persisted inventory only stores
@@ -2377,95 +1218,116 @@ class MarketCycler:
 
         await self._maybe_pre_expiry_auto_merge(market, pos, remaining, wallet_truth=wallet_truth)
 
-        if has_negative_matched_pair_edge(pos):
-            pairs = int(pos.matched_pairs())
-            pair_pnl = round(pos.matched_pair_profit(), 4)
-            condition_id = getattr(pos, "condition_id", None) or market.market_id
-            log.warning(
-                "negative_pair_edge_recovery",
-                asset=self.asset,
-                market=market.market_id[:8],
-                matched_pairs=pairs,
-                pair_pnl=pair_pnl,
-                msg="Stale negative-edge pairs detected; merging to recover capital",
+        negative_pair_edge = decide_negative_pair_edge(pos)
+        if negative_pair_edge.triggered:
+            pairs = negative_pair_edge.matched_pairs
+            pair_pnl = round(negative_pair_edge.pair_pnl, 4)
+            debt_eligible, debt_reason, debt_meta = balanced_repair_debt_eligible(
+                pos, self.balanced_repair_config
             )
-
-            # The loss is already locked in from fills. Merge recovers ~$1/pair
-            # minus the small loss back to the wallet. Halting would just
-            # abandon the capital AND prevent future profitable trading.
-            merged = False
-            if pairs > 0 and condition_id:
-                amount = int(pairs * 1e6)
-                tx = None
-
-                # Infer correct collateral for this market
-                collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
-                if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
-                    try:
-                        from src.execution.ctf_ops import infer_collateral_token_for_market
-                        collateral_token = infer_collateral_token_for_market(
-                            self.balance_monitor._w3,
-                            self.balance_monitor._ctf,
-                            condition_id,
-                            getattr(pos, "yes_token_id", ""),
-                            getattr(pos, "no_token_id", ""),
-                            collateral_token,
-                        )
-                    except Exception:
-                        pass
-
-                if self.gasless_merger and self.gasless_merger.is_available:
-                    tx = await self.gasless_merger.merge_positions(
-                        condition_id, amount, collateral_token=collateral_token)
-                if not tx and self.ctf:
-                    tx = await self.ctf.merge_positions(
-                        condition_id, amount, collateral_token=collateral_token)
-
-                if tx:
-                    # Record the (negative) profit, recover capital, clear state
-                    profit = pos.matched_pair_profit()
-                    self.pnl.record_settlement(profit, market.market_id)
-                    self.pnl.record_capital_recovery(pairs * 1.0)
-                    pos.acknowledge_settlement()
-
-                    # ERC20 approvals are permanent; only sync CLOB balance.
-                    sync_balance = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
-                    if callable(sync_balance):
-                        await asyncio.sleep(3)
-                        for _attempt in range(1, 4):
-                            try:
-                                if await sync_balance():
-                                    break
-                            except Exception:
-                                pass
-                            await asyncio.sleep(2 * _attempt)
-
-                    log.info(
-                        "negative_pair_edge_recovered",
-                        asset=self.asset,
-                        pairs=pairs,
-                        profit=f"${profit:.4f}",
-                        tx=str(tx)[:16],
-                    )
-                    merged = True
-
-            # Clear stale inventory regardless of merge success.
-            # If merge failed, the on-chain state is unknown (maybe already
-            # merged by a previous session). Either way, continuing to trade
-            # is better than halting permanently.
-            self.inventory.clear_market(market.market_id)
-            pos = self.inventory.get_or_create(market.market_id, self.asset)
-            pos.condition_id = getattr(market, "condition_id", None) or market.market_id
-            pos.yes_token_id = str(getattr(market, "token_id_up", "") or "")
-            pos.no_token_id = str(getattr(market, "token_id_down", "") or "")
-
-            if not merged:
+            if debt_eligible and not self._small_capital_enabled():
                 log.warning(
-                    "negative_pair_edge_cleared_without_merge",
+                    "negative_pair_edge_balanced_repair_armed",
                     asset=self.asset,
                     market=market.market_id[:8],
-                    msg="Cleared stale inventory; on-chain pairs may need manual redemption",
+                    matched_pairs=pairs,
+                    pair_pnl=pair_pnl,
+                    debt=debt_meta.get("debt"),
+                    msg="Keeping negative-edge pairs open for balanced repair instead of immediate merge",
                 )
+                self._set_dashboard_event(
+                    "warn",
+                    "BALANCED_REPAIR_ARMED",
+                    f"debt ${float(debt_meta.get('debt', 0) or 0):.2f}; waiting for profitable pairs",
+                )
+            else:
+                condition_id = getattr(pos, "condition_id", None) or market.market_id
+                log.warning(
+                    "negative_pair_edge_recovery",
+                    asset=self.asset,
+                    market=market.market_id[:8],
+                    matched_pairs=pairs,
+                    pair_pnl=pair_pnl,
+                    balanced_repair_reason=debt_reason,
+                    msg="Stale negative-edge pairs detected; merging to recover capital",
+                )
+
+                # The loss is already locked in from fills. Merge recovers ~$1/pair
+                # minus the small loss back to the wallet. Halting would just
+                # abandon the capital AND prevent future profitable trading.
+                merged = False
+                if pairs > 0 and condition_id:
+                    amount = int(pairs * 1e6)
+                    tx = None
+
+                    # Infer correct collateral for this market
+                    collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
+                    if self.balance_monitor and getattr(self.balance_monitor, "_ctf", None):
+                        try:
+                            from src.execution.ctf_ops import infer_collateral_token_for_market
+                            collateral_token = infer_collateral_token_for_market(
+                                self.balance_monitor._w3,
+                                self.balance_monitor._ctf,
+                                condition_id,
+                                getattr(pos, "yes_token_id", ""),
+                                getattr(pos, "no_token_id", ""),
+                                collateral_token,
+                            )
+                        except Exception:
+                            pass
+
+                    if self.gasless_merger and self.gasless_merger.is_available:
+                        tx = await self.gasless_merger.merge_positions(
+                            condition_id, amount, collateral_token=collateral_token)
+                    if not tx and self.ctf:
+                        tx = await self.ctf.merge_positions(
+                            condition_id, amount, collateral_token=collateral_token)
+
+                    if tx:
+                        # Record the (negative) profit, recover capital, clear state
+                        profit = pos.matched_pair_profit()
+                        self.pnl.record_settlement(profit, market.market_id)
+                        self.pnl.record_capital_recovery(pairs * 1.0)
+                        pos.acknowledge_settlement()
+
+                        # ERC20 approvals are permanent; only sync CLOB balance.
+                        sync_balance = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
+                        if callable(sync_balance):
+                            await asyncio.sleep(3)
+                            for _attempt in range(1, 4):
+                                try:
+                                    if await sync_balance():
+                                        break
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(2 * _attempt)
+
+                        log.info(
+                            "negative_pair_edge_recovered",
+                            asset=self.asset,
+                            pairs=pairs,
+                            profit=f"${profit:.4f}",
+                            tx=str(tx)[:16],
+                        )
+                        merged = True
+
+                # Clear stale inventory regardless of merge success.
+                # If merge failed, the on-chain state is unknown (maybe already
+                # merged by a previous session). Either way, continuing to trade
+                # is better than halting permanently.
+                self.inventory.clear_market(market.market_id)
+                pos = self.inventory.get_or_create(market.market_id, self.asset)
+                pos.condition_id = getattr(market, "condition_id", None) or market.market_id
+                pos.yes_token_id = str(getattr(market, "token_id_up", "") or "")
+                pos.no_token_id = str(getattr(market, "token_id_down", "") or "")
+
+                if not merged:
+                    log.warning(
+                        "negative_pair_edge_cleared_without_merge",
+                        asset=self.asset,
+                        market=market.market_id[:8],
+                        msg="Cleared stale inventory; on-chain pairs may need manual redemption",
+                    )
 
         if phase == "DEAD_ZONE" and float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance()) == 0:
             await self.order_mgr.cancel_market_quotes(market.market_id)
@@ -2532,12 +1394,16 @@ class MarketCycler:
         # leaves us imbalanced, the safest response is not a full quoting freeze;
         # it is close-only repair on the light side with conservative sizing.
         # Uses SHARE COUNT imbalance (Up - Down), not dollar delta.
-        imbalance = float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance())
-        abs_imbalance = abs(imbalance)
+        inventory_plan = decide_inventory_risk(
+            float(wallet_imbalance if wallet_imbalance is not None else pos.share_imbalance()),
+            min_order_size,
+        )
+        imbalance = inventory_plan.imbalance
+        abs_imbalance = inventory_plan.abs_imbalance
         # Treat any leftover as actionable inventory risk. If one side filled and
         # the other did not, quote ONLY the light side until balanced again.
-        inventory_repair = abs_imbalance >= min_order_size
-        dust_normalization = 0 < abs_imbalance < min_order_size
+        inventory_repair = inventory_plan.inventory_repair
+        dust_normalization = inventory_plan.dust_normalization
         close_only_phase = phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"]
 
         # 10. Toxicity monitor
@@ -2657,7 +1523,7 @@ class MarketCycler:
                         imbalance, fv, min_order_size, self.quote_engine.max_order_size)
                 else:
                     up_size = 0
-                    down_size = _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
+                    down_size = repair_size_or_zero(min(self.quote_engine.max_order_size, int(abs_imbalance)), min_order_size)
                     repair_mode = "repair_down"
             elif imbalance < 0:
                 if abs_imbalance < min_order_size:
@@ -2665,7 +1531,7 @@ class MarketCycler:
                         imbalance, fv, min_order_size, self.quote_engine.max_order_size)
                 else:
                     down_size = 0
-                    up_size = _repair_size(min(self.quote_engine.max_order_size, int(abs_imbalance)))
+                    up_size = repair_size_or_zero(min(self.quote_engine.max_order_size, int(abs_imbalance)), min_order_size)
                     repair_mode = "repair_up"
             else:
                 # If we're flat near expiry, we intentionally do not quote.
@@ -2701,9 +1567,10 @@ class MarketCycler:
         # Enforce live minimum order size before quote generation. In normal quoting
         # modes, round active-but-small sides up to the minimum. In close-only modes,
         # avoid over-repairing small residual inventory (< min_order_size).
-        up_size, down_size = _normalize_quote_sizes(
+        up_size, down_size = normalize_quote_sizes(
             up_size,
             down_size,
+            min_order_size,
             allow_round_up=not (inventory_repair or balance_only or phase in ["FINAL_SECONDS", "DEFENSIVE", "DEAD_ZONE"] or is_halted),
         )
 
@@ -2766,11 +1633,17 @@ class MarketCycler:
 
         # Book snapshots/FV blend were already computed before any early-return
         # path so dashboard, risk, sizing, and quotes all use one FV source.
-        if (repair_mode == "normal"
-                and not balance_only
-                and not is_halted
-                and basis_guard_triggered(model_fv, polymarket_mid_up)):
-            if abs_imbalance >= min_order_size:
+        basis_risk_decision = decide_basis_risk(
+            repair_mode=repair_mode,
+            balance_only=balance_only,
+            is_halted=is_halted,
+            model_fv=model_fv,
+            polymarket_mid_up=polymarket_mid_up,
+            abs_imbalance=abs_imbalance,
+            min_order_size=min_order_size,
+        )
+        if basis_risk_decision.triggered:
+            if basis_risk_decision.action == "close_only":
                 up_size, down_size, repair_mode = compute_inventory_repair_sizes(
                     imbalance,
                     min_order_size,
@@ -2818,6 +1691,7 @@ class MarketCycler:
             best_bid_yes=best_bid_yes,
             best_bid_no=best_bid_no,
         )
+        quote_policy = QuotePolicy()
         quotes.phase = phase
         quotes = apply_dust_price_guardrails(
             quotes,
@@ -2826,75 +1700,70 @@ class MarketCycler:
             best_ask_no=best_ask_no,
         )
 
-        # Directional market guard: graduated severity instead of binary block.
-        # At extreme FVs, the "cheap" side gets filled easily (adverse selection)
-        # while the expensive side doesn't fill, creating unmatched inventory.
-        #
-        # GRADUATED APPROACH (replaces the old binary FV >= 0.65 block):
-        #   FV 0.35-0.65: normal quoting (no change)
-        #   FV 0.65-0.80 or 0.20-0.35: reduce CHEAP side size by 50%
-        #   FV > 0.80 or FV < 0.20: block cheap side entirely (repair-only)
-        #
-        # This allows pair completion in moderate directional markets while
-        # protecting against extreme adverse selection.
-        if repair_mode == "normal":
-            if fv >= 0.80 or fv <= 0.20:
-                # Extreme: block the cheap/adverse side entirely
-                log.warning(
-                    "normal_quote_reduced_extreme_directional",
-                    asset=self.asset,
-                    fair_value=round(fv, 4),
-                    action="block_cheap_side",
-                )
-                if fv >= 0.80:
-                    # NO is cheap (adverse selection) → block NO
-                    quotes.no_buy_size = 0
-                else:
-                    # YES is cheap (adverse selection) → block YES
-                    quotes.yes_buy_size = 0
-            elif fv >= 0.65 or fv <= 0.35:
-                # Moderate: halve the cheap side to slow adverse fills
-                log.info(
-                    "normal_quote_reduced_moderate_directional",
-                    asset=self.asset,
-                    fair_value=round(fv, 4),
-                    action="halve_cheap_side",
-                )
-                if fv >= 0.65:
-                    # NO is cheap → halve NO size
-                    quotes.no_buy_size = max(0, int(quotes.no_buy_size * 0.5))
-                else:
-                    # YES is cheap → halve YES size
-                    quotes.yes_buy_size = max(0, int(quotes.yes_buy_size * 0.5))
+        # Balanced repair: if previous matched pairs locked a loss but current
+        # market prices offer a clearly profitable YES+NO pair, add equal size
+        # on both sides to offset the repair debt. This intentionally runs
+        # before directional guards so extreme-price repair pairs like
+        # YES 0.15 + NO 0.84 can remain two-sided when config permits it.
+        balanced_repair_plan = plan_balanced_negative_edge_repair(
+            pos,
+            yes_price=quotes.yes_buy_price,
+            no_price=quotes.no_buy_price,
+            min_order_size=min_order_size,
+            max_order_size=self.quote_engine.max_order_size,
+            config=self.balanced_repair_config,
+            remaining_seconds=remaining,
+            abs_imbalance=abs_imbalance,
+            is_halted=is_halted,
+            close_only_phase=close_only_phase,
+            small_capital_enabled=self._small_capital_enabled(),
+        )
+        if balanced_repair_plan.mode == "balanced_repair":
+            quotes.yes_buy_size = balanced_repair_plan.yes_size
+            quotes.no_buy_size = balanced_repair_plan.no_size
+            repair_mode = "balanced_repair"
+            quotes.combined_cost = round(float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0), 4)
+            quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
+            log.warning(
+                "balanced_repair_quote_planned",
+                asset=self.asset,
+                market=market.market_id[:8],
+                yes_price=quotes.yes_buy_price,
+                no_price=quotes.no_buy_price,
+                size=balanced_repair_plan.yes_size,
+                pair_cost=balanced_repair_plan.metadata.get("pair_cost"),
+                pair_edge=balanced_repair_plan.metadata.get("pair_edge"),
+                debt=balanced_repair_plan.metadata.get("debt"),
+                needed_pairs=balanced_repair_plan.metadata.get("needed_pairs"),
+            )
 
-        # 12.25 Pair-cost pre-check: block the adverse side if both-side
-        # fill would create negative-edge pairs. This is a HARD guard that
-        # catches scenarios like YES@$0.46 + NO@$0.71 = $1.17 before they
-        # happen. Unlike the post-generation combined-cost enforcement in
-        # quote_engine (which drops the heavy side price), this blocks the
-        # side that's LIKELY TO FILL FIRST (the cheap side in a directional
-        # market).
-        if (repair_mode == "normal"
-                and quotes.yes_buy_size > 0
-                and quotes.no_buy_size > 0):
-            proposed_combined = float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0)
-            if proposed_combined > MAX_COMBINED_COST:
-                log.warning(
-                    "pair_cost_precheck_blocking_adverse_side",
-                    asset=self.asset,
-                    combined=round(proposed_combined, 4),
-                    max_allowed=MAX_COMBINED_COST,
-                    yes_price=quotes.yes_buy_price,
-                    no_price=quotes.no_buy_price,
-                    fair_value=round(fv, 4),
-                )
-                # Block the CHEAP side (it fills first and creates the problem)
-                if fv >= 0.50:
-                    # YES is expensive, NO is cheap → block NO
-                    quotes.no_buy_size = 0
-                else:
-                    # NO is expensive, YES is cheap → block YES
-                    quotes.yes_buy_size = 0
+        directional_action = apply_directional_market_guard(quotes, fv, repair_mode)
+        if directional_action == "block_cheap_side":
+            log.warning(
+                "normal_quote_reduced_extreme_directional",
+                asset=self.asset,
+                fair_value=round(fv, 4),
+                action=directional_action,
+            )
+        elif directional_action == "halve_cheap_side":
+            log.info(
+                "normal_quote_reduced_moderate_directional",
+                asset=self.asset,
+                fair_value=round(fv, 4),
+                action=directional_action,
+            )
+
+        proposed_combined = float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0)
+        if apply_pair_cost_precheck(quotes, fv, repair_mode, MAX_COMBINED_COST):
+            log.warning(
+                "pair_cost_precheck_blocking_adverse_side",
+                asset=self.asset,
+                combined=round(proposed_combined, 4),
+                max_allowed=MAX_COMBINED_COST,
+                yes_price=quotes.yes_buy_price,
+                no_price=quotes.no_buy_price,
+                fair_value=round(fv, 4),
+            )
 
         # 12.35 FV-favored entry mode: when flat, start by buying only the side
         # the model likes (e.g. FV=0.60 => YES first). Once that side fills,
@@ -3050,69 +1919,54 @@ class MarketCycler:
                         no_size=quotes.no_buy_size,
                     )
 
-            # After capital scaling/backoff, drop any active side that fell below
-            # Polymarket's minimum order size. Dust-normalization is an atomic
-            # paired plan: if either leg is no longer valid, cancel both rather
-            # than leaving a one-sided top-up landmine.
-            quotes.yes_buy_size, quotes.no_buy_size = _normalize_quote_sizes(
-                quotes.yes_buy_size,
-                quotes.no_buy_size,
+            # QuotePolicy owns the post-capital quote invariants: minimum live
+            # sizes, close-only repair side enforcement, and normal-mode
+            # atomicity. MarketCycler only emits side effects for the decision.
+            post_capital_decision = quote_policy.apply_post_capital_safety(
+                quotes,
+                min_order_size=min_order_size,
                 allow_round_up=False,
+                repair_mode=repair_mode,
+                abs_imbalance=abs_imbalance,
+                fv_entry_side=fv_entry_side,
+                sct_entry_side=sct_entry_side,
+                merge_blocked=self._merge_unavailable_until > _time.time(),
+                atomic_reason="NORMAL_QUOTE_NOT_ATOMIC",
             )
-            if repair_mode.startswith("dust_") and (
-                quotes.yes_buy_size < min_order_size or quotes.no_buy_size < min_order_size
-            ):
-                quotes.yes_buy_size = 0
-                quotes.no_buy_size = 0
-
-            # Final invariant after all capital/backoff transforms: repair mode
-            # is close-only. repair_up means Down is heavy, so quote YES only;
-            # repair_down means Up is heavy, so quote NO only.
-            if repair_mode == "repair_up":
-                quotes.no_buy_size = 0
-            elif repair_mode == "repair_down":
-                quotes.yes_buy_size = 0
-
-            # Normal/balanced quoting is atomic unless we intentionally entered
-            # FV-favored one-sided entry mode while flat. Capital scaling/backoff
-            # must not accidentally turn a balanced market into a one-sided bet.
-            if repair_mode == "normal" and abs_imbalance < min_order_size:
-                one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
-                merge_blocked = self._merge_unavailable_until > _time.time()
-                allowed_fv_entry = fv_entry_side in ("yes", "no") and one_sided_normal and not merge_blocked
-                allowed_sct_entry = sct_entry_side in ("yes", "no") and one_sided_normal and not merge_blocked
-                if (one_sided_normal and not (allowed_fv_entry or allowed_sct_entry)) or merge_blocked:
-                    log.warning(
-                        "normal_quote_blocked_not_atomic",
-                        asset=self.asset,
-                        yes_size=quotes.yes_buy_size,
-                        no_size=quotes.no_buy_size,
-                        merge_blocked=merge_blocked,
-                        imbalance=round(imbalance, 4),
-                    )
-                    quotes.yes_buy_size = 0
-                    quotes.no_buy_size = 0
+            if not post_capital_decision.allowed and post_capital_decision.reason == "NORMAL_QUOTE_NOT_ATOMIC":
+                log.warning(
+                    "normal_quote_blocked_not_atomic",
+                    asset=self.asset,
+                    yes_size=post_capital_decision.metadata.get("before", {}).get("yes_size", quotes.yes_buy_size),
+                    no_size=post_capital_decision.metadata.get("before", {}).get("no_size", quotes.no_buy_size),
+                    merge_blocked=post_capital_decision.metadata.get("merge_blocked", False),
+                    imbalance=round(imbalance, 4),
+                )
         except Exception:
             # Never fail a cycle due to sizing guardrails.
             pass
 
-        # Belt-and-suspenders atomicity check outside the guardrail try-block:
+        # Belt-and-suspenders safety check outside the guardrail try-block:
         # flat normal mode must be both-side, no-side, or an explicitly allowed
-        # FV entry. It must never accidentally leak one naked side.
-        if repair_mode == "normal" and abs_imbalance < min_order_size:
-            one_sided_normal = (quotes.yes_buy_size > 0) != (quotes.no_buy_size > 0)
-            allowed_fv_entry = fv_entry_side in ("yes", "no") and one_sided_normal
-            allowed_sct_entry = sct_entry_side in ("yes", "no") and one_sided_normal
-            if one_sided_normal and not (allowed_fv_entry or allowed_sct_entry):
-                log.warning(
-                    "normal_quote_blocked_not_atomic_final",
-                    asset=self.asset,
-                    yes_size=quotes.yes_buy_size,
-                    no_size=quotes.no_buy_size,
-                    imbalance=round(imbalance, 4),
-                )
-                quotes.yes_buy_size = 0
-                quotes.no_buy_size = 0
+        # entry mode, and repair modes must remain close-only.
+        final_post_capital_decision = quote_policy.apply_post_capital_safety(
+            quotes,
+            min_order_size=min_order_size,
+            allow_round_up=False,
+            repair_mode=repair_mode,
+            abs_imbalance=abs_imbalance,
+            fv_entry_side=fv_entry_side,
+            sct_entry_side=sct_entry_side,
+            atomic_reason="NORMAL_QUOTE_NOT_ATOMIC_FINAL",
+        )
+        if not final_post_capital_decision.allowed and final_post_capital_decision.reason == "NORMAL_QUOTE_NOT_ATOMIC_FINAL":
+            log.warning(
+                "normal_quote_blocked_not_atomic_final",
+                asset=self.asset,
+                yes_size=final_post_capital_decision.metadata.get("before", {}).get("yes_size", quotes.yes_buy_size),
+                no_size=final_post_capital_decision.metadata.get("before", {}).get("no_size", quotes.no_buy_size),
+                imbalance=round(imbalance, 4),
+            )
 
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
             self._set_dashboard_event("skip", "NO_QUOTES", halt_reason if is_halted else phase)
@@ -3174,19 +2028,34 @@ class MarketCycler:
                     has_resting_opening_quote,
                     int(pos.matched_pairs() or 0),
                 ):
-                    log.info(
-                        "small_capital_holding_opening_quote",
-                        asset=self.asset,
-                        market=market.market_id[:8],
-                        msg="opening quote already placed; holding without normal repricing",
+                    reprice_side = self._apply_small_capital_opening_reprice_guard(
+                        market.market_id,
+                        quotes,
+                        sct_state,
+                        min_order_size,
                     )
+                    if not reprice_side:
+                        log.warning(
+                            "small_capital_opening_reprice_side_unknown",
+                            asset=self.asset,
+                            market=market.market_id[:8],
+                            msg="opening quote is resting but side could not be inferred; holding without reprice",
+                        )
+                        self._set_dashboard_event(
+                            "info",
+                            "SMALL_CAP_HOLD_OPENING",
+                            "opening quote already placed; waiting for fill/cancel",
+                        )
+                        self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_HOLD_OPENING", remaining)
+                        return
                     self._set_dashboard_event(
                         "info",
-                        "SMALL_CAP_HOLD_OPENING",
-                        "opening quote already placed; waiting for fill/cancel",
+                        "SMALL_CAP_REPRICE_OPENING",
+                        f"repricing existing {reprice_side} opening quote",
                     )
-                    self._update_dashboard(market, spot, fv, sigma, "SMALL_CAP_HOLD_OPENING", remaining)
-                    return
+                    # Continue to universal guards and update_quotes.
+                    # OrderManager will cancel/replace only if the target price
+                    # materially changed; otherwise existing queue priority stays.
                 elif not has_resting_opening_quote:
                     log.warning(
                         "small_capital_no_second_opening_quote",
@@ -3204,16 +2073,15 @@ class MarketCycler:
                     return
 
         # Absolute post-generation invariant: if inventory is already imbalanced
-        # by at least one live-min order, do not quote the heavy side. This is a
-        # final backstop against quote-engine/capital transforms reintroducing
-        # the side we are trying to stop buying.
-        if abs(pos.share_imbalance()) >= min_order_size:
-            if pos.share_imbalance() > 0:
-                quotes.yes_buy_size = 0
-                repair_mode = "repair_down"
-            else:
-                quotes.no_buy_size = 0
-                repair_mode = "repair_up"
+        # by at least one live-min order, QuotePolicy blocks the heavy side
+        # before pair-cost caps are computed for the remaining repair quote.
+        heavy_side_decision = quote_policy.enforce_inventory_heavy_side(
+            quotes,
+            pos.share_imbalance(),
+            min_order_size,
+            repair_mode,
+        )
+        repair_mode = heavy_side_decision.metadata.get("repair_mode", repair_mode)
 
         # ──────────────────────────────────────────────────────────
         # Universal pair-cost guard: cap EACH side's bid against
@@ -3234,117 +2102,136 @@ class MarketCycler:
                 continue
 
             pair_edge = repair_min_edge_for_remaining(remaining, repair_mode)
-            cap = float(pos.max_profitable_repair_price(
-                side_label, size_val, min_edge=pair_edge))
+            cap_decision = plan_repair_price_cap(
+                pos,
+                side_label,
+                size_val,
+                fv,
+                min_edge=pair_edge,
+                repair_mode=repair_mode,
+                small_capital_opening_spent=sct_opening_spent,
+                small_capital_state=self._small_capital_state(market.market_id) if sct_opening_spent else None,
+                small_capital_config=getattr(self, "small_capital_config", None),
+                abs_imbalance=abs_imbalance,
+            )
+            cap = float(cap_decision.cap)
+            sct_guard_source = cap_decision.source
 
-            sct_saved_cap = None
-            sct_guard_source = "fifo"
-            if sct_opening_spent:
-                is_sct_repair_side = (repair_mode == f"repair_{side_label}"
-                                      or (side_label == "yes" and repair_mode == "repair_up")
-                                      or (side_label == "no" and repair_mode == "repair_down"))
-                if is_sct_repair_side:
-                    sct_state_for_cap = self._small_capital_state(market.market_id)
-                    emergency_cap, emergency_active, emergency_elapsed = self._small_capital_emergency_hedge_cap(
-                        sct_state_for_cap,
-                        side_label,
+
+            if cap_decision.blocked:
+                if cap_decision.reason == "SMALL_CAPITAL_EMERGENCY_HEDGE_MISSING_ENTRY_PRICE":
+                    log.warning(
+                        "small_capital_emergency_hedge_blocked_missing_entry_price",
+                        market=market.market_id[:8],
+                        side=side_label,
+                        quoted=price_val,
+                        mode=repair_mode,
+                        elapsed=round(float(cap_decision.metadata.get("emergency_elapsed", 0.0) or 0.0), 2),
+
                     )
-                    if emergency_active:
-                        if emergency_cap is None and abs_imbalance > 0:
-                            log.warning(
-                                "small_capital_emergency_hedge_blocked_missing_entry_price",
-                                market=market.market_id[:8],
-                                side=side_label,
-                                quoted=price_val,
-                                mode=repair_mode,
-                                elapsed=round(emergency_elapsed, 2),
-                            )
-                            setattr(quotes, buy_size_attr, 0)
-                            continue
-                        if emergency_cap is not None:
-                            cap = float(emergency_cap)
-                            sct_guard_source = "small_capital_emergency_hedge"
-                            self._set_dashboard_event(
-                                "warn",
-                                "SMALL_CAP_EMERGENCY_HEDGE",
-                                f"{side_label} cap {cap:.2f} after {emergency_elapsed:.0f}s",
-                            )
-                            log.warning(
-                                "small_capital_emergency_hedge_active",
-                                market=market.market_id[:8],
-                                side=side_label,
-                                cap=round(cap, 4),
-                                elapsed=round(emergency_elapsed, 2),
-                                quoted=price_val,
-                                mode=repair_mode,
-                            )
-                    elif cap >= 0.99:
-                        sct_saved_cap = self._small_capital_saved_repair_cap(
-                            sct_state_for_cap,
-                            side_label,
-                            pair_edge,
-                        )
-                        if sct_saved_cap is None and abs_imbalance > 0:
-                            log.warning(
-                                "small_capital_repair_blocked_missing_entry_price",
-                                market=market.market_id[:8],
-                                side=side_label,
-                                quoted=price_val,
-                                mode=repair_mode,
-                                imbalance=round(imbalance, 4),
-                            )
-                            setattr(quotes, buy_size_attr, 0)
-                            continue
-                        if sct_saved_cap is not None:
-                            cap = min(cap, float(sct_saved_cap))
-                            sct_guard_source = "small_capital_saved_entry"
+                else:
+                    log.warning(
+                        "small_capital_repair_blocked_missing_entry_price",
+                        market=market.market_id[:8],
+                        side=side_label,
+                        quoted=price_val,
+                        mode=repair_mode,
+                        imbalance=round(imbalance, 4),
+                    )
+                setattr(quotes, buy_size_attr, 0)
+                continue
+
+            if sct_guard_source == "small_capital_emergency_hedge":
+                emergency_elapsed = float(cap_decision.metadata.get("emergency_elapsed", 0.0) or 0.0)
+                self._set_dashboard_event(
+                    "warn",
+                    "SMALL_CAP_EMERGENCY_HEDGE",
+                    f"{side_label} cap {cap:.2f} after {emergency_elapsed:.0f}s",
+                )
+                log.warning(
+                    "small_capital_emergency_hedge_active",
+                    market=market.market_id[:8],
+                    side=side_label,
+                    cap=round(cap, 4),
+                    elapsed=round(emergency_elapsed, 2),
+                    quoted=price_val,
+                    mode=repair_mode,
+                )
 
             # No unmatched fills on opposite → cap is 0.99, no constraint
             if cap >= 0.99:
                 continue
 
-            is_repair = (repair_mode == f"repair_{side_label}"
-                         or (side_label == "yes" and repair_mode == "repair_up")
-                         or (side_label == "no" and repair_mode == "repair_down"))
-
-            if cap < 0.01:
+            pair_cost_decision = quote_policy.apply_pair_cost_side_guard(
+                quotes,
+                side_label=side_label,
+                repair_mode=repair_mode,
+                cap=cap,
+                pair_edge=pair_edge,
+                best_ask=best_ask,
+                best_bid=best_bid,
+                aggressive_price_fn=aggressive_repair_price,
+                guard_source=sct_guard_source,
+            )
+            if pair_cost_decision.reason == "PAIR_COST_BLOCKED":
                 log.warning("pair_cost_guard_blocked",
                             market=market.market_id[:8], side=side_label,
                             quoted=price_val, cap=round(cap, 4),
                             mode=repair_mode)
-                setattr(quotes, buy_size_attr, 0)
-            elif is_repair:
-                # In repair mode: use aggressive pricing up to cap
-                old_price = price_val
-                new_price = aggressive_repair_price(
-                    price_val, cap, best_ask=best_ask, best_bid=best_bid)
-                if new_price is None:
-                    setattr(quotes, buy_size_attr, 0)
-                else:
-                    if old_price and old_price > cap:
-                        log.warning("repair_quote_capped_for_pair_edge",
-                                    market=market.market_id[:8], side=side_label,
-                                    quoted=old_price, cap=round(cap, 4),
-                                    min_edge=pair_edge,
-                                    source=sct_guard_source)
-                    elif new_price > float(old_price or 0):
-                        log.info("repair_quote_aggressed_to_cap",
-                                 market=market.market_id[:8], side=side_label,
-                                 old=old_price, new=new_price,
-                                 cap=round(cap, 4), min_edge=pair_edge,
-                                 best_ask=best_ask)
-                    setattr(quotes, buy_price_attr, new_price)
-            elif float(price_val) > cap:
+            elif pair_cost_decision.reason == "REPAIR_QUOTE_CAPPED_FOR_PAIR_EDGE":
+                log.warning("repair_quote_capped_for_pair_edge",
+                            market=market.market_id[:8], side=side_label,
+                            quoted=pair_cost_decision.metadata.get("old_price"), cap=round(cap, 4),
+                            min_edge=pair_edge,
+                            source=sct_guard_source)
+            elif pair_cost_decision.reason == "REPAIR_QUOTE_AGGRESSED_TO_CAP":
+                log.info("repair_quote_aggressed_to_cap",
+                         market=market.market_id[:8], side=side_label,
+                         old=pair_cost_decision.metadata.get("old_price"),
+                         new=pair_cost_decision.metadata.get("new_price"),
+                         cap=round(cap, 4), min_edge=pair_edge,
+                         best_ask=best_ask)
+            elif pair_cost_decision.reason == "PAIR_COST_CLAMPED":
                 # Normal mode: silently clamp to cap
                 log.info("pair_cost_guard_clamped",
                          market=market.market_id[:8], side=side_label,
                          quoted=price_val, cap=round(cap, 4),
                          mode=repair_mode)
-                setattr(quotes, buy_price_attr, round(cap, 2))
 
         quotes.combined_cost = round(float(quotes.yes_buy_price or 0) + float(quotes.no_buy_price or 0), 4)
         quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
 
+        if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
+            self._set_dashboard_event("skip", "NO_QUOTES", halt_reason if is_halted else phase)
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
+
+        final_quote_decision = quote_policy.apply_final_inventory_safety(
+            quotes,
+            imbalance=pos.share_imbalance(),
+            min_order_size=min_order_size,
+            repair_mode=repair_mode,
+            max_combined_cost=MAX_COMBINED_COST,
+        )
+        repair_mode = final_quote_decision.metadata.get("repair_mode", repair_mode)
+        if not final_quote_decision.allowed:
+            log.warning(
+                "final_quote_validation_failed",
+                market=market.market_id,
+                reason=final_quote_decision.reason,
+                **final_quote_decision.metadata,
+            )
+            self._set_dashboard_event("skip", final_quote_decision.reason, str(final_quote_decision.metadata)[:160])
+            await self.order_mgr.cancel_market_quotes(market.market_id)
+            self._update_dashboard(market, spot, fv, sigma, halt_reason if is_halted else phase, remaining)
+            return
+        quotes.combined_cost = round(
+            (float(quotes.yes_buy_price or 0) if quotes.yes_buy_size else 0.0)
+            + (float(quotes.no_buy_price or 0) if quotes.no_buy_size else 0.0),
+            4,
+        )
+        quotes.edge_per_pair = round(1.0 - quotes.combined_cost, 4)
         if quotes.yes_buy_size == 0 and quotes.no_buy_size == 0:
             self._set_dashboard_event("skip", "NO_QUOTES", halt_reason if is_halted else phase)
             await self.order_mgr.cancel_market_quotes(market.market_id)
@@ -3416,60 +2303,94 @@ class MarketCycler:
             wallet_truth, wallet_snapshot = await self._refresh_wallet_truth_for_market(market)
         if fills and await self._small_capital_maybe_stop_completed(market, pos, "post_fill_balanced", wallet_snapshot=wallet_snapshot):
             return
-        if fills and has_negative_matched_pair_edge(pos):
-            pairs = int(pos.matched_pairs())
-            log.critical(
-                "negative_pair_edge_halt",
-                asset=self.asset,
-                market=market.market_id[:8],
-                matched_pairs=pairs,
-                pair_pnl=round(pos.matched_pair_profit(), 4),
-                msg="Matched pair cost exceeded 1 after fill; merging and stopping this market",
+        post_fill_negative_pair_edge = decide_negative_pair_edge(pos) if fills else None
+        if post_fill_negative_pair_edge and post_fill_negative_pair_edge.triggered:
+            pairs = post_fill_negative_pair_edge.matched_pairs
+            debt_eligible, debt_reason, debt_meta = balanced_repair_debt_eligible(
+                pos, self.balanced_repair_config
             )
-            # Merge the negative-edge pairs to recover capital before halting.
-            # The loss is locked in from fills; leaving pairs unmerged just
-            # abandons capital on-chain.
-            if pairs > 0:
-                condition_id = getattr(pos, "condition_id", None) or market.market_id
-                amount = int(pairs * 1e6)
-                tx = None
-                collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
-                if self.gasless_merger and self.gasless_merger.is_available:
-                    tx = await self.gasless_merger.merge_positions(
-                        condition_id, amount, collateral_token=collateral_token)
-                if tx:
-                    profit = pos.matched_pair_profit()
-                    self.pnl.record_settlement(profit, market.market_id)
-                    self.pnl.record_capital_recovery(pairs * 1.0)
-                    pos.acknowledge_settlement()
-                    log.info("negative_pair_edge_force_merged",
-                             pairs=pairs, profit=f"${profit:.4f}", tx=str(tx)[:16])
-                    sync_fn = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
-                    if callable(sync_fn):
-                        await asyncio.sleep(3)
-                        try:
-                            await sync_fn()
-                        except Exception:
-                            pass
-            await self.order_mgr.cancel_market_quotes(market.market_id)
-            self.stop_reason = "negative_pair_edge_halt"
-            self._set_dashboard_event("error", "NEGATIVE_PAIR_EDGE", "matched pair cost exceeded 1")
-            self._running = False
-            return
+            if debt_eligible and not self._small_capital_enabled():
+                log.warning(
+                    "negative_pair_edge_balanced_repair_after_fill",
+                    asset=self.asset,
+                    market=market.market_id[:8],
+                    matched_pairs=pairs,
+                    pair_pnl=round(post_fill_negative_pair_edge.pair_pnl, 4),
+                    debt=debt_meta.get("debt"),
+                    msg="Negative pair edge accepted as repair debt; future balanced pairs must offset it",
+                )
+                self._set_dashboard_event(
+                    "warn",
+                    "BALANCED_REPAIR_DEBT",
+                    f"debt ${float(debt_meta.get('debt', 0) or 0):.2f}",
+                )
+            else:
+                log.critical(
+                    "negative_pair_edge_halt",
+                    asset=self.asset,
+                    market=market.market_id[:8],
+                    matched_pairs=pairs,
+                    pair_pnl=round(post_fill_negative_pair_edge.pair_pnl, 4),
+                    balanced_repair_reason=debt_reason,
+                    msg="Matched pair cost exceeded 1 after fill; merging and stopping this market",
+                )
+                # Merge the negative-edge pairs to recover capital before halting.
+                # The loss is locked in from fills; leaving pairs unmerged just
+                # abandons capital on-chain.
+                if pairs > 0:
+                    condition_id = getattr(pos, "condition_id", None) or market.market_id
+                    amount = int(pairs * 1e6)
+                    tx = None
+                    collateral_token = getattr(self.gasless_merger, "_collateral_token", "") if self.gasless_merger else ""
+                    if self.gasless_merger and self.gasless_merger.is_available:
+                        tx = await self.gasless_merger.merge_positions(
+                            condition_id, amount, collateral_token=collateral_token)
+                    if tx:
+                        profit = pos.matched_pair_profit()
+                        self.pnl.record_settlement(profit, market.market_id)
+                        self.pnl.record_capital_recovery(pairs * 1.0)
+                        pos.acknowledge_settlement()
+                        log.info("negative_pair_edge_force_merged",
+                                 pairs=pairs, profit=f"${profit:.4f}", tx=str(tx)[:16])
+                        sync_fn = getattr(self.order_mgr.executor, "sync_balance_allowance", None)
+                        if callable(sync_fn):
+                            await asyncio.sleep(3)
+                            try:
+                                await sync_fn()
+                            except Exception:
+                                pass
+                await self.order_mgr.cancel_market_quotes(market.market_id)
+                self.stop_reason = "negative_pair_edge_halt"
+                self._set_dashboard_event("error", "NEGATIVE_PAIR_EDGE", "matched pair cost exceeded 1")
+                self._running = False
+                return
 
         # 15.5. Auto-merge check: dollar-based threshold OR low balance. The
         # 2-minute pre-expiry force merge runs earlier so it is not skipped by
         # quote/order early returns.
         force_merge = False
         merge_reason = "routine"
-        # Dollar-based mid-market merge trigger
-        if not force_merge and self.inventory.should_merge(market.market_id):
+        debt_eligible_for_repair, _, debt_repair_meta = balanced_repair_debt_eligible(
+            pos, self.balanced_repair_config
+        )
+        suppress_routine_merge_for_repair = debt_eligible_for_repair and not self._small_capital_enabled()
+        # Dollar-based mid-market merge trigger. If balanced repair is armed,
+        # keep the negative debt visible so profitable new pairs can offset it;
+        # low-balance/pre-expiry merge paths may still recover capital.
+        if not force_merge and self.inventory.should_merge(market.market_id) and not suppress_routine_merge_for_repair:
             force_merge = True
             merge_reason = "dollar_threshold"
             log.info("dollar_threshold_merge_triggered",
                      asset=self.asset,
                      locked=f"${pos.locked_capital():.2f}",
                      threshold=f"${self.inventory.auto_merge_dollar_threshold:.2f}")
+        elif suppress_routine_merge_for_repair:
+            log.info(
+                "dollar_threshold_merge_suppressed_for_balanced_repair",
+                asset=self.asset,
+                debt=debt_repair_meta.get("debt"),
+                locked=f"${pos.locked_capital():.2f}",
+            )
 
         if self.balance_monitor:
             merge_result = await self.balance_monitor.check_and_merge(
@@ -3498,198 +2419,29 @@ class MarketCycler:
                                 quotes, pos, imbalance, inv_state.value)
 
     def _update_dashboard_waiting(self):
-        if not self._dashboard_cb:
-            return
-            
-        spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, 0)
-        price_age = (self.price_feed.get_price_age(self.ac.symbol)
-                     if hasattr(self.price_feed, "get_price_age") else 0)
-        price_source = (self.price_feed.get_price_source(self.ac.symbol)
-                        if hasattr(self.price_feed, "get_price_source") else "unknown")
-        
-        state = {
-            "asset": self.asset,
-            "market_id": "waiting...",
-            "slug": "Waiting for next Polymarket window...",
-            "question": "",
-            "start_price": 0,
-            "spot_price": spot,
-            "raw_spot": spot,
-            "chainlink_spread": 0,
-            "price_age": price_age,
-            "price_source": price_source,
-            "fair_value": 0,
-            "sigma": 0,
-            "ws_ticks": getattr(self.price_feed, "ticks", 0),
-            "phase": "WAITING",
-            "time_remaining": 0,
-            "regime": "WAITING",
-            "up_buy": 0,
-            "down_buy": 0,
-            "up_size": 0,
-            "down_size": 0,
-            "combined_cost": 0,
-            "edge": 0,
-            "up_shares": 0,
-            "down_shares": 0,
-            "up_avg": 0,
-            "down_avg": 0,
-            "share_imbalance": 0,
-            "dollar_delta": 0,
-            "matched_pairs": 0,
-            "avg_pair_cost": 0,
-            "matched_pair_pnl": 0,
-            "negative_pair_edge": False,
-            "inv_state": "WAITING",
-            "net_trading_pnl": self.pnl.net_trading_pnl,
-            "outcome_pnl": self.pnl.outcome_pnl,
-            "est_rebates": self.pnl.est_rebates,
-            "net_pnl": self.pnl.net_pnl,
-            "economic_pnl": self.pnl.economic_pnl,
-            "rebates_per_hour": self.pnl.rebates_per_hour(),
-            "total_volume": self.pnl.total_volume,
-            "total_shares": self.pnl.total_shares,
-            "markets_settled": self.pnl.markets_settled,
-            "total_fills": self.pnl.total_fills,
-            "starting_capital": getattr(self.pnl, "starting_capital", 0),
-            "current_capital": getattr(self.pnl, "current_capital", 0),
-        }
-        
-        if self.balance_monitor:
-            bm_stats = self.balance_monitor.stats
-            state["wallet_balance"] = bm_stats["last_balance"]
-            state["auto_merges"] = bm_stats["total_merges"]
-            state["auto_merged_usdc"] = bm_stats["total_merged_usdc"]
-            state["balance_warn_threshold"] = self.balance_monitor.warn_balance
-            state["balance_merge_threshold"] = self.balance_monitor.merge_balance
-            state["merge_message"] = bm_stats.get("merge_message", "")
-            
-        self._dashboard_cb(state)
+        update_dashboard_waiting(self)
 
     def _max_spot_price_age_seconds(self) -> float:
-        """Allowed active spot age; Exness/MT5 can use its configured tolerance."""
+        """Allowed active spot age for live quoting.
+
+        Exness/MT5 is expected to refresh per quote cycle; do not let a large
+        bridge stale_seconds setting keep stale FV tradable for many seconds.
+        """
         if bool(getattr(self.price_feed, "mt5_bridge_url", "")):
-            return float(getattr(self.price_feed, "mt5_bridge_stale_seconds", MAX_SPOT_PRICE_AGE_SECONDS)
-                         or MAX_SPOT_PRICE_AGE_SECONDS)
+            configured = float(getattr(self.price_feed, "mt5_bridge_stale_seconds", MAX_EXNESS_PRICE_AGE_SECONDS)
+                               or MAX_EXNESS_PRICE_AGE_SECONDS)
+            return min(configured, MAX_EXNESS_PRICE_AGE_SECONDS)
         return MAX_SPOT_PRICE_AGE_SECONDS
 
     def _dashboard_sigma_for_stale_spot(self) -> float:
-        """Best dashboard sigma when spot is stale and model updates are paused."""
-        if self.last_sigma and self.last_sigma > 0:
-            return self.last_sigma
-        try:
-            sigma = self.vol_estimator.sigma_for_model()
-            if sigma and sigma > 0:
-                return sigma
-        except Exception:
-            pass
-        return float(getattr(self.ac, "default_sigma", 0) or 0)
+        return dashboard_sigma_for_stale_spot(self)
 
     def _update_dashboard(self, market, spot, fv, sigma, phase,
                            remaining, quotes=None, pos=None,
                            delta=0, inv_state="NORMAL"):
-        """Push state to dashboard callback.
-        
-        Always fetches the real position from inventory so that
-        shares/delta display correctly even when quotes are paused
-        (e.g., regime spike, risk halt, dead zone).
-        """
-        if not self._dashboard_cb:
-            return
 
-        start_price = (self.fair_value_model.start_price
-                       if self.fair_value_model else 0)
+        update_dashboard(self, market, spot, fv, sigma, phase, remaining, quotes, pos, delta, inv_state)
 
-        # Local inventory keeps cost basis/P&L. In live mode, wallet/ERC1155
-        # balances are the display/position truth because CLOB fills can lag.
-        real_pos = self.inventory.get_or_create(market.market_id, self.asset)
-        real_delta = real_pos.dollar_delta(fv) if fv else 0
-        real_state = self.inventory.get_state(market.market_id, fv)
-        wallet_snapshot = getattr(self, "_wallet_truth_by_market", {}).get(market.market_id)
-        display_up_shares = real_pos.yes_shares
-        display_down_shares = real_pos.no_shares
-        display_imbalance = real_pos.share_imbalance()
-        display_matched_pairs = real_pos.matched_pairs()
-        display_delta = real_delta
-        inventory_source = "local"
-        if wallet_snapshot:
-            display_up_shares = float(wallet_snapshot.get("yes_shares", 0) or 0)
-            display_down_shares = float(wallet_snapshot.get("no_shares", 0) or 0)
-            display_imbalance = float(wallet_snapshot.get("share_imbalance", display_up_shares - display_down_shares) or 0)
-            display_matched_pairs = float(wallet_snapshot.get("matched_pairs", min(display_up_shares, display_down_shares)) or 0)
-            display_delta = (display_up_shares * fv - display_down_shares * (1 - fv)) if fv else 0
-            inventory_source = "wallet"
-
-        raw_spot = getattr(self.price_feed, 'prices', {}).get(self.ac.symbol, spot)
-        price_age = (self.price_feed.get_price_age(self.ac.symbol)
-                     if hasattr(self.price_feed, "get_price_age") else 0)
-        price_source = (self.price_feed.get_price_source(self.ac.symbol)
-                        if hasattr(self.price_feed, "get_price_source") else "unknown")
-        
-        state = {
-            "asset": self.asset,
-            "market_id": market.market_id,
-            "slug": market.slug,
-            "question": market.question,
-            "start_price": start_price or 0,
-            "spot_price": spot or 0,
-            "raw_spot": raw_spot or 0,
-            "chainlink_spread": getattr(self, 'chainlink_spread', 0),
-            "price_age": price_age,
-            "price_source": price_source,
-            "fair_value": fv,
-            "sigma": sigma,
-            "ws_ticks": getattr(self.price_feed, "ticks", 0),
-            "phase": phase,
-            "time_remaining": remaining,
-            "regime": self.regime_filter.regime(),
-            "up_buy": quotes.yes_buy_price if quotes else 0,
-            "down_buy": quotes.no_buy_price if quotes else 0,
-            "up_size": quotes.yes_buy_size if quotes else 0,
-            "down_size": quotes.no_buy_size if quotes else 0,
-            "combined_cost": quotes.combined_cost if quotes else 0,
-            "edge": quotes.edge_per_pair if quotes else 0,
-            # Display live wallet truth when available; keep local averages/P&L.
-            "up_shares": display_up_shares,
-            "down_shares": display_down_shares,
-            "up_avg": real_pos.yes_avg_entry,
-            "down_avg": real_pos.no_avg_entry,
-            "share_imbalance": display_imbalance,
-            "dollar_delta": display_delta,
-            "matched_pairs": display_matched_pairs,
-            "avg_pair_cost": real_pos.avg_matched_pair_cost(),
-            "matched_pair_pnl": real_pos.matched_pair_profit(),
-            "negative_pair_edge": has_negative_matched_pair_edge(real_pos),
-            "inventory_source": inventory_source,
-            "inv_state": real_state.value,
-            # P&L with rebates and outcomes
-            "net_trading_pnl": self.pnl.net_trading_pnl,
-            "outcome_pnl": self.pnl.outcome_pnl,
-            "est_rebates": self.pnl.est_rebates,
-            "net_pnl": self.pnl.net_pnl,
-            "economic_pnl": self.pnl.economic_pnl,
-            "rebates_per_hour": self.pnl.rebates_per_hour(),
-            "total_volume": self.pnl.total_volume,
-            "total_shares": self.pnl.total_shares,
-            "markets_settled": self.pnl.markets_settled,
-            "total_fills": self.pnl.total_fills,
-            "starting_capital": getattr(self.pnl, "starting_capital", 0),
-            "current_capital": getattr(self.pnl, "current_capital", 0),
-        }
-        if getattr(self, "_dashboard_event", None):
-            state.update(self._dashboard_event)
-
-        # Add balance monitor stats (live mode only)
-        if self.balance_monitor:
-            bm_stats = self.balance_monitor.stats
-            state["wallet_balance"] = bm_stats["last_balance"]
-            state["auto_merges"] = bm_stats["total_merges"]
-            state["auto_merged_usdc"] = bm_stats["total_merged_usdc"]
-            state["balance_warn_threshold"] = self.balance_monitor.warn_balance
-            state["balance_merge_threshold"] = self.balance_monitor.merge_balance
-            state["merge_message"] = bm_stats.get("merge_message", "")
-
-        self._dashboard_cb(state)
 
     async def stop(self):
         self._running = False

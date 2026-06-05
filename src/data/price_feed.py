@@ -17,6 +17,7 @@ from urllib.parse import urlparse, urlunparse
 
 import websockets
 
+from src.market_data.feed_health import FeedFreshness, freshness
 from src.monitoring.logger import get_logger
 
 log = get_logger("price_feed")
@@ -119,6 +120,17 @@ class PriceFeed:
             # it must not appear as the active source while MT5 is configured.
             return "exness_mt5_unavailable"
         return self.price_sources.get(sym, "unknown")
+
+    def get_feed_freshness(self, symbol: str, max_age_seconds: float | None = None) -> FeedFreshness:
+        """Read-only market_data compatibility wrapper for active feed freshness."""
+        max_age = self.mt5_bridge_stale_seconds if max_age_seconds is None else max_age_seconds
+        active_price = self.get_price(symbol)
+        age_seconds = self.get_price_age(symbol) if active_price is not None else float("inf")
+        return freshness(
+            age_seconds=age_seconds,
+            max_age_seconds=max_age,
+            source=self.get_price_source(symbol),
+        )
 
     def _mt5_active(self, symbol: str) -> bool:
         """True when Exness/MT5 is the current fresh primary spot."""

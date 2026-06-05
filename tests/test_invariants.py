@@ -22,6 +22,7 @@ from src.orchestration.market_cycler import (
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     blended_fair_value,
+    cap_fair_value_to_market,
     fv_model_confidence,
     has_negative_matched_pair_edge,
     polymarket_implied_up_mid,
@@ -35,6 +36,7 @@ from src.risk.risk_engine import pre_trade_checks
 from src.risk.toxicity import FillEdgeTracker, ToxicityMonitor
 from src.strategy.inventory import InventoryManager, InventoryState
 from src.strategy.quote_engine import MAX_COMBINED_COST, QuoteEngine
+from src.strategy.volatility import MIN_BINARY_MODEL_SIGMA, VolatilityEstimator
 
 
 class DummyExecutor:
@@ -119,6 +121,20 @@ def test_dashboard_fair_value_peek_does_not_mutate_authoritative_state():
     assert model._last_update_ts == last_ts
 
 
+def test_binary_volatility_floor_prevents_raw_model_pin_to_certain():
+    model = UpDownFairValue(event_start_ts=1000, resolve_ts=1900, start_price=100_000.0)
+    # A 0.20% move with 10m left is enough to pin raw FV near certainty if the
+    # annualized sigma is configured at 20%.
+    too_low_sigma_fv = model.fair_value(100_200.0, sigma_annualized=0.20, now_ts=1300, update_state=False)
+    estimator = VolatilityEstimator(default_sigma=0.20)
+    floored_sigma = estimator.sigma_for_model()
+    floored_fv = model.fair_value(100_200.0, sigma_annualized=floored_sigma, now_ts=1300, update_state=False)
+
+    assert too_low_sigma_fv > 0.98
+    assert floored_sigma == pytest.approx(MIN_BINARY_MODEL_SIGMA)
+    assert floored_fv < 0.82
+
+
 def test_blended_fair_value_prevents_early_window_overconfidence():
     model_fv = 0.95
     confidence = fv_model_confidence(
@@ -156,6 +172,12 @@ def test_blended_fair_value_missing_book_tempers_to_neutral():
     final_fv = blended_fair_value(0.90, None, confidence)
 
     assert 0.50 < final_fv < 0.60
+
+
+def test_trading_fair_value_is_capped_near_polymarket_price_when_model_is_optimistic():
+    assert cap_fair_value_to_market(0.75, 0.60, max_deviation=0.06) == pytest.approx(0.66)
+    assert cap_fair_value_to_market(0.45, 0.60, max_deviation=0.06) == pytest.approx(0.54)
+    assert cap_fair_value_to_market(0.63, 0.60, max_deviation=0.06) == pytest.approx(0.63)
 
 
 def test_exness_fast_feed_confidence_floor_reduces_fv_lag_on_real_move():
@@ -928,6 +950,37 @@ def test_small_capital_holds_active_unfilled_opening_quote_without_repricing():
     assert cycler._small_capital_opening_spent({"opening_attempt_spent": True, "quote_cycle_started": False}) is True
 
 
+def test_small_capital_resting_opening_quote_reprices_same_side_only():
+    cycler = MarketCycler.__new__(MarketCycler)
+    cycler.asset = "BTC"
+    active = SimpleNamespace(
+        yes_order_id="",
+        no_order_id="NO-1",
+        yes_price=None,
+        no_price=0.52,
+    )
+    cycler.order_mgr = SimpleNamespace(get_active=lambda market_id: active)
+    quotes = SimpleNamespace(
+        yes_buy_price=0.19,
+        no_buy_price=0.80,
+        yes_buy_size=5,
+        no_buy_size=0,
+    )
+    state = {
+        "quote_cycle_started": True,
+        "opening_attempt_spent": True,
+        "initial_filled": False,
+        "initial_side": "no",
+    }
+
+    side = cycler._apply_small_capital_opening_reprice_guard("M1", quotes, state, min_order_size=5)
+
+    assert side == "no"
+    assert quotes.yes_buy_size == 0
+    assert quotes.no_buy_size == 5
+    assert quotes.no_buy_price == 0.80
+
+
 def test_small_capital_canceled_unfilled_opening_can_retry_by_default():
     class StateManager:
         def __init__(self):
@@ -1056,10 +1109,10 @@ def test_price_feed_prefers_recent_aggtrade_when_book_mid_is_sticky():
     assert feed.get_price_source("BTCUSDT") == "bookTicker"
 
 
-def test_exness_spot_age_uses_mt5_stale_tolerance():
+def test_exness_spot_age_fails_closed_faster_than_bridge_stale_tolerance():
     cycler = MarketCycler.__new__(MarketCycler)
     cycler.price_feed = SimpleNamespace(mt5_bridge_url="http://bridge:8765", mt5_bridge_stale_seconds=15.0)
-    assert cycler._max_spot_price_age_seconds() == pytest.approx(15.0)
+    assert cycler._max_spot_price_age_seconds() == pytest.approx(1.0)
 
     cycler.price_feed = SimpleNamespace(mt5_bridge_url="", mt5_bridge_stale_seconds=15.0)
     assert cycler._max_spot_price_age_seconds() == pytest.approx(3.0)

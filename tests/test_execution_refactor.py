@@ -1,0 +1,379 @@
+import asyncio
+from types import SimpleNamespace
+
+from src.core.models.orders import OrderIntent
+from src.services.execution.order_intents import attach_place_intent, next_quote_version
+from src.execution.order_manager import OrderManager
+from src.execution.order_state import ActiveQuotes
+from src.execution.repricing import RepricePolicy
+from src.services.execution.cancel_manager import CancelManager
+from src.services.execution.order_submitter import OrderSubmitter
+from src.services.execution.order_tracker import OrderTracker
+from src.services.execution.reconciliation import find_stray_order_ids
+
+
+class SideAwareExecutor:
+    def __init__(self):
+        self.calls = []
+        self.batch_calls = []
+
+    async def place_buy_order(self, token_id, price, size, side=None, book_snapshot=None):
+        self.calls.append((token_id, price, size, side, book_snapshot))
+        return f"{side}-order"
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        return {order["side"]: f"{order['side']}-order" for order in orders}
+
+
+class LegacyExecutor:
+    def __init__(self):
+        self.calls = []
+        self.cancelled = []
+
+    async def place_buy_order(self, token_id, price, size):
+        self.calls.append((token_id, price, size))
+        return "legacy-order"
+
+    async def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
+        return order_id != "bad"
+
+
+class BatchCancelExecutor:
+    def __init__(self):
+        self.cancelled = []
+
+    async def cancel_orders(self, order_ids):
+        self.cancelled.extend(order_ids)
+        return True
+
+
+class NonePlacementExecutor:
+    def __init__(self):
+        self.batch_calls = []
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        return {order["side"]: None for order in orders}
+
+
+class TransientNonePlacementExecutor:
+    def __init__(self):
+        self.batch_calls = []
+        self.reconcile_calls = 0
+        self.last_place_error = "PolyApiException[status_code=500, error_message={'error': 'order timed out'}]"
+        self.last_place_error_transient = True
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        return {order["side"]: None for order in orders}
+
+    async def reconcile_on_startup(self):
+        self.reconcile_calls += 1
+        return {"open_orders": 0, "recent_trades": 0, "ok": True}
+
+
+class NonTransientNonePlacementExecutor:
+    def __init__(self):
+        self.batch_calls = []
+        self.last_place_error = "the order signer address has to be the address of the API KEY"
+        self.last_place_error_transient = False
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        return {order["side"]: None for order in orders}
+
+
+class RaisingPlacementExecutor:
+    def __init__(self):
+        self.batch_calls = []
+
+    async def place_buy_orders(self, orders):
+        self.batch_calls.append(orders)
+        raise RuntimeError("exchange timeout")
+
+
+class OpenOrderExecutor:
+    def __init__(self, open_orders):
+        self.open_orders = open_orders
+
+    async def cancel_all(self):
+        return True
+
+
+class Book:
+    best_ask = 0.50
+
+
+def test_order_intent_ignores_metadata_for_retry_idempotency():
+    first = OrderIntent("M1", 3, "yes", price=0.42, size=10, token_id="UP", metadata=(("trace", "a"),))
+    retry = OrderIntent("M1", 3, "yes", price=0.42, size=10, token_id="UP", metadata=(("trace", "b"),))
+    changed_action = OrderIntent("M1", 3, "yes", action="CANCEL", price=0.42, size=10, token_id="UP")
+
+    assert first.intent_id == retry.intent_id
+    assert first.intent_id != changed_action.intent_id
+    assert next_quote_version(3) == 4
+
+
+def test_attach_place_intent_adds_stable_metadata_without_mutating_spec():
+    spec = {"token_id": "UP", "price": 0.42, "size": 10, "side": "yes"}
+    enriched = attach_place_intent(spec, market_id="M1", quote_version=7)
+    retry = attach_place_intent({**spec, "book_snapshot": object()}, market_id="M1", quote_version=7)
+
+    assert "intent" not in spec
+    assert enriched["quote_version"] == 7
+    assert enriched["intent"].intent_id == retry["intent"].intent_id
+
+
+def test_reprice_policy_marks_risk_reductions_urgent_and_sticky_repairs_stable():
+    policy = RepricePolicy(reprice_threshold=0.005, repair_reprice_threshold=0.05)
+
+    assert policy.decision(0.51, 0.49, 5, 5, book_snapshot=Book()) == (True, True)
+    assert policy.decision(0.40, 0.43, 5, 5, sticky_repair=True) == (False, False)
+    assert policy.decision(0.40, 0.46, 5, 5, sticky_repair=True) == (True, False)
+    assert policy.decision(0.40, None, 5, 0) == (True, True)
+
+
+def test_reconciliation_finds_stray_orders_on_market_tokens_only():
+    active = ActiveQuotes(yes_order_id="tracked-yes", no_order_id=None)
+    open_orders = {
+        "tracked-yes": {"token_id": "UP"},
+        "stray-up": {"asset_id": "UP"},
+        "other-market": {"token_id": "OTHER"},
+    }
+
+    assert find_stray_order_ids(active, open_orders, {"UP", "DOWN"}) == ["stray-up"]
+
+
+def test_order_submitter_preserves_executor_signature_boundaries():
+    side_aware = SideAwareExecutor()
+    book = object()
+    placed = asyncio.run(OrderSubmitter(side_aware).submit_order(
+        OrderIntent("M1", 1, "yes", price=0.44, size=7, token_id="UP"),
+        book_snapshot=book,
+    ))
+    assert placed == "yes-order"
+    assert side_aware.calls == [("UP", 0.44, 7, "yes", book)]
+
+    legacy = LegacyExecutor()
+    placed = asyncio.run(OrderSubmitter(legacy).place_buy("UP", 0.45, 4, side="no", book_snapshot=book))
+    assert placed == "legacy-order"
+    assert legacy.calls == [("UP", 0.45, 4)]
+
+
+def test_order_manager_suppresses_duplicate_submit_for_same_side_quote_version():
+    executor = SideAwareExecutor()
+    manager = OrderManager(executor)
+    spec = {
+        "token_id": "UP",
+        "price": 0.45,
+        "size": 5,
+        "side": "yes",
+        "book_snapshot": object(),
+    }
+    first = attach_place_intent(spec, market_id="M1", quote_version=9)
+    duplicate = attach_place_intent({**spec, "price": 0.46}, market_id="M1", quote_version=9)
+
+    placed = asyncio.run(manager._place_buys([first, duplicate]))
+
+    assert placed == {"yes": "yes-order"}
+    assert len(executor.batch_calls) == 1
+    assert len(executor.batch_calls[0]) == 1
+    submitted = executor.batch_calls[0][0]
+    assert submitted["price"] == 0.45
+    assert "intent" not in submitted
+    assert "quote_version" not in submitted
+
+
+def test_order_manager_releases_failed_placement_intent_for_retry():
+    executor = NonePlacementExecutor()
+    manager = OrderManager(executor)
+    spec = {
+        "token_id": "UP",
+        "price": 0.45,
+        "size": 5,
+        "side": "yes",
+    }
+    intent_spec = attach_place_intent(spec, market_id="M1", quote_version=10)
+
+    first = asyncio.run(manager._place_buys([intent_spec]))
+    retry = asyncio.run(manager._place_buys([intent_spec]))
+
+    assert first == {"yes": None}
+    assert retry == {"yes": None}
+    assert len(executor.batch_calls) == 2
+    assert manager.order_tracker.pending == {}
+    assert intent_spec["intent"].intent_id in manager.order_tracker.failed_intents
+    assert manager.last_order_error is None
+    assert manager.last_order_warning == "order_placement_unconfirmed"
+
+
+def test_order_manager_treats_transient_place_timeout_as_nonfatal_and_reconciles():
+    executor = TransientNonePlacementExecutor()
+    manager = OrderManager(executor)
+    intent_spec = attach_place_intent(
+        {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"},
+        market_id="M1",
+        quote_version=10,
+    )
+
+    result = asyncio.run(manager._place_buys([intent_spec]))
+
+    assert result == {"yes": None}
+    assert executor.reconcile_calls == 1
+    assert manager.last_order_error is None
+    assert manager.last_order_warning == "order_placement_unconfirmed"
+
+
+def test_order_manager_keeps_nontransient_place_errors_fatal():
+    executor = NonTransientNonePlacementExecutor()
+    manager = OrderManager(executor)
+    intent_spec = attach_place_intent(
+        {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"},
+        market_id="M1",
+        quote_version=10,
+    )
+
+    result = asyncio.run(manager._place_buys([intent_spec]))
+
+    assert result == {"yes": None}
+    assert manager.last_order_error == "order_placement_failed"
+    assert manager.last_order_warning is None
+
+
+def test_order_manager_releases_raised_placement_intent_for_retry():
+    executor = RaisingPlacementExecutor()
+    manager = OrderManager(executor)
+    intent_spec = attach_place_intent(
+        {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"},
+        market_id="M1",
+        quote_version=11,
+    )
+
+    first = asyncio.run(manager._place_buys([intent_spec]))
+    retry = asyncio.run(manager._place_buys([intent_spec]))
+
+    assert first == {"yes": None}
+    assert retry == {"yes": None}
+    assert len(executor.batch_calls) == 2
+    assert manager.last_order_error == "order_placement_failed"
+
+
+def test_order_manager_allows_new_quote_version_after_duplicate_suppression():
+    executor = SideAwareExecutor()
+    manager = OrderManager(executor)
+    base = {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"}
+
+    v1 = attach_place_intent(base, market_id="M1", quote_version=12)
+    duplicate_v1 = attach_place_intent({**base, "price": 0.46}, market_id="M1", quote_version=12)
+    v2 = attach_place_intent({**base, "price": 0.47}, market_id="M1", quote_version=13)
+
+    assert asyncio.run(manager._place_buys([v1])) == {"yes": "yes-order"}
+    assert asyncio.run(manager._place_buys([duplicate_v1])) == {"yes": None}
+    assert asyncio.run(manager._place_buys([v2])) == {"yes": "yes-order"}
+    assert len(executor.batch_calls) == 2
+    assert executor.batch_calls[-1][0]["price"] == 0.47
+
+
+def test_order_tracker_claims_duplicate_submit_slot_once_per_side_version():
+    tracker = OrderTracker()
+    base = {"token_id": "UP", "price": 0.45, "size": 5, "side": "yes"}
+    first = attach_place_intent(base, market_id="M1", quote_version=12)
+    duplicate = attach_place_intent({**base, "price": 0.46}, market_id="M1", quote_version=12)
+
+    filtered, skipped, intents_by_side = tracker.claim_place_orders([first, duplicate])
+
+    assert filtered == [first]
+    assert skipped == {"yes": None}
+    assert set(intents_by_side) == {"yes"}
+    assert len(tracker.pending) == 1
+
+
+def test_order_manager_private_execution_wrappers_are_pruned():
+    pruned = {
+        "_needs_reprice",
+        "_reprice_decision",
+        "_is_crossed_buy",
+        "_order_still_open",
+        "_maybe_defer_crossed_bid_cancel",
+        "_place_buy",
+    }
+
+    assert pruned.isdisjoint(vars(OrderManager))
+
+
+def test_order_tracker_reconstructs_states_from_active_quotes():
+    active = ActiveQuotes(
+        yes_order_id="yes-live",
+        no_order_id="no-live",
+        yes_price=0.41,
+        no_price=0.53,
+        yes_size=3,
+        no_size=4,
+    )
+    tracker = OrderTracker()
+
+    rebuilt = tracker.reconstruct_from_active_quotes(
+        "M1",
+        active,
+        quote_version=12,
+        token_id_yes="UP",
+        token_id_no="DOWN",
+    )
+
+    assert set(rebuilt) == {"yes-live", "no-live"}
+    assert tracker.orders["yes-live"].metadata == {"quote_version": 12, "token_id": "UP"}
+    assert tracker.orders["no-live"].side == "no"
+    assert tracker.orders["yes-live"].status == "open"
+
+
+def test_cancel_manager_uses_batch_when_available_and_single_fallback():
+    batch = BatchCancelExecutor()
+    assert asyncio.run(CancelManager(batch).cancel_orders(["a", "b"])) is True
+    assert batch.cancelled == ["a", "b"]
+
+    legacy = LegacyExecutor()
+    assert asyncio.run(CancelManager(legacy).cancel_orders(["a", "b"])) is True
+    assert legacy.cancelled == ["a", "b"]
+
+
+def test_cancel_manager_crossed_bid_deferral_handles_fill_race_active_callback():
+    active = ActiveQuotes(yes_order_id="yes-1", yes_price=0.51, yes_size=5)
+    executor = OpenOrderExecutor(open_orders={"yes-1": SimpleNamespace(token_id="UP")})
+
+    # Simulate a fill/reconciliation race: by the time the crossed-cancel path
+    # checks exchange-local state, the order has already disappeared.
+    executor.open_orders.clear()
+    deferred = asyncio.run(CancelManager(executor).crossed_bid_cancel_should_defer(
+        market_id="market-1",
+        side="yes",
+        order_id="yes-1",
+        grace_seconds=0.0,
+        clear_active_side=lambda: (
+            setattr(active, "yes_order_id", None),
+            setattr(active, "yes_price", None),
+            setattr(active, "yes_size", 0),
+        ),
+    ))
+
+    assert deferred is True
+    assert active.yes_order_id is None
+    assert active.yes_price is None
+    assert active.yes_size == 0
+
+
+def test_cancel_manager_crossed_bid_deferral_clears_via_callback():
+    executor = OpenOrderExecutor(open_orders={})
+    cleared = []
+
+    deferred = asyncio.run(CancelManager(executor).crossed_bid_cancel_should_defer(
+        market_id="market-1",
+        side="yes",
+        order_id="yes-1",
+        grace_seconds=0.0,
+        clear_active_side=lambda: cleared.append("yes"),
+    ))
+
+    assert deferred is True
+    assert cleared == ["yes"]
