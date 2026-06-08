@@ -352,6 +352,71 @@ class ClobClientWrapper:
             log.error("client_not_initialized")
             return None
 
+    async def place_sell_order(self, token_id: str, price: float,
+                               size: float, side: str = "up", book_snapshot=None) -> Optional[str]:
+        """Place a SELL order with maker/post-only semantics.
+
+        This is intended only for close/reduce flows where we already hold the
+        conditional token. It is still GTC maker-only via ``_post_order_compat``;
+        callers must not use it for marketable/taker exits.
+        """
+        self._clear_place_error()
+        if not self._initialized:
+            log.error("client_not_initialized")
+            return None
+
+        try:
+            def _create_and_post():
+                OrderArgs, OrderType, PartialCreateOrderOptions, _, _, sdk_version = self._order_type_imports()
+                if sdk_version == "v2":
+                    from py_clob_client_v2.order_builder.constants import SELL
+                else:
+                    from py_clob_client.order_builder.constants import SELL
+
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=size,
+                    side=SELL,
+                )
+
+                tick_size = str(getattr(book_snapshot, "tick_size", "0.01") or "0.01")
+                neg_risk = bool(getattr(book_snapshot, "neg_risk", False))
+                opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+                order_args = self._ensure_builder_code(order_args)
+                signed_order = self._client.create_order(order_args, opts)
+                return self._post_order_compat(signed_order, OrderType.GTC)
+
+            response = await self._run_client_call(_create_and_post)
+            order_id = response.get("orderID") or response.get("id")
+
+            if order_id:
+                self.open_orders[order_id] = {
+                    "token_id": token_id,
+                    "price": price,
+                    "size": size,
+                    "side": "SELL",
+                    "token_side": side,
+                    "placed_at": time.time(),
+                }
+                self._save_orders_state()
+                log.info("sell_order_placed", order_id=order_id[:8],
+                         price=price, size=size, token=token_id[:8], token_side=side)
+                return order_id
+
+            status = response.get("status", "unknown")
+            log.info("sell_post_only_rejected", status=status,
+                     price=price, token=token_id[:8])
+            return None
+
+        except Exception as e:
+            self._record_place_error(e)
+            log.error("sell_order_place_error", error=str(e),
+                      price=price, size=size,
+                      transient=self.last_place_error_transient,
+                      **self._auth_context_fields())
+            return None
+
         try:
             def _create_and_post():
                 OrderArgs, OrderType, PartialCreateOrderOptions, _, BUY, _ = self._order_type_imports()

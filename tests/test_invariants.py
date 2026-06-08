@@ -2343,6 +2343,48 @@ def test_dry_run_partial_fill_keeps_order_live():
     assert "DRY-1" not in executor.open_orders
 
 
+def test_dry_run_sell_order_rejects_marketable_ask_post_only():
+    executor = DryRunExecutor(min_queue_time=0, max_queue_time=0, partial_fill_chance=0.0)
+    book = BookSnapshot(
+        token_id="YES1",
+        timestamp=time.time(),
+        bids=[(0.50, 10)],
+        asks=[(0.55, 10)],
+        best_bid=0.50,
+        best_ask=0.55,
+        best_bid_size=10,
+        best_ask_size=10,
+        mid_price=0.525,
+        micro_price=0.525,
+    )
+
+    order_id = asyncio.run(executor.place_sell_order("YES1", 0.50, 5, side="yes", book_snapshot=book))
+
+    assert order_id is None
+    assert executor.stats["total_rejects"] == 1
+
+
+def test_dry_run_sell_order_places_resting_ask():
+    executor = DryRunExecutor(min_queue_time=0, max_queue_time=0, partial_fill_chance=0.0)
+    book = BookSnapshot(
+        token_id="YES1",
+        timestamp=time.time(),
+        bids=[(0.50, 10)],
+        asks=[(0.55, 10)],
+        best_bid=0.50,
+        best_ask=0.55,
+        best_bid_size=10,
+        best_ask_size=10,
+        mid_price=0.525,
+        micro_price=0.525,
+    )
+
+    order_id = asyncio.run(executor.place_sell_order("YES1", 0.51, 5, side="yes", book_snapshot=book))
+
+    assert order_id is not None
+    assert executor.open_orders[order_id].side == "sell_yes"
+
+
 def test_live_prequote_fill_sync_updates_inventory_before_quotes():
     import asyncio
 

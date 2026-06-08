@@ -129,6 +129,44 @@ class DryRunExecutor:
                  side=side, price=price, size=size)
         return order_id
 
+    async def place_sell_order(self, token_id: str, price: float,
+                               size: float, side: str = "yes",
+                               book_snapshot=None) -> Optional[str]:
+        """Simulate a post-only SELL order.
+
+        Maker sell asks must rest above the current best bid; otherwise they
+        would execute immediately as takers and are rejected.
+        """
+        await self._simulate_network_latency()
+
+        self._total_orders += 1
+
+        if book_snapshot:
+            best_bid = book_snapshot.best_bid if hasattr(book_snapshot, 'best_bid') else 0.01
+            if price <= best_bid:
+                self._total_rejects += 1
+                log.debug("dry_sell_post_only_rejected", price=price,
+                         best_bid=best_bid, side=side)
+                return None
+
+        self._order_counter += 1
+        order_id = f"DRY-{self._order_counter:06d}"
+
+        order = SimulatedOrder(
+            order_id=order_id,
+            token_id=token_id,
+            side=f"sell_{side}",
+            price=price,
+            size=size,
+            placed_at=time.time(),
+            fair_value_at_place=self._current_fv,
+        )
+        self.open_orders[order_id] = order
+
+        log.debug("dry_sell_order_placed", order_id=order_id,
+                 side=side, price=price, size=size)
+        return order_id
+
     async def place_buy_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
         """Simulate batch placing multiple BUY orders with one network hop."""
         await self._simulate_network_latency()
