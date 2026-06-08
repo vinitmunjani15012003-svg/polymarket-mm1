@@ -958,8 +958,21 @@ class MarketCycler:
 
         stale_spot_decision = decide_stale_spot(raw_spot, price_age, max_spot_age)
         if stale_spot_decision.should_stop and stale_spot_decision.dashboard_reason == "NO_SPOT":
-            log.warning("no_spot_price", symbol=self.ac.symbol)
-            self._set_dashboard_event("skip", "NO_SPOT_PRICE", f"{self.ac.symbol} unavailable")
+            mt5_status = (
+                self.price_feed.get_mt5_bridge_status(self.ac.symbol)
+                if hasattr(self.price_feed, "get_mt5_bridge_status")
+                else {}
+            )
+            mt5_detail = ""
+            if mt5_configured:
+                host = mt5_status.get("host") or "unknown_host"
+                last_error = mt5_status.get("last_error") or "no_response"
+                attempts = mt5_status.get("attempts", 0)
+                failures = mt5_status.get("failures", 0)
+                timeout = mt5_status.get("timeout_seconds")
+                mt5_detail = f"; mt5 host={host} error={last_error} attempts={attempts} failures={failures} timeout={timeout}s"
+            log.warning("no_spot_price", symbol=self.ac.symbol, mt5_bridge=mt5_status)
+            self._set_dashboard_event("skip", "NO_SPOT_PRICE", f"{self.ac.symbol} unavailable{mt5_detail}")
             await self.order_mgr.cancel_market_quotes(market.market_id)
             self._update_dashboard(market, 0, self.last_fair_value or 0, self._dashboard_sigma_for_stale_spot(), "NO_SPOT", remaining)
             return
