@@ -84,6 +84,7 @@ class CredentialsConfig:
     mt5_bridge_url: str = ""
     mt5_bridge_api_key: str = ""
     mt5_bridge_stale_seconds: float = 5.0
+    mt5_bridge_symbol_map: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -256,6 +257,27 @@ def _recursive_env_sub(obj):
     return obj
 
 
+def _parse_symbol_map(value) -> Dict[str, str]:
+    """Parse MT5 bridge symbol aliases from YAML dict or ENV string.
+
+    ENV format: ``BTCUSDT=BTCUSDm,ETHUSDT=ETHUSDm``. Empty entries are ignored.
+    """
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return {str(k).upper(): str(v).upper() for k, v in value.items() if str(k).strip() and str(v).strip()}
+    result: Dict[str, str] = {}
+    for part in str(value).split(","):
+        if "=" not in part:
+            continue
+        left, right = part.split("=", 1)
+        left = left.strip().upper()
+        right = right.strip().upper()
+        if left and right:
+            result[left] = right
+    return result
+
+
 _LOADED_ENV_FILES: list[str] = []
 
 
@@ -408,6 +430,7 @@ def load_config(config_path: str = "config/default.yaml",
         mt5_bridge_url=mt5.get("url") or os.environ.get("MT5_BRIDGE_URL", ""),
         mt5_bridge_api_key=mt5.get("api_key") or os.environ.get("MT5_BRIDGE_API_KEY", ""),
         mt5_bridge_stale_seconds=float(mt5.get("stale_seconds") or os.environ.get("MT5_BRIDGE_STALE_SECONDS", 5.0)),
+        mt5_bridge_symbol_map=_parse_symbol_map(mt5.get("symbol_map") or os.environ.get("MT5_BRIDGE_SYMBOL_MAP", "")),
     )
 
     # Assets

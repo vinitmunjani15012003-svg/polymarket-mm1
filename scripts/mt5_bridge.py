@@ -21,7 +21,14 @@ import MetaTrader5 as mt5
 HOST = os.environ.get("MT5_BRIDGE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MT5_BRIDGE_PORT", "8765"))
 API_KEY = os.environ.get("MT5_BRIDGE_API_KEY", "")
-DEFAULT_SYMBOL = os.environ.get("MT5_DEFAULT_SYMBOL", "BTCUSD")
+DEFAULT_SYMBOL = os.environ.get("MT5_DEFAULT_SYMBOL", "BTCUSD").upper()
+SYMBOL_ALIASES = {
+    left.strip().upper(): right.strip().upper()
+    for item in os.environ.get("MT5_SYMBOL_ALIASES", "").split(",")
+    if "=" in item
+    for left, right in [item.split("=", 1)]
+    if left.strip() and right.strip()
+}
 
 
 def ensure_mt5() -> bool:
@@ -30,20 +37,50 @@ def ensure_mt5() -> bool:
     return bool(mt5.initialize())
 
 
+def _candidate_symbols(symbol: str) -> list[str]:
+    symbol = (symbol or DEFAULT_SYMBOL).upper()
+    candidates = [SYMBOL_ALIASES.get(symbol, symbol)]
+    # Exness account types often suffix symbols (for example BTCUSDm). If the
+    # bot asks for BTCUSD but the local terminal exposes a suffixed/default
+    # symbol, try that before declaring Exness unavailable.
+    if symbol.endswith("USDT"):
+        candidates.append(symbol[:-1])  # BTCUSDT -> BTCUSD
+    if DEFAULT_SYMBOL and (symbol.startswith(DEFAULT_SYMBOL.rstrip("M")) or DEFAULT_SYMBOL.startswith(symbol.rstrip("T"))):
+        candidates.append(DEFAULT_SYMBOL)
+    candidates.extend([f"{candidates[0]}m", f"{candidates[0]}.m"])
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
 def tick_payload(symbol: str) -> dict:
     if not ensure_mt5():
         raise RuntimeError(f"mt5_initialize_failed: {mt5.last_error()}")
-    if not mt5.symbol_select(symbol, True):
-        raise RuntimeError(f"symbol_select_failed: {symbol}: {mt5.last_error()}")
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None or (not tick.bid and not tick.ask and not tick.last):
-        raise RuntimeError(f"no_tick: {symbol}: {mt5.last_error()}")
+    errors = []
+    selected = ""
+    tick = None
+    for candidate in _candidate_symbols(symbol):
+        if not mt5.symbol_select(candidate, True):
+            errors.append(f"symbol_select_failed: {candidate}: {mt5.last_error()}")
+            continue
+        candidate_tick = mt5.symbol_info_tick(candidate)
+        if candidate_tick is None or (not candidate_tick.bid and not candidate_tick.ask and not candidate_tick.last):
+            errors.append(f"no_tick: {candidate}: {mt5.last_error()}")
+            continue
+        selected = candidate
+        tick = candidate_tick
+        break
+    if tick is None:
+        raise RuntimeError("; ".join(errors) or f"no_tick: {symbol}: {mt5.last_error()}")
     bid = float(tick.bid or tick.last or tick.ask)
     ask = float(tick.ask or tick.last or tick.bid)
     mid = (bid + ask) / 2.0
     ts = (float(tick.time_msc) / 1000.0) if getattr(tick, "time_msc", 0) else time.time()
     return {
-        "symbol": symbol,
+        "symbol": selected,
+        "requested_symbol": symbol,
         "bid": bid,
         "ask": ask,
         "mid": mid,

@@ -60,6 +60,7 @@ def test_dependency_builder_preserves_wallet_mode_address_and_mt5_log_shape():
         "url_host": "bridge.local:8765",
         "has_api_key": True,
         "stale_seconds": 5.0,
+        "symbol_map": {},
         "loaded_env_files": [".env"],
         "mt5_env_url_present": True,
         "mt5_env_key_present": True,

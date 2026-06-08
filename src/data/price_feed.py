@@ -12,7 +12,7 @@ import time
 import math
 import numpy as np
 from collections import deque
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, Mapping
 from urllib.parse import urlparse, urlunparse
 
 import websockets
@@ -35,7 +35,8 @@ class PriceFeed:
                  rest_url: str = "https://api.binance.com/api/v3",
                  mt5_bridge_url: str = "",
                  mt5_bridge_api_key: str = "",
-                 mt5_bridge_stale_seconds: float = 5.0):
+                 mt5_bridge_stale_seconds: float = 5.0,
+                 mt5_bridge_symbol_map: Mapping[str, str] | None = None):
         """
         Args:
             ws_url: Binance WebSocket base URL.
@@ -48,6 +49,11 @@ class PriceFeed:
         self.mt5_bridge_url = self._normalize_mt5_bridge_url(mt5_bridge_url or "")
         self.mt5_bridge_api_key = mt5_bridge_api_key or ""
         self.mt5_bridge_stale_seconds = float(mt5_bridge_stale_seconds or 5.0)
+        self.mt5_bridge_symbol_map = {
+            str(k).upper(): str(v).upper()
+            for k, v in dict(mt5_bridge_symbol_map or {}).items()
+            if str(k).strip() and str(v).strip()
+        }
         # Keep the bridge poll timeout aligned with the accepted freshness
         # window. A 1.5s hard timeout caused false STALE_SPOT periods when the
         # MT5/Exness bridge was alive but a single HTTP poll was slow.
@@ -354,6 +360,9 @@ class PriceFeed:
 
     def _mt5_symbol_for(self, symbol: str) -> str:
         sym = symbol.upper()
+        mapped = self.mt5_bridge_symbol_map.get(sym)
+        if mapped:
+            return mapped
         if sym.endswith("USDT"):
             return sym[:-1]  # BTCUSDT -> BTCUSD
         return sym
