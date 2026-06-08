@@ -156,6 +156,14 @@ def update_dashboard(cycler, market, spot, fv, sigma, phase,
         else {}
     )
 
+    matched_value = max(0.0, display_matched_pairs) * 1.0
+    unmatched_up = max(0.0, display_up_shares - display_matched_pairs)
+    unmatched_down = max(0.0, display_down_shares - display_matched_pairs)
+    inventory_mark_value = matched_value
+    if fv:
+        inventory_mark_value += unmatched_up * fv
+        inventory_mark_value += unmatched_down * (1.0 - fv)
+
     state = {
         "asset": cycler.asset,
         "market_id": market.market_id,
@@ -189,6 +197,8 @@ def update_dashboard(cycler, market, spot, fv, sigma, phase,
         "matched_pairs": display_matched_pairs,
         "avg_pair_cost": real_pos.avg_matched_pair_cost(),
         "matched_pair_pnl": real_pos.matched_pair_profit(),
+        "inventory_mark_value": inventory_mark_value,
+        "matched_pair_value": matched_value,
         "negative_pair_edge": (
             cycler._decide_negative_pair_edge(real_pos).triggered
             if hasattr(cycler, "_decide_negative_pair_edge")
@@ -220,7 +230,10 @@ def _add_balance_monitor_stats(cycler, state: dict) -> None:
     if not cycler.balance_monitor:
         return
     bm_stats = cycler.balance_monitor.stats
-    state["wallet_balance"] = bm_stats["last_balance"]
+    wallet_balance = bm_stats["last_balance"]
+    state["wallet_balance"] = wallet_balance
+    if wallet_balance is not None and wallet_balance >= 0:
+        state["estimated_equity"] = wallet_balance + float(state.get("inventory_mark_value", 0) or 0)
     state["auto_merges"] = bm_stats["total_merges"]
     state["auto_merged_usdc"] = bm_stats["total_merged_usdc"]
     state["balance_warn_threshold"] = cycler.balance_monitor.warn_balance

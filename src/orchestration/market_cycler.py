@@ -836,7 +836,18 @@ class MarketCycler:
             balance_monitor = getattr(self, "balance_monitor", None)
             if balance_monitor and hasattr(balance_monitor, "get_usdc_balance"):
                 try:
-                    await balance_monitor.get_usdc_balance()
+                    wallet_balance = await balance_monitor.get_usdc_balance()
+                    matched_pairs = float(pos.matched_pairs() or 0)
+                    matched_value = matched_pairs * 1.0
+                    log.info(
+                        "post_fill_balance_reconciliation",
+                        wallet_usdc=round(wallet_balance, 4) if wallet_balance >= 0 else wallet_balance,
+                        local_current_capital=round(float(getattr(self.pnl, "current_capital", 0) or 0), 4),
+                        matched_pairs=round(matched_pairs, 4),
+                        matched_pair_value=round(matched_value, 4),
+                        matched_pair_pnl=round(float(pos.matched_pair_profit() or 0), 4),
+                        total_fees=round(float(getattr(self.pnl, "total_fees", 0) or 0), 6),
+                    )
                 except Exception as e:
                     log.warning("post_fill_balance_refresh_failed", error=str(e))
 

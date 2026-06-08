@@ -182,7 +182,13 @@ class Dashboard:
             )
             auto_merges = s.get("auto_merges", 0)
             merged_usdc = s.get("auto_merged_usdc", 0)
-            table.add_row("Wallet USDC", f"[{bc}]${wallet_bal:.2f}[/]",
+            est_equity = s.get("estimated_equity", -1)
+            wallet_label = "Wallet USDC"
+            wallet_value = f"[{bc}]${wallet_bal:.2f}[/]"
+            if est_equity >= 0:
+                wallet_label = "Wallet / Est Equity"
+                wallet_value = f"[{bc}]${wallet_bal:.2f}[/] / ${est_equity:.2f}"
+            table.add_row(wallet_label, wallet_value,
                            "Auto-Merges",
                            f"{auto_merges} (${merged_usdc:.2f})" if auto_merges else "0")
 
