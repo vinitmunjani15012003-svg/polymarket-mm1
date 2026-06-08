@@ -151,6 +151,102 @@ class InventoryPosition:
     def matched_pairs(self) -> float:
         return min(self.yes_shares, self.no_shares)
 
+    def unmatched_shares(self, side: str) -> float:
+        """Return FIFO-unmatched shares available to close-only sell."""
+        side = (side or "").lower()
+        fills = self._yes_fills if side in ("yes", "up") else self._no_fills
+        return sum(max(0.0, float(getattr(fill, "remaining", 0.0) or 0.0)) for fill in fills)
+
+    def unmatched_cost_basis(self, side: str, size: float | None = None) -> dict:
+        """Return FIFO cost basis for a prospective unmatched-share sale."""
+        side = (side or "").lower()
+        fills = self._yes_fills if side in ("yes", "up") else self._no_fills
+        requested = self.unmatched_shares(side) if size is None else max(0.0, float(size or 0.0))
+        remaining = requested
+        cost_basis = 0.0
+        covered = 0.0
+        max_entry = 0.0
+        for fill in fills:
+            if remaining <= 1e-9:
+                break
+            qty = min(max(0.0, float(getattr(fill, "remaining", 0.0) or 0.0)), remaining)
+            if qty <= 0:
+                continue
+            entry = float(getattr(fill, "price", 0.0) or 0.0)
+            cost_basis += qty * entry
+            max_entry = max(max_entry, entry)
+            covered += qty
+            remaining -= qty
+        avg_entry = cost_basis / covered if covered > 0 else 0.0
+        return {
+            "size": covered,
+            "cost_basis": cost_basis,
+            "avg_entry": avg_entry,
+            "max_entry": max_entry,
+        }
+
+    def record_unmatched_sell(self, side: str, price: float, size: float, ts: float = 0.0) -> dict:
+        """Sell owned unmatched shares using FIFO cost basis.
+
+        This deliberately drains only the remaining unmatched FIFO lots. Matched
+        pair accounting is untouched, preserving the 1 YES + 1 NO guaranteed
+        settlement logic.
+        """
+        side = (side or "").lower()
+        if side not in ("yes", "up", "no", "down"):
+            raise ValueError(f"unknown sell side: {side}")
+        price = float(price or 0.0)
+        requested = float(size or 0.0)
+        if requested <= 0:
+            return {"size": 0.0, "proceeds": 0.0, "cost_basis": 0.0, "realized_pnl": 0.0}
+
+        fills = self._yes_fills if side in ("yes", "up") else self._no_fills
+        available = self.unmatched_shares(side)
+        if requested > available + 1e-9:
+            raise ValueError(f"sell size {requested} exceeds unmatched {available}")
+
+        remaining = requested
+        cost_basis = 0.0
+        while fills and remaining > 1e-9:
+            fill = fills[0]
+            qty = min(max(0.0, float(fill.remaining or 0.0)), remaining)
+            if qty <= 0:
+                fills.pop(0)
+                continue
+            cost_basis += qty * float(fill.price)
+            fill.remaining -= qty
+            remaining -= qty
+            if fill.remaining <= 1e-9:
+                fills.pop(0)
+
+        sold = requested - max(0.0, remaining)
+        proceeds = sold * price
+        realized_pnl = proceeds - cost_basis
+        if side in ("yes", "up"):
+            self.yes_shares = max(0.0, self.yes_shares - sold)
+            self.yes_total_cost = max(0.0, self.yes_total_cost - cost_basis)
+        else:
+            self.no_shares = max(0.0, self.no_shares - sold)
+            self.no_total_cost = max(0.0, self.no_total_cost - cost_basis)
+
+        log.info(
+            "unmatched_sell_recorded",
+            market=self.market_id[:8],
+            side=side,
+            size=round(sold, 4),
+            price=round(price, 4),
+            proceeds=round(proceeds, 4),
+            cost_basis=round(cost_basis, 4),
+            realized_pnl=round(realized_pnl, 4),
+            unmatched_remaining=round(self.unmatched_shares(side), 4),
+        )
+        return {
+            "size": sold,
+            "proceeds": proceeds,
+            "cost_basis": cost_basis,
+            "realized_pnl": realized_pnl,
+        }
+
     def add_fill(self, side: str, price: float, size: float, ts: float = 0.0):
         """Record a fill and FIFO-match against the opposite side.
 
@@ -413,6 +509,28 @@ class InventoryManager:
                  up_shares=pos.yes_shares, down_shares=pos.no_shares,
                  pair_pnl=round(pos._realized_pair_pnl, 4),
                  imbalance=pos.share_imbalance())
+
+    def record_unmatched_sell(self, market_id: str, side: str, size: float, price: float, asset: str = "") -> dict:
+        """Record a close-only sell of FIFO-unmatched inventory."""
+        pos = self.get_or_create(market_id, asset)
+        result = pos.record_unmatched_sell(side, price, size)
+        if self.capital_arbiter and asset:
+            # Arbiter tracks deployed capital capacity, so recover cost basis;
+            # sale proceeds are tracked by PnL/capital accounting separately.
+            self.capital_arbiter.record_recovery(asset, float(result.get("cost_basis", 0.0) or 0.0))
+        self._save_state()
+        log.info(
+            "sell_recorded",
+            market=market_id[:8],
+            side=side,
+            size=round(float(result.get("size", 0.0) or 0.0), 4),
+            price=price,
+            up_shares=pos.yes_shares,
+            down_shares=pos.no_shares,
+            realized_pnl=round(float(result.get("realized_pnl", 0.0) or 0.0), 4),
+            imbalance=pos.share_imbalance(),
+        )
+        return result
 
     def get_state(self, market_id: str, current_mid: float = 0.5,
                   t_normalized: float = 1.0) -> InventoryState:

@@ -184,6 +184,17 @@ balanced_repair:
   max_abs_imbalance: 0.5      # balanced repair only when YES/NO shares are flat
   min_seconds_remaining: 90   # avoid starting balanced repair near expiry
 
+# --- Close-Only Sell Engine ---
+# Phase-1 sell support: sell only owned, FIFO-unmatched excess shares in
+# close-only/risk/small-cap emergency contexts. Disabled by default.
+close_only_sell:
+  enabled: false
+  max_order_size: 0           # 0 = use per-asset/quote-engine max size
+  min_edge: 0.01              # require sell price >= fast FV + 1c when available
+  max_loss_per_share: 0.20    # small-cap emergency loss cap vs FIFO cost basis
+  min_seconds_remaining: 30   # do not start passive sells in final seconds
+  allow_taker: false          # phase 1 is maker/post-only only
+
 # --- Balance Monitor (live mode only) ---
 # Auto-merges matched pairs when USDC wallet balance drops low.
 # Uses gasless relayer (Builder credentials) → on-chain fallback.

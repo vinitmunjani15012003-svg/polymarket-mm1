@@ -18,11 +18,11 @@ class OrderTracker:
         self.pending: dict[str, OrderIntent] = {}
         self.orders: dict[str, OrderState] = {}
         self.failed_intents: dict[str, OrderIntent] = {}
-        self._submitted_versions: set[tuple[str, str, int]] = set()
+        self._submitted_versions: set[tuple[str, str, str, int]] = set()
 
     @staticmethod
-    def _version_key(intent: OrderIntent) -> tuple[str, str, int]:
-        return (intent.market_id, intent.side, int(intent.quote_version))
+    def _version_key(intent: OrderIntent) -> tuple[str, str, str, int]:
+        return (intent.market_id, intent.side, str(intent.execution_side or "BUY"), int(intent.quote_version))
 
     def add_intent(self, intent: OrderIntent) -> str:
         self.pending[intent.intent_id] = intent
@@ -104,9 +104,16 @@ class OrderTracker:
                     side=intent.side,
                     price=intent.price,
                     size=intent.size,
+                    execution_side=intent.execution_side,
+                    close_only=intent.close_only,
                     status="open",
                     updated_ts=time.time(),
-                    metadata={"quote_version": intent.quote_version, "token_id": intent.token_id},
+                    metadata={
+                        "quote_version": intent.quote_version,
+                        "token_id": intent.token_id,
+                        "execution_side": intent.execution_side,
+                        "close_only": intent.close_only,
+                    },
                 ))
             else:
                 self.mark_rejected(intent)

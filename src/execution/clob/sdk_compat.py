@@ -23,11 +23,13 @@ def ensure_builder_code(order_args: Any) -> Any:
     return order_args
 
 
-def post_order_compat(client: Any, signed_order: Any, order_type: Any) -> Any:
+def post_order_compat(client: Any, signed_order: Any, order_type: Any, *, require_post_only: bool = False) -> Any:
     """Post a single order across SDK variants while preserving post-only where supported."""
     try:
         return client.post_order(signed_order, order_type, post_only=True)
     except TypeError:
+        if require_post_only:
+            raise
         return client.post_order(signed_order, order_type)
 
 

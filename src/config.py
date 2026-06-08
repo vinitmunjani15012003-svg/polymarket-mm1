@@ -179,6 +179,22 @@ class BalancedRepairConfig:
 
 
 @dataclass
+class CloseOnlySellConfig:
+    """Close-only sell controls.
+
+    First-phase SELL support is intentionally conservative: sell only owned,
+    FIFO-unmatched shares, only in close-only/risk/emergency contexts, and only
+    as post-only maker orders.
+    """
+    enabled: bool = False
+    max_order_size: int = 0
+    min_edge: float = 0.01
+    max_loss_per_share: float = 0.20
+    min_seconds_remaining: float = 30.0
+    allow_taker: bool = False
+
+
+@dataclass
 class BotConfig:
     """Root configuration object."""
     mode: str = "dry-run"
@@ -192,6 +208,7 @@ class BotConfig:
     dry_run: DryRunConfig = field(default_factory=DryRunConfig)
     small_capital_test: SmallCapitalTestConfig = field(default_factory=SmallCapitalTestConfig)
     balanced_repair: BalancedRepairConfig = field(default_factory=BalancedRepairConfig)
+    close_only_sell: CloseOnlySellConfig = field(default_factory=CloseOnlySellConfig)
 
     def validate(self):
         """Validate all configuration invariants."""
@@ -234,6 +251,12 @@ class BotConfig:
             raise ValueError("balanced_repair.min_pair_edge must be non-negative")
         if self.balanced_repair.max_abs_imbalance < 0:
             raise ValueError("balanced_repair.max_abs_imbalance must be non-negative")
+        if self.close_only_sell.max_order_size < 0:
+            raise ValueError("close_only_sell.max_order_size must be non-negative")
+        if self.close_only_sell.min_edge < 0:
+            raise ValueError("close_only_sell.min_edge must be non-negative")
+        if self.close_only_sell.max_loss_per_share < 0:
+            raise ValueError("close_only_sell.max_loss_per_share must be non-negative")
 
 
 def _substitute_env_vars(value: str) -> str:
@@ -555,6 +578,17 @@ def load_config(config_path: str = "config/default.yaml",
         max_order_size=int(br.get("max_order_size", 0) or 0),
         max_abs_imbalance=float(br.get("max_abs_imbalance", 0.5)),
         min_seconds_remaining=float(br.get("min_seconds_remaining", 90.0)),
+    )
+
+    # Close-only sell controls
+    cos = raw.get("close_only_sell", {})
+    config.close_only_sell = CloseOnlySellConfig(
+        enabled=bool(cos.get("enabled", False)),
+        max_order_size=int(cos.get("max_order_size", 0) or 0),
+        min_edge=float(cos.get("min_edge", 0.01)),
+        max_loss_per_share=float(cos.get("max_loss_per_share", 0.20)),
+        min_seconds_remaining=float(cos.get("min_seconds_remaining", 30.0)),
+        allow_taker=bool(cos.get("allow_taker", False)),
     )
 
     # Validate config invariants

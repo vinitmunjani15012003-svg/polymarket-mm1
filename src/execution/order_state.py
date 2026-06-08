@@ -15,6 +15,12 @@ class ActiveQuotes:
     no_price: Optional[float] = None
     yes_size: int = 0
     no_size: int = 0
+    yes_sell_order_id: Optional[str] = None
+    no_sell_order_id: Optional[str] = None
+    yes_sell_price: Optional[float] = None
+    no_sell_price: Optional[float] = None
+    yes_sell_size: int = 0
+    no_sell_size: int = 0
     last_update: float = 0.0
 
 

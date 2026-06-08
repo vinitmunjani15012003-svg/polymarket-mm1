@@ -5,6 +5,7 @@ from .balanced_repair import (
     negative_pair_debt,
     plan_balanced_negative_edge_repair,
 )
+from .close_only_sell import CloseOnlySellPlan, plan_close_only_sell
 from .exposure import gross_exposure, inventory_skew, matched_pairs, share_imbalance
 from .inventory_book import InventoryBook
 from .pair_tracker import has_negative_matched_pair_edge
@@ -27,6 +28,8 @@ __all__ = [
     "balanced_repair_debt_eligible",
     "negative_pair_debt",
     "plan_balanced_negative_edge_repair",
+    "CloseOnlySellPlan",
+    "plan_close_only_sell",
     "gross_exposure",
     "inventory_skew",
     "matched_pairs",

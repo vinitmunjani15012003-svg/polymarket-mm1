@@ -12,7 +12,7 @@ from typing import Optional
 
 from src.strategy.quote_engine import QuoteResult
 from src.execution.order_state import ActiveQuotes
-from src.execution.repricing import RepricePolicy, is_crossed_buy
+from src.execution.repricing import RepricePolicy, is_crossed_buy, is_crossed_sell
 from src.monitoring.logger import get_logger
 from src.services.execution.cancel_manager import CancelManager
 from src.services.execution.order_intents import attach_place_intent, next_quote_version
@@ -108,6 +108,10 @@ class OrderManager:
             market_id, token_id_yes, token_id_no, active
         ):
             self.last_order_error = "stray_live_order_cancel_failed"
+            return False
+
+        if not await self._cancel_active_sells_before_buy(market_id, active):
+            self.last_order_error = "active_sell_cancel_failed_before_buy"
             return False
 
         # In repair modes, only the LIGHT side may be quoted. Enforce this at the
@@ -316,6 +320,143 @@ class OrderManager:
             )
         return ok
 
+    async def _cancel_active_sells_before_buy(self, market_id: str, active: ActiveQuotes) -> bool:
+        sell_ids = [
+            oid for oid in (active.yes_sell_order_id, active.no_sell_order_id) if oid
+        ]
+        if not sell_ids:
+            return True
+        ok = await self.cancel_manager.cancel_orders(sell_ids)
+        if ok:
+            active.yes_sell_order_id = None
+            active.no_sell_order_id = None
+            active.yes_sell_price = None
+            active.no_sell_price = None
+            active.yes_sell_size = 0
+            active.no_sell_size = 0
+            log.warning(
+                "active_sells_cancelled_before_buy_quotes",
+                market=market_id[:8],
+                count=len(sell_ids),
+                order_ids=[oid[:8] for oid in sell_ids[:8]],
+            )
+        else:
+            log.error(
+                "active_sell_cancel_failed_before_buy",
+                market=market_id[:8],
+                order_ids=[oid[:8] for oid in sell_ids[:8]],
+            )
+        return ok
+
+    async def update_close_only_sell(self, market_id: str, token_id: str, *,
+                                     side: str, price: float | None, size: int,
+                                     book_snapshot=None) -> bool:
+        """Maintain one close-only SELL order for unmatched heavy inventory."""
+        active = self.get_active(market_id)
+        self.last_order_error = None
+        self.last_order_warning = None
+        side = "yes" if side in ("yes", "up") else "no"
+
+        # SELL and BUY repair must never run simultaneously for the same market.
+        buy_ids = [oid for oid in (active.yes_order_id, active.no_order_id) if oid]
+        if buy_ids:
+            ok = await self.cancel_manager.cancel_orders(buy_ids)
+            if not ok:
+                self.last_order_error = "buy_cancel_failed_before_sell"
+                log.error(
+                    "buy_cancel_failed_before_sell",
+                    market=market_id[:8],
+                    order_ids=[oid[:8] for oid in buy_ids[:8]],
+                )
+                return False
+            active.yes_order_id = None
+            active.no_order_id = None
+            active.yes_price = None
+            active.no_price = None
+            active.yes_size = 0
+            active.no_size = 0
+
+        current_id = active.yes_sell_order_id if side == "yes" else active.no_sell_order_id
+        current_price = active.yes_sell_price if side == "yes" else active.no_sell_price
+        current_size = active.yes_sell_size if side == "yes" else active.no_sell_size
+        other_id = active.no_sell_order_id if side == "yes" else active.yes_sell_order_id
+
+        cancel_ids = []
+        if other_id:
+            cancel_ids.append(other_id)
+
+        needs = self.reprice_policy.needs_reprice(current_price, price, int(current_size or 0), int(size or 0))
+        if current_id and is_crossed_sell(current_price, book_snapshot):
+            needs = True
+        if current_id and needs:
+            cancel_ids.append(current_id)
+
+        if cancel_ids:
+            ok = await self.cancel_manager.cancel_orders(cancel_ids)
+            if not ok:
+                self.last_order_error = "sell_cancel_failed_halt_reprice"
+                log.error(
+                    "sell_cancel_failed_halt_reprice",
+                    market=market_id[:8],
+                    order_ids=[oid[:8] for oid in cancel_ids[:8]],
+                )
+                return False
+            if side == "yes":
+                active.no_sell_order_id = None
+                active.no_sell_price = None
+                active.no_sell_size = 0
+                if current_id in cancel_ids:
+                    active.yes_sell_order_id = None
+                    active.yes_sell_price = None
+                    active.yes_sell_size = 0
+            else:
+                active.yes_sell_order_id = None
+                active.yes_sell_price = None
+                active.yes_sell_size = 0
+                if current_id in cancel_ids:
+                    active.no_sell_order_id = None
+                    active.no_sell_price = None
+                    active.no_sell_size = 0
+
+        if not needs and current_id:
+            return False
+
+        if not price or size <= 0:
+            return bool(cancel_ids)
+
+        quote_version = self._advance_quote_version(market_id)
+        spec = attach_place_intent({
+            "token_id": token_id,
+            "price": price,
+            "size": int(size),
+            "side": side,
+            "book_snapshot": book_snapshot,
+            "execution_side": "SELL",
+            "close_only": True,
+        }, market_id=market_id, quote_version=quote_version)
+        placed = await self._place_sells([spec])
+        order_id = placed.get(side)
+        if order_id:
+            if side == "yes":
+                active.yes_sell_order_id = order_id
+                active.yes_sell_price = price
+                active.yes_sell_size = int(size)
+            else:
+                active.no_sell_order_id = order_id
+                active.no_sell_price = price
+                active.no_sell_size = int(size)
+            active.last_update = time.time()
+            log.info(
+                "close_only_sell_updated",
+                market=market_id[:8],
+                side=side,
+                price=price,
+                size=size,
+                order_id=order_id[:8],
+            )
+            return True
+        return bool(cancel_ids)
+
     async def cancel_side_quotes(self, market_id: str, side: str, token_id: str):
         """Cancel all known quotes for one side/token of a market."""
         active = self.active.get(market_id)
@@ -323,8 +464,12 @@ class OrderManager:
 
         if side in ("yes", "up") and active and active.yes_order_id:
             cancel_ids.append(active.yes_order_id)
+        if side in ("yes", "up") and active and active.yes_sell_order_id:
+            cancel_ids.append(active.yes_sell_order_id)
         if side in ("no", "down") and active and active.no_order_id:
             cancel_ids.append(active.no_order_id)
+        if side in ("no", "down") and active and active.no_sell_order_id:
+            cancel_ids.append(active.no_sell_order_id)
 
         open_orders = getattr(self.executor, "open_orders", None)
         if isinstance(open_orders, dict):
@@ -341,10 +486,16 @@ class OrderManager:
                 active.yes_order_id = None
                 active.yes_price = None
                 active.yes_size = 0
+                active.yes_sell_order_id = None
+                active.yes_sell_price = None
+                active.yes_sell_size = 0
             else:
                 active.no_order_id = None
                 active.no_price = None
                 active.no_size = 0
+                active.no_sell_order_id = None
+                active.no_sell_price = None
+                active.no_sell_size = 0
             log.warning(
                 "side_quotes_cancelled",
                 market=market_id[:8],
@@ -368,7 +519,12 @@ class OrderManager:
             return True
 
         ok = await self.cancel_manager.cancel_orders(
-            [oid for oid in (active.yes_order_id, active.no_order_id) if oid]
+            [oid for oid in (
+                active.yes_order_id,
+                active.no_order_id,
+                active.yes_sell_order_id,
+                active.no_sell_order_id,
+            ) if oid]
         )
 
         if ok:
@@ -412,6 +568,27 @@ class OrderManager:
             self.last_order_error = "order_placement_failed"
             return {**skipped, **failed}
 
+        failed_submission = self.order_tracker.record_submission_results(placed, intents_by_side)
+        if failed_submission:
+            await self._handle_unconfirmed_placement(intents_by_side)
+        return {**skipped, **placed}
+
+    async def _place_sells(self, orders: list[dict]) -> dict[str, Optional[str]]:
+        """Place one or more close-only SELL orders."""
+        filtered, skipped, intents_by_side = self.order_tracker.claim_place_orders(orders)
+        if not filtered:
+            return skipped
+        try:
+            placed = await self.order_submitter.place_sells(filtered)
+        except Exception as exc:
+            failed = self.order_tracker.mark_submission_exception(intents_by_side)
+            log.error(
+                "sell_placement_failed",
+                error=str(exc),
+                sides=list(intents_by_side),
+            )
+            self.last_order_error = "sell_placement_failed"
+            return {**skipped, **failed}
         failed_submission = self.order_tracker.record_submission_results(placed, intents_by_side)
         if failed_submission:
             await self._handle_unconfirmed_placement(intents_by_side)

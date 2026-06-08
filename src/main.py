@@ -495,6 +495,7 @@ async def run_bot(
             balance_monitor=balance_monitor,
             small_capital_config=config.small_capital_test,
             balanced_repair_config=config.balanced_repair,
+            close_only_sell_config=config.close_only_sell,
         )
         cyclers.append(cycler)
 

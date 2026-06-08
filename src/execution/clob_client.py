@@ -133,21 +133,21 @@ class ClobClientWrapper:
         if self._client_version == "v2":
             from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
             from py_clob_client_v2 import PostOrdersV2Args as BatchPostOrdersArgs
-            from py_clob_client_v2.order_builder.constants import BUY
-            return OrderArgs, OrderType, PartialCreateOrderOptions, BatchPostOrdersArgs, BUY, "v2"
+            from py_clob_client_v2.order_builder.constants import BUY, SELL
+            return OrderArgs, OrderType, PartialCreateOrderOptions, BatchPostOrdersArgs, BUY, SELL, "v2"
 
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.clob_types import PartialCreateOrderOptions, PostOrdersArgs
-        from py_clob_client.order_builder.constants import BUY
-        return OrderArgs, OrderType, PartialCreateOrderOptions, PostOrdersArgs, BUY, "v1"
+        from py_clob_client.order_builder.constants import BUY, SELL
+        return OrderArgs, OrderType, PartialCreateOrderOptions, PostOrdersArgs, BUY, SELL, "v1"
 
-    def _post_order_compat(self, signed_order, order_type):
+    def _post_order_compat(self, signed_order, order_type, *, require_post_only: bool = False):
         """Post a single order across SDK variants.
 
         v1 supports post_only as a request flag. Official v2 examples post the
         signed GTC order directly; if a build rejects post_only, retry without it.
         """
-        return post_order_compat(self._client, signed_order, order_type)
+        return post_order_compat(self._client, signed_order, order_type, require_post_only=require_post_only)
 
     def set_state_manager(self, state_manager):
         self.state_manager = state_manager
@@ -337,16 +337,20 @@ class ClobClientWrapper:
             log.error("balance_allowance_sync_error", error=str(e))
             return False
 
-    async def place_buy_order(self, token_id: str, price: float,
-                               size: float, side: str = "up", book_snapshot=None) -> Optional[str]:
-        """
-        Place a BUY order with post_only=True.
+    async def _place_limit_order(self, token_id: str, price: float,
+                                 size: float, *, token_side: str,
+                                 execution_side: str = "BUY",
+                                 book_snapshot=None,
+                                 close_only: bool = False) -> Optional[str]:
+        """Place a maker-only limit order through CLOB."""
+        execution_side = str(execution_side or "BUY").upper()
+        if execution_side not in ("BUY", "SELL"):
+            log.error("order_place_invalid_execution_side", execution_side=execution_side)
+            return None
+        if execution_side == "SELL" and not close_only:
+            log.error("sell_rejected_not_close_only", token=token_id[:8], price=price, size=size)
+            return None
 
-        This is the ONLY way to place orders. No sells. No taker orders.
-
-        Returns:
-            Order ID if placed, None if rejected (post_only rejection is expected).
-        """
         self._clear_place_error()
         if not self._initialized:
             log.error("client_not_initialized")
@@ -419,13 +423,14 @@ class ClobClientWrapper:
 
         try:
             def _create_and_post():
-                OrderArgs, OrderType, PartialCreateOrderOptions, _, BUY, _ = self._order_type_imports()
+                OrderArgs, OrderType, PartialCreateOrderOptions, _, BUY, SELL, _ = self._order_type_imports()
+                sdk_side = BUY if execution_side == "BUY" else SELL
 
                 order_args = OrderArgs(
                     token_id=token_id,
                     price=price,
                     size=size,
-                    side=BUY,  # ALWAYS BUY
+                    side=sdk_side,
                 )
 
                 tick_size = str(getattr(book_snapshot, "tick_size", "0.01") or "0.01")
@@ -436,7 +441,11 @@ class ClobClientWrapper:
 
                 # GTC = Good-Til-Cancelled. _post_order_compat uses maker-only
                 # post_only where supported by the installed SDK.
-                return self._post_order_compat(signed_order, OrderType.GTC)
+                return self._post_order_compat(
+                    signed_order,
+                    OrderType.GTC,
+                    require_post_only=(execution_side == "SELL"),
+                )
 
             response = await self._run_client_call(_create_and_post)
 
@@ -447,28 +456,57 @@ class ClobClientWrapper:
                     "token_id": token_id,
                     "price": price,
                     "size": size,
-                    "side": "BUY",
-                    "token_side": side,  # "up" or "down"
+                    "side": execution_side,
+                    "execution_side": execution_side,
+                    "close_only": bool(close_only),
+                    "token_side": token_side,  # "up" or "down"
                     "placed_at": time.time(),
                 }
                 self._save_orders_state()
                 log.info("order_placed", order_id=order_id[:8],
-                         price=price, size=size, token=token_id[:8], token_side=side)
+                         execution_side=execution_side,
+                         close_only=bool(close_only),
+                         price=price, size=size, token=token_id[:8], token_side=token_side)
                 return order_id
             else:
                 # post_only rejected — order would have crossed spread
                 status = response.get("status", "unknown")
                 log.info("post_only_rejected", status=status,
+                         execution_side=execution_side,
                          price=price, token=token_id[:8])
                 return None
 
         except Exception as e:
             self._record_place_error(e)
             log.error("order_place_error", error=str(e),
+                     execution_side=execution_side,
                      price=price, size=size,
                      transient=self.last_place_error_transient,
                      **self._auth_context_fields())
             return None
+
+    async def place_buy_order(self, token_id: str, price: float,
+                               size: float, side: str = "up", book_snapshot=None) -> Optional[str]:
+        """Place a BUY order with post_only=True."""
+        return await self._place_limit_order(
+            token_id, price, size,
+            token_side=side,
+            execution_side="BUY",
+            book_snapshot=book_snapshot,
+            close_only=False,
+        )
+
+    async def place_sell_order(self, token_id: str, price: float,
+                                size: float, side: str = "up", book_snapshot=None,
+                                close_only: bool = True) -> Optional[str]:
+        """Place a close-only SELL order with post_only=True."""
+        return await self._place_limit_order(
+            token_id, price, size,
+            token_side=side,
+            execution_side="SELL",
+            book_snapshot=book_snapshot,
+            close_only=close_only,
+        )
 
     @staticmethod
     def _normalize_post_orders_response(response, expected_count: int) -> list[dict]:
@@ -486,7 +524,7 @@ class ClobClientWrapper:
             sides = [spec.get("side", "up") for spec in orders]
 
             def _create_and_post_batch():
-                OrderArgs, OrderType, PartialCreateOrderOptions, BatchPostOrdersArgs, BUY, sdk_version = self._order_type_imports()
+                OrderArgs, OrderType, PartialCreateOrderOptions, BatchPostOrdersArgs, BUY, _SELL, sdk_version = self._order_type_imports()
 
                 post_args = []
 
@@ -515,6 +553,8 @@ class ClobClientWrapper:
                             postOnly=True,
                         ))
 
+                if sdk_version == "v2":
+                    return self._client.post_orders(post_args, post_only=True)
                 return self._client.post_orders(post_args)
 
             response = await self._run_client_call(_create_and_post_batch)
@@ -574,6 +614,21 @@ class ClobClientWrapper:
                 placed=sum(1 for oid in placed.values() if oid),
             )
             return placed
+
+    async def place_sell_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
+        """Place close-only SELL orders sequentially for maker-only safety."""
+        placed: dict[str, Optional[str]] = {}
+        for idx, spec in enumerate(orders):
+            side = str(spec.get("side", idx))
+            placed[side] = await self.place_sell_order(
+                token_id=spec["token_id"],
+                price=spec["price"],
+                size=spec["size"],
+                side=side,
+                book_snapshot=spec.get("book_snapshot"),
+                close_only=bool(spec.get("close_only", True)),
+            )
+        return placed
 
     def _cancel_fn(self):
         """Return the installed SDK's single-order cancel function."""
@@ -988,6 +1043,12 @@ class ClobClientWrapper:
             self._processed_fills.add(fill_id)
             fills_changed = True
 
+            execution_side = str(
+                order_ctx.get("execution_side")
+                or order_ctx.get("side")
+                or "BUY"
+            ).upper()
+            close_only = bool(order_ctx.get("close_only", False))
             std_fill = {
                 "order_id": order_id,
                 "token_id": token_id,
@@ -997,6 +1058,9 @@ class ClobClientWrapper:
                 "fill_time": time.time(),
                 "simulated": False
             }
+            if execution_side != "BUY" or close_only:
+                std_fill["execution_side"] = execution_side
+                std_fill["close_only"] = close_only
             processed.append(std_fill)
 
         if fills_changed:

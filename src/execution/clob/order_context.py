@@ -87,11 +87,14 @@ def normalize_open_order_record(order: dict, *, now: float | None = None) -> tup
     order_id = order_id_from_record(order)
     if not order_id:
         return None
+    execution_side = str(order.get("side", "BUY") or "BUY").upper()
     return order_id, {
         "token_id": str(order.get("asset_id") or order.get("token_id") or ""),
         "price": float(order.get("price") or 0),
         "size": order_remaining_size(order),
-        "side": order.get("side", "BUY"),
+        "side": execution_side,
+        "execution_side": execution_side,
+        "close_only": execution_side == "SELL",
         "token_side": token_side_from_outcome(order.get("outcome")),
         "placed_at": float(order.get("created_at") or (time.time() if now is None else now)),
     }

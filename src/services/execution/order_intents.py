@@ -17,7 +17,8 @@ def next_quote_version(current: int | None) -> int:
 
 def build_place_intent(*, market_id: str, quote_version: int, side: str,
                        token_id: str, price: float | None,
-                       size: float) -> OrderIntent:
+                       size: float, execution_side: str = "BUY",
+                       close_only: bool = False) -> OrderIntent:
     """Build the stable idempotency key for a quote placement."""
     return OrderIntent(
         market_id=market_id,
@@ -27,6 +28,8 @@ def build_place_intent(*, market_id: str, quote_version: int, side: str,
         price=price,
         size=size,
         token_id=str(token_id),
+        execution_side=str(execution_side or "BUY").upper(),  # type: ignore[arg-type]
+        close_only=bool(close_only),
     )
 
 
@@ -41,6 +44,8 @@ def attach_place_intent(spec: dict, *, market_id: str, quote_version: int) -> di
         token_id=str(spec["token_id"]),
         price=spec.get("price"),
         size=float(spec.get("size") or 0),
+        execution_side=str(spec.get("execution_side", "BUY")).upper(),
+        close_only=bool(spec.get("close_only", False)),
     )
     return enriched
 

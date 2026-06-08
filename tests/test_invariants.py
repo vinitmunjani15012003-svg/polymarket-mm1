@@ -2382,7 +2382,8 @@ def test_dry_run_sell_order_places_resting_ask():
     order_id = asyncio.run(executor.place_sell_order("YES1", 0.51, 5, side="yes", book_snapshot=book))
 
     assert order_id is not None
-    assert executor.open_orders[order_id].side == "sell_yes"
+    assert executor.open_orders[order_id].side == "yes"
+    assert executor.open_orders[order_id].execution_side == "SELL"
 
 
 def test_live_prequote_fill_sync_updates_inventory_before_quotes():

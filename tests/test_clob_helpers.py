@@ -129,6 +129,8 @@ def test_order_context_helpers_normalize_open_orders_and_cache_recent_context():
             "price": 0.51,
             "size": 6.0,
             "side": "BUY",
+            "execution_side": "BUY",
+            "close_only": False,
             "token_side": "yes",
             "placed_at": 123.0,
         },

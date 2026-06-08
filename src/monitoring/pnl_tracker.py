@@ -83,6 +83,7 @@ class FillRecord:
 class PnLSnapshot:
     timestamp: float = 0.0
     spread_income: float = 0.0       # From matched pairs (Up+Down < $1)
+    unmatched_unwind_pnl: float = 0.0  # From close-only sells of unmatched inventory
     settlement_pnl: float = 0.0      # From resolved markets
     outcome_pnl: float = 0.0         # From unmatched-token actual outcomes
     unrealized_pnl: float = 0.0      # MTM on open positions
@@ -115,6 +116,7 @@ class PnLTracker:
         self.outcome_pnl = 0.0
         self.total_fees = 0.0          # Maker fees = $0
         self.spread_income = 0.0
+        self.unmatched_unwind_pnl = 0.0
 
         # Rebate tracking
         self.est_rebates = 0.0         # Running total estimated rebates
@@ -199,6 +201,52 @@ class PnLTracker:
                  est_rebate=round(rebate, 6),
                  total_rebates=round(self.est_rebates, 4))
 
+    def record_unmatched_sale(self, size: float, price: float,
+                              side: str = "", asset: str = "",
+                              market_id: str = "", cost_basis: float = 0.0,
+                              realized_pnl: float = 0.0):
+        """Record a maker SELL fill that closes unmatched inventory."""
+        self.total_fills += 1
+        proceeds = float(size or 0.0) * float(price or 0.0)
+        self.total_volume += proceeds
+        self.total_shares += float(size or 0.0)
+        self.current_capital += proceeds
+        self.unmatched_unwind_pnl += float(realized_pnl or 0.0)
+
+        taker_fee = compute_taker_fee(size, price, self.fee_rate)
+        rebate = estimate_maker_rebate(size, price, self.fee_rate,
+                                       self.rebate_share, self.volume_share)
+        self.total_taker_fees += taker_fee
+        self.est_rebates += rebate
+
+        if asset:
+            self._asset_rebates[asset] = self._asset_rebates.get(asset, 0) + rebate
+            self._asset_fills[asset] = self._asset_fills.get(asset, 0) + 1
+            self._asset_volume[asset] = self._asset_volume.get(asset, 0) + proceeds
+
+        self._fills.append(FillRecord(
+            timestamp=time.time(),
+            side=f"sell_{side}" if side else "sell",
+            size=size,
+            price=price,
+            asset=asset,
+            market_id=market_id[:8] if market_id else "",
+            taker_fee=taker_fee,
+            est_rebate=rebate,
+            notional=proceeds,
+        ))
+
+        log.info("unmatched_sale_pnl",
+                 asset=asset,
+                 side=side,
+                 size=size,
+                 price=price,
+                 proceeds=round(proceeds, 4),
+                 cost_basis=round(float(cost_basis or 0.0), 4),
+                 realized_pnl=round(float(realized_pnl or 0.0), 4),
+                 total_unmatched_unwind_pnl=round(self.unmatched_unwind_pnl, 4),
+                 est_rebate=round(rebate, 6))
+
     def record_spread_income(self, up_price: float, down_price: float,
                               matched_pairs: float):
         """Record spread income from matched Up+Down pairs."""
@@ -261,7 +309,7 @@ class PnLTracker:
         self.total_fees += amount
 
     def snapshot(self, unrealized: float = 0.0) -> PnLSnapshot:
-        trading_pnl = self.settlement_pnl + self.spread_income - self.total_fees
+        trading_pnl = self.settlement_pnl + self.spread_income + self.unmatched_unwind_pnl - self.total_fees
         net_with_rebates = trading_pnl + unrealized + self.est_rebates
         economic_pnl = net_with_rebates + self.outcome_pnl
         avg_rebate = self.est_rebates / max(1, self.total_fills)
@@ -270,6 +318,7 @@ class PnLTracker:
         snap = PnLSnapshot(
             timestamp=time.time(),
             spread_income=self.spread_income,
+            unmatched_unwind_pnl=self.unmatched_unwind_pnl,
             settlement_pnl=self.settlement_pnl,
             outcome_pnl=self.outcome_pnl,
             unrealized_pnl=unrealized,
@@ -293,7 +342,7 @@ class PnLTracker:
     @property
     def net_pnl(self) -> float:
         """Legacy net P&L: matched-pair/merge P&L plus estimated rebates."""
-        return self.settlement_pnl + self.spread_income - self.total_fees + self.est_rebates
+        return self.settlement_pnl + self.spread_income + self.unmatched_unwind_pnl - self.total_fees + self.est_rebates
 
     @property
     def economic_pnl(self) -> float:
@@ -303,7 +352,7 @@ class PnLTracker:
     @property
     def net_trading_pnl(self) -> float:
         """Net P&L from trading only (no rebates)."""
-        return self.settlement_pnl + self.spread_income - self.total_fees
+        return self.settlement_pnl + self.spread_income + self.unmatched_unwind_pnl - self.total_fees
 
     @property
     def session_duration_hours(self) -> float:

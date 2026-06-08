@@ -15,6 +15,8 @@ def tracked_order_ids(active_quotes) -> set[str]:
         for oid in (
             getattr(active_quotes, "yes_order_id", None),
             getattr(active_quotes, "no_order_id", None),
+            getattr(active_quotes, "yes_sell_order_id", None),
+            getattr(active_quotes, "no_sell_order_id", None),
         )
         if oid
     }

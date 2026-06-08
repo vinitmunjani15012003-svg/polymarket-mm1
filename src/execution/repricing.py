@@ -9,6 +9,10 @@ def is_crossed_buy(price: Optional[float], book_snapshot=None) -> bool:
     return bool(book_snapshot is not None and price is not None and price >= book_snapshot.best_ask)
 
 
+def is_crossed_sell(price: Optional[float], book_snapshot=None) -> bool:
+    return bool(book_snapshot is not None and price is not None and price <= book_snapshot.best_bid)
+
+
 class RepricePolicy:
     def __init__(self, reprice_threshold: float = 0.005, repair_reprice_threshold: float | None = None):
         self.reprice_threshold = float(reprice_threshold or 0.0)

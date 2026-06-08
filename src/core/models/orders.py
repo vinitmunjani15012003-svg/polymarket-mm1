@@ -12,6 +12,7 @@ import hashlib
 
 
 OrderSide = Literal["yes", "no"]
+OrderExecutionSide = Literal["BUY", "SELL"]
 OrderIntentAction = Literal["PLACE", "CANCEL", "REPLACE", "HOLD"]
 
 
@@ -24,11 +25,13 @@ class OrderIntent:
     price: float | None = None
     size: float = 0.0
     token_id: str = ""
+    execution_side: OrderExecutionSide = "BUY"
+    close_only: bool = False
     metadata: tuple[tuple[str, Any], ...] = ()
 
     @property
     def intent_id(self) -> str:
-        raw = f"{self.market_id}:{self.quote_version}:{self.side}:{self.action}:{self.price}:{self.size}:{self.token_id}"
+        raw = f"{self.market_id}:{self.quote_version}:{self.side}:{self.action}:{self.price}:{self.size}:{self.token_id}:{self.execution_side}:{self.close_only}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -40,6 +43,8 @@ class OrderState:
     side: str = ""
     price: float | None = None
     size: float = 0.0
+    execution_side: str = "BUY"
+    close_only: bool = False
     status: str = "unknown"
     updated_ts: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)

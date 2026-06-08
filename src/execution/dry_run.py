@@ -33,6 +33,8 @@ class SimulatedOrder:
     price: float
     size: float
     placed_at: float
+    execution_side: str = "BUY"
+    close_only: bool = False
     filled: bool = False
     fill_time: float = 0.0
     # Track the fair value at placement for fill logic
@@ -118,6 +120,8 @@ class DryRunExecutor:
             order_id=order_id,
             token_id=token_id,
             side=side,
+            execution_side="BUY",
+            close_only=False,
             price=price,
             size=size,
             placed_at=time.time(),
@@ -197,6 +201,8 @@ class DryRunExecutor:
                 order_id=order_id,
                 token_id=token_id,
                 side=side,
+                execution_side="BUY",
+                close_only=False,
                 price=price,
                 size=size,
                 placed_at=time.time(),
@@ -206,6 +212,54 @@ class DryRunExecutor:
             log.debug("dry_order_placed", order_id=order_id,
                      side=side, price=price, size=size)
 
+        return placed
+
+    async def place_sell_order(self, token_id: str, price: float,
+                                size: float, side: str = "yes",
+                                book_snapshot=None, close_only: bool = True) -> Optional[str]:
+        """Simulate placing a close-only SELL maker order."""
+        await self._simulate_network_latency()
+        if not close_only:
+            log.error("dry_sell_rejected_not_close_only", side=side, price=price, size=size)
+            return None
+
+        self._total_orders += 1
+        if book_snapshot:
+            best_bid = book_snapshot.best_bid if hasattr(book_snapshot, 'best_bid') else 0.01
+            if price <= best_bid:
+                self._total_rejects += 1
+                log.debug("dry_post_only_rejected", execution_side="SELL",
+                          price=price, best_bid=best_bid, side=side)
+                return None
+
+        self._order_counter += 1
+        order_id = f"DRY-{self._order_counter:06d}"
+        self.open_orders[order_id] = SimulatedOrder(
+            order_id=order_id,
+            token_id=token_id,
+            side=side,
+            price=price,
+            size=size,
+            placed_at=time.time(),
+            execution_side="SELL",
+            close_only=True,
+            fair_value_at_place=self._current_fv,
+        )
+        log.debug("dry_order_placed", order_id=order_id,
+                  execution_side="SELL", side=side, price=price, size=size)
+        return order_id
+
+    async def place_sell_orders(self, orders: list[dict]) -> dict[str, Optional[str]]:
+        """Simulate batch placing close-only SELL orders."""
+        placed: dict[str, Optional[str]] = {}
+        for spec in orders:
+            side = spec.get("side", "yes")
+            placed[side] = await self.place_sell_order(
+                spec["token_id"], spec["price"], spec["size"],
+                side=side,
+                book_snapshot=spec.get("book_snapshot"),
+                close_only=bool(spec.get("close_only", True)),
+            )
         return placed
 
     def check_fills(self,
@@ -247,8 +301,12 @@ class DryRunExecutor:
                 best_bid = getattr(book, 'best_bid', 0.01) or 0.01
                 best_ask = getattr(book, 'best_ask', 0.99) or 0.99
 
-                # 1) Marketable: our bid reaches/passes best ask
-                if order.price >= best_ask:
+                # 1) Marketable: BUY bid reaches ask; SELL ask reaches bid.
+                if order.execution_side == "SELL":
+                    marketable = order.price <= best_bid
+                else:
+                    marketable = order.price >= best_ask
+                if marketable:
                     if elapsed >= self.min_queue_time:
                         should_fill = True
                     else:
@@ -257,8 +315,11 @@ class DryRunExecutor:
                     # 2) At/near top of book: probabilistic taker flow
                     #    If we're within 1 tick (1c) of best bid, allow a small chance.
                     #    Longer wait time simulates queue depth.
-                    near_best_bid = order.price >= (best_bid - 0.01)
-                    if near_best_bid:
+                    if order.execution_side == "SELL":
+                        near_top = order.price <= (best_ask + 0.01)
+                    else:
+                        near_top = order.price >= (best_bid - 0.01)
+                    if near_top:
                         queue_needed = max(self.min_queue_time, 2.0) + 2.0  # ~4s baseline
                         if elapsed >= queue_needed and random.random() < 0.03:
                             should_fill = True
@@ -274,13 +335,13 @@ class DryRunExecutor:
             else:
                 # Positive edge = our bid is below FV (normal limit order)
                 # Zero/negative edge = FV has crossed through our price
-                if order.side == "yes":
-                    edge = fv - order.price
-                elif order.side == "no":
-                    no_value = 1.0 - fv
-                    edge = no_value - order.price
-                else:
+                token_value = fv if order.side == "yes" else 1.0 - fv
+                if order.side not in ("yes", "no"):
                     continue
+                if order.execution_side == "SELL":
+                    edge = order.price - token_value
+                else:
+                    edge = token_value - order.price
 
                 should_fill = False
                 if edge <= 0:
@@ -308,6 +369,8 @@ class DryRunExecutor:
                 "order_id": oid,
                 "token_id": order.token_id,
                 "side": order.side,
+                "execution_side": order.execution_side,
+                "close_only": order.close_only,
                 "price": order.price,
                 "size": fill_size,
                 "fill_time": now,

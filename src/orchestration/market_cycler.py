@@ -82,6 +82,7 @@ from src.services.inventory import (
     compute_fv_aware_dust_repair_sizes,
     compute_inventory_repair_sizes,
     has_negative_matched_pair_edge,  # compatibility re-export; live cycler uses quote_cycle decisions
+    plan_close_only_sell,
     plan_balanced_negative_edge_repair,
     plan_repair_price_cap,
     repair_min_edge_for_remaining,
@@ -124,7 +125,8 @@ class MarketCycler:
                  gasless_merger: Optional[GaslessMerger] = None,
                  balance_monitor: Optional[BalanceMonitor] = None,
                  small_capital_config=None,
-                 balanced_repair_config=None):
+                 balanced_repair_config=None,
+                 close_only_sell_config=None):
 
         self.asset = asset
         self.ac = asset_config
@@ -145,6 +147,7 @@ class MarketCycler:
         self.balance_monitor: Optional[BalanceMonitor] = balance_monitor
         self.small_capital_config = small_capital_config
         self.balanced_repair_config = balanced_repair_config
+        self.close_only_sell_config = close_only_sell_config
         self.small_capital = SmallCapitalLifecycle(self)
         log.info(
             "market_cycler_small_capital_mode",
@@ -791,23 +794,39 @@ class MarketCycler:
         saw_fill = False
         for fill in fills:
             saw_fill = True
-            self.inventory.record_fill(
-                market.market_id, fill["side"],
-                fill["size"], fill["price"], self.asset
-            )
-            self.pnl.record_fill(
-                size=fill["size"],
-                price=fill["price"],
-                side=fill["side"],
-                asset=self.asset,
-                market_id=market.market_id,
-            )
-            self.edge_tracker.record_fill(fill["side"], fill["price"], fv)
-            toxicity_monitor = getattr(self, "toxicity_monitor", None)
-            if toxicity_monitor:
-                toxicity_monitor.record_fill(
-                    fill["side"], fill["price"], fill["size"], fv
+            execution_side = str(fill.get("execution_side") or fill.get("trade_side") or "BUY").upper()
+            if execution_side == "SELL":
+                sale = self.inventory.record_unmatched_sell(
+                    market.market_id, fill["side"],
+                    fill["size"], fill["price"], self.asset
                 )
+                self.pnl.record_unmatched_sale(
+                    size=sale.get("size", fill["size"]),
+                    price=fill["price"],
+                    side=fill["side"],
+                    asset=self.asset,
+                    market_id=market.market_id,
+                    cost_basis=sale.get("cost_basis", 0.0),
+                    realized_pnl=sale.get("realized_pnl", 0.0),
+                )
+            else:
+                self.inventory.record_fill(
+                    market.market_id, fill["side"],
+                    fill["size"], fill["price"], self.asset
+                )
+                self.pnl.record_fill(
+                    size=fill["size"],
+                    price=fill["price"],
+                    side=fill["side"],
+                    asset=self.asset,
+                    market_id=market.market_id,
+                )
+                self.edge_tracker.record_fill(fill["side"], fill["price"], fv)
+                toxicity_monitor = getattr(self, "toxicity_monitor", None)
+                if toxicity_monitor:
+                    toxicity_monitor.record_fill(
+                        fill["side"], fill["price"], fill["size"], fv
+                    )
 
             # Keep local ActiveQuotes in sync with the fill before canceling the
             # rest. Fully filled orders may already be gone exchange-side, so do
@@ -815,7 +834,19 @@ class MarketCycler:
             active = self.order_mgr.get_active(market.market_id)
             fill_order_id = str(fill.get("order_id") or "")
             fill_size = float(fill.get("size") or 0)
-            if fill["side"] in ("yes", "up") and active.yes_order_id == fill_order_id:
+            if execution_side == "SELL" and fill["side"] in ("yes", "up") and active.yes_sell_order_id == fill_order_id:
+                active.yes_sell_size = max(0, float(active.yes_sell_size or 0) - fill_size)
+                if active.yes_sell_size <= 0.0001:
+                    active.yes_sell_order_id = None
+                    active.yes_sell_price = None
+                    active.yes_sell_size = 0
+            elif execution_side == "SELL" and fill["side"] in ("no", "down") and active.no_sell_order_id == fill_order_id:
+                active.no_sell_size = max(0, float(active.no_sell_size or 0) - fill_size)
+                if active.no_sell_size <= 0.0001:
+                    active.no_sell_order_id = None
+                    active.no_sell_price = None
+                    active.no_sell_size = 0
+            elif fill["side"] in ("yes", "up") and active.yes_order_id == fill_order_id:
                 active.yes_size = max(0, float(active.yes_size or 0) - fill_size)
                 if active.yes_size <= 0.0001:
                     active.yes_order_id = None
@@ -1242,6 +1273,7 @@ class MarketCycler:
 
         await self._maybe_pre_expiry_auto_merge(market, pos, remaining, wallet_truth=wallet_truth)
 
+        balanced_repair_armed = False
         negative_pair_edge = decide_negative_pair_edge(pos)
         if negative_pair_edge.triggered:
             pairs = negative_pair_edge.matched_pairs
@@ -1250,6 +1282,7 @@ class MarketCycler:
                 pos, self.balanced_repair_config
             )
             if debt_eligible and not self._small_capital_enabled():
+                balanced_repair_armed = True
                 log.warning(
                     "negative_pair_edge_balanced_repair_armed",
                     asset=self.asset,
@@ -1472,6 +1505,75 @@ class MarketCycler:
             sct_opening_spent = self._small_capital_opening_spent(
                 self._small_capital_state(market.market_id)
             )
+
+        sct_state_for_sell = self._small_capital_state(market.market_id) if self._small_capital_enabled() else {}
+        active_for_sell = self.order_mgr.get_active(market.market_id)
+        has_resting_opening_quote = bool(
+            sct_opening_spent
+            and not sct_state_for_sell.get("initial_filled")
+            and (active_for_sell.yes_order_id or active_for_sell.no_order_id)
+        )
+        small_cap_emergency_sell = False
+        if self._small_capital_enabled() and sct_state_for_sell.get("initial_filled") and not sct_state_for_sell.get("balancing_filled"):
+            try:
+                elapsed_since_initial = now - float(sct_state_for_sell.get("initial_fill_ts") or now)
+                small_cap_emergency_sell = bool(
+                    getattr(self.small_capital_config, "emergency_hedge_enabled", True)
+                    and elapsed_since_initial >= float(getattr(self.small_capital_config, "emergency_hedge_after_seconds", 20.0) or 20.0)
+                )
+            except Exception:
+                small_cap_emergency_sell = False
+
+        sell_plan = plan_close_only_sell(
+            pos,
+            fair_value=fv,
+            wallet_snapshot=wallet_snapshot,
+            yes_book=book_up,
+            no_book=book_down,
+            min_order_size=min_order_size,
+            max_order_size=self.quote_engine.max_order_size,
+            config=getattr(self, "close_only_sell_config", None),
+            close_only_context=bool(close_only_phase or is_halted or balance_only),
+            small_cap_emergency=small_cap_emergency_sell,
+            balanced_repair_active=balanced_repair_armed,
+            has_resting_opening_quote=has_resting_opening_quote,
+            remaining_seconds=remaining,
+        )
+        if sell_plan.active:
+            token_id = market.token_id_up if sell_plan.side == "yes" else market.token_id_down
+            book_for_sell = book_up if sell_plan.side == "yes" else book_down
+            updated_sell = await self.order_mgr.update_close_only_sell(
+                market.market_id,
+                token_id,
+                side=sell_plan.side,
+                price=sell_plan.price,
+                size=sell_plan.size,
+                book_snapshot=book_for_sell,
+            )
+            if getattr(self.order_mgr, "last_order_error", None):
+                self.stop_reason = f"close_only_sell_failed:{self.order_mgr.last_order_error}"
+                self._set_dashboard_event("error", "CLOSE_ONLY_SELL_FAILED", str(self.order_mgr.last_order_error))
+                self._update_dashboard(market, spot, fv, sigma, "SELL_ERROR", remaining, pos=pos)
+                self._running = False
+                return
+            log.warning(
+                "close_only_sell_planned",
+                asset=self.asset,
+                market=market.market_id[:8],
+                side=sell_plan.side,
+                price=sell_plan.price,
+                size=sell_plan.size,
+                reason=sell_plan.reason,
+                updated=updated_sell,
+                metadata=sell_plan.metadata,
+            )
+            self._set_dashboard_event(
+                "warn",
+                "CLOSE_ONLY_SELL",
+                f"sell {sell_plan.size} {sell_plan.side} @ {sell_plan.price}",
+            )
+            self._update_dashboard(market, spot, fv, sigma, "CLOSE_ONLY_SELL", remaining, pos=pos)
+            return
 
         # 10.25 Inventory repair / dust-normalization overrides normal quoting.
         # Guardrails:
