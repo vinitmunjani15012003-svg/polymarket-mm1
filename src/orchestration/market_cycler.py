@@ -1556,8 +1556,34 @@ class MarketCycler:
                 self._update_dashboard(market, spot, fv, sigma, "SELL_ERROR", remaining, pos=pos)
                 self._running = False
                 return
+            active_after_sell = self.order_mgr.get_active(market.market_id)
+            active_sell_id = (
+                active_after_sell.yes_sell_order_id
+                if sell_plan.side == "yes"
+                else active_after_sell.no_sell_order_id
+            )
+            if not active_sell_id:
+                warning = getattr(self.order_mgr, "last_order_warning", None) or "close_only_sell_not_placed"
+                log.warning(
+                    "close_only_sell_not_active",
+                    asset=self.asset,
+                    market=market.market_id[:8],
+                    side=sell_plan.side,
+                    price=sell_plan.price,
+                    size=sell_plan.size,
+                    reason=sell_plan.reason,
+                    warning=warning,
+                    metadata=sell_plan.metadata,
+                )
+                self._set_dashboard_event(
+                    "warn",
+                    "CLOSE_ONLY_SELL_NOT_PLACED",
+                    f"{sell_plan.side} sell not active @ {sell_plan.price}: {warning}",
+                )
+                self._update_dashboard(market, spot, fv, sigma, "SELL_NOT_PLACED", remaining, pos=pos)
+                return
             log.warning(
-                "close_only_sell_planned",
+                "close_only_sell_active",
                 asset=self.asset,
                 market=market.market_id[:8],
                 side=sell_plan.side,
@@ -1565,12 +1591,13 @@ class MarketCycler:
                 size=sell_plan.size,
                 reason=sell_plan.reason,
                 updated=updated_sell,
+                order_id=str(active_sell_id)[:8],
                 metadata=sell_plan.metadata,
             )
             self._set_dashboard_event(
                 "warn",
                 "CLOSE_ONLY_SELL",
-                f"sell {sell_plan.size} {sell_plan.side} @ {sell_plan.price}",
+                f"sell {sell_plan.size} {sell_plan.side} @ {sell_plan.price} id={str(active_sell_id)[:8]}",
             )
             self._update_dashboard(market, spot, fv, sigma, "CLOSE_ONLY_SELL", remaining, pos=pos)
             return
@@ -1957,6 +1984,20 @@ class MarketCycler:
             # after order placement fails leaves the bot unable to repair a
             # 35-vs-15 style imbalance.
             if self.balance_monitor and planned > 0:
+                # Low-balance quoting decisions must use fresh wallet truth.
+                # The cached balance monitor value can be stale immediately
+                # after merges, sells, or external deposits, causing the bot to
+                # show no active quote and keep sizing from old low cash.
+                try:
+                    fresh_balance = await self.balance_monitor.get_usdc_balance()
+                    if fresh_balance is not None and fresh_balance >= 0:
+                        log.info(
+                            "pre_quote_wallet_balance_refreshed",
+                            asset=self.asset,
+                            balance=f"${float(fresh_balance):.2f}",
+                        )
+                except Exception as e:
+                    log.warning("pre_quote_wallet_balance_refresh_failed", asset=self.asset, error=str(e))
                 bm_balance = float(getattr(self.balance_monitor, "_last_balance", 0) or 0)
                 bm_merge_at = float(getattr(self.balance_monitor, "merge_balance", 0) or 0)
                 bm_min_pairs = int(getattr(self.balance_monitor, "min_merge_pairs", 1) or 1)

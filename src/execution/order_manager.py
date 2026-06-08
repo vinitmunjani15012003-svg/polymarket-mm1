@@ -455,7 +455,21 @@ class OrderManager:
                 order_id=order_id[:8],
             )
             return True
-        return bool(cancel_ids)
+
+        # Canceling stale buys/sells is not enough to claim a close-only sell is
+        # working. Surface the actual placement miss so the dashboard does not
+        # show "sell @ price" when no sell order id exists.
+        self.last_order_warning = "close_only_sell_not_placed"
+        log.warning(
+            "close_only_sell_not_placed",
+            market=market_id[:8],
+            side=side,
+            price=price,
+            size=size,
+            placed=placed,
+            cancelled=len(cancel_ids),
+        )
+        return False
 
     async def cancel_side_quotes(self, market_id: str, side: str, token_id: str):
         """Cancel all known quotes for one side/token of a market."""
