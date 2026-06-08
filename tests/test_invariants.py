@@ -1142,7 +1142,19 @@ def test_mt5_bridge_poll_timeout_tracks_stale_window_without_being_too_large():
 
     assert fast.mt5_bridge_timeout_seconds == pytest.approx(1.5)
     assert normal.mt5_bridge_timeout_seconds == pytest.approx(4.0)
-    assert slow.mt5_bridge_timeout_seconds == pytest.approx(5.0)
+    assert slow.mt5_bridge_timeout_seconds == pytest.approx(12.0)
+
+
+def test_mt5_bridge_timeout_can_be_overridden_for_slow_exness_server():
+    pf = PriceFeed(
+        "wss://stream.binance.com:9443/ws",
+        ["BTCUSDT"],
+        mt5_bridge_url="http://bridge:8765",
+        mt5_bridge_stale_seconds=15.0,
+        mt5_bridge_timeout_seconds=10.0,
+    )
+
+    assert pf.mt5_bridge_timeout_seconds == pytest.approx(10.0)
 
 
 def test_mt5_bridge_symbol_map_overrides_default_binance_to_mt5_symbol():

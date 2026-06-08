@@ -167,6 +167,7 @@ async def run_bot(
         mt5_bridge_url=config.credentials.mt5_bridge_url,
         mt5_bridge_api_key=config.credentials.mt5_bridge_api_key,
         mt5_bridge_stale_seconds=config.credentials.mt5_bridge_stale_seconds,
+        mt5_bridge_timeout_seconds=config.credentials.mt5_bridge_timeout_seconds,
         mt5_bridge_symbol_map=config.credentials.mt5_bridge_symbol_map,
     )
 

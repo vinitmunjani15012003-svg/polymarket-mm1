@@ -48,6 +48,7 @@ def test_dependency_builder_preserves_wallet_mode_address_and_mt5_log_shape():
         mt5_bridge_url="http://bridge.local:8765/path",
         mt5_bridge_api_key="secret-value",
         mt5_bridge_stale_seconds=5.0,
+        mt5_bridge_timeout_seconds=8.0,
     )
     cfg = SimpleNamespace(credentials=credentials)
 
@@ -60,6 +61,7 @@ def test_dependency_builder_preserves_wallet_mode_address_and_mt5_log_shape():
         "url_host": "bridge.local:8765",
         "has_api_key": True,
         "stale_seconds": 5.0,
+        "timeout_seconds": 8.0,
         "symbol_map": {},
         "loaded_env_files": [".env"],
         "mt5_env_url_present": True,

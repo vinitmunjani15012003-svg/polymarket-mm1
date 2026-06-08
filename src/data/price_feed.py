@@ -36,6 +36,7 @@ class PriceFeed:
                  mt5_bridge_url: str = "",
                  mt5_bridge_api_key: str = "",
                  mt5_bridge_stale_seconds: float = 5.0,
+                 mt5_bridge_timeout_seconds: float = 0.0,
                  mt5_bridge_symbol_map: Mapping[str, str] | None = None):
         """
         Args:
@@ -55,12 +56,17 @@ class PriceFeed:
             if str(k).strip() and str(v).strip()
         }
         # Keep the bridge poll timeout aligned with the accepted freshness
-        # window. A 1.5s hard timeout caused false STALE_SPOT periods when the
-        # MT5/Exness bridge was alive but a single HTTP poll was slow.
-        self.mt5_bridge_timeout_seconds = max(
-            1.5,
-            min(5.0, max(0.5, self.mt5_bridge_stale_seconds * 0.8)),
-        )
+        # window. A 1.5s hard timeout caused false STALE_SPOT/NO_SPOT periods
+        # when the MT5/Exness bridge was alive but a single HTTP poll was slow.
+        # Allow an explicit override for slow Exness server/terminal sessions.
+        explicit_timeout = float(mt5_bridge_timeout_seconds or 0.0)
+        if explicit_timeout > 0:
+            self.mt5_bridge_timeout_seconds = max(0.5, explicit_timeout)
+        else:
+            self.mt5_bridge_timeout_seconds = max(
+                1.5,
+                min(12.0, max(0.5, self.mt5_bridge_stale_seconds * 0.8)),
+            )
         self.symbols = [s.lower() for s in symbols]
         self.vol_lookback = vol_lookback
 

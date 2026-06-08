@@ -84,6 +84,7 @@ class CredentialsConfig:
     mt5_bridge_url: str = ""
     mt5_bridge_api_key: str = ""
     mt5_bridge_stale_seconds: float = 5.0
+    mt5_bridge_timeout_seconds: float = 0.0
     mt5_bridge_symbol_map: Dict[str, str] = field(default_factory=dict)
 
 
@@ -430,6 +431,7 @@ def load_config(config_path: str = "config/default.yaml",
         mt5_bridge_url=mt5.get("url") or os.environ.get("MT5_BRIDGE_URL", ""),
         mt5_bridge_api_key=mt5.get("api_key") or os.environ.get("MT5_BRIDGE_API_KEY", ""),
         mt5_bridge_stale_seconds=float(mt5.get("stale_seconds") or os.environ.get("MT5_BRIDGE_STALE_SECONDS", 5.0)),
+        mt5_bridge_timeout_seconds=float(mt5.get("timeout_seconds") or os.environ.get("MT5_BRIDGE_TIMEOUT_SECONDS", 0.0) or 0.0),
         mt5_bridge_symbol_map=_parse_symbol_map(mt5.get("symbol_map") or os.environ.get("MT5_BRIDGE_SYMBOL_MAP", "")),
     )
 

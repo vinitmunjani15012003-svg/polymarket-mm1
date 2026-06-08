@@ -77,6 +77,7 @@ def mt5_bridge_log_fields(config: Any, env: Mapping[str, str], loaded_env_files:
         "url_host": parsed.netloc if parsed else "",
         "has_api_key": bool(getattr(credentials, "mt5_bridge_api_key", "")),
         "stale_seconds": getattr(credentials, "mt5_bridge_stale_seconds", None),
+        "timeout_seconds": getattr(credentials, "mt5_bridge_timeout_seconds", None),
         "symbol_map": getattr(credentials, "mt5_bridge_symbol_map", {}) or {},
         "loaded_env_files": loaded_env_files or [],
         "mt5_env_url_present": bool(env.get("MT5_BRIDGE_URL")),
